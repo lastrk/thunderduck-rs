@@ -3,10 +3,8 @@
 //! Operators merge their clause into the child's open [`SelectBlock`] when
 //! the clause ordinal and alias-visibility preconditions hold, and wrap the
 //! child as a derived table (a fresh block) only on slot-occupancy conflict.
-//! This replaces the former wrap-every-operator-then-flatten-heuristically
-//! string rendering: one uniform mechanism instead of per-shape inlining
-//! ladders (the Calcite `RelToSqlConverter` approach; ADR-001 sanctions the
-//! node-reducing merges as result-irrelevant cosmetic simplification).
+//! This provides one uniform mechanism for clause placement and derived-table
+//! wrapping (ADR-001 permits the resulting cosmetic simplification).
 //!
 //! A block stores **already-rendered SQL fragments** (projection slot lists,
 //! predicates, sort keys) produced by `emission`'s expression layer; this
@@ -43,8 +41,8 @@ pub(crate) enum Clause {
 }
 
 /// A rendered relational unit: either an open, merge-accepting SELECT block
-/// or an opaque SQL string (set-op chains, `WITH RECURSIVE`, and every
-/// operator still on a legacy string renderer). Nothing merges into `Raw`;
+/// or an opaque SQL string (set-op chains, `WITH RECURSIVE`, and operators
+/// that require string rendering). Nothing merges into `Raw`;
 /// parents wrap it.
 #[derive(Debug)]
 pub(crate) enum SqlUnit {
@@ -465,8 +463,7 @@ impl SelectBlock {
         sql.push_str(&self.from.to_sql());
         match self.where_conjuncts.as_slice() {
             [] => {}
-            // A single predicate renders bare (parity with the former
-            // `render_filter`); composed predicates parenthesize each
+            // A single predicate renders bare; composed predicates parenthesize each
             // conjunct to keep operator precedence unambiguous.
             [only] => {
                 sql.push_str(" WHERE ");

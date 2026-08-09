@@ -185,11 +185,10 @@ class TestEmptyDataFrameJoin:
             StructField("value", StringType(), True)
         ])
 
-        # Create empty left side on both
+        # Join an empty left side with a non-empty right side on both engines.
         ref_left = spark_reference.createDataFrame([], left_schema)
         td_left = spark_thunderduck.createDataFrame([], left_schema)
 
-        # Load non-empty right side on both
         ref_right = spark_reference.read.parquet(str(tpch_data_dir / "nation.parquet"))
         ref_right = ref_right.withColumnRenamed("n_nationkey", "id")
 

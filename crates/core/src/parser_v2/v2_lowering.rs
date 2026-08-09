@@ -1,22 +1,9 @@
 //! sqlparser-rs AST → τ [`CommonAst`] lowering.
 //!
-//! Scope (per architecture plan §4):
-//! - `SELECT expr, … FROM table WHERE … GROUP BY … ORDER BY … LIMIT n OFFSET m`
-//! - bare `SELECT literal`
-//! - `SELECT … FROM (VALUES ...)` and other subquery-in-FROM forms
-//! - basic joins (INNER / LEFT / RIGHT / FULL / CROSS / LEFT SEMI / LEFT ANTI)
-//! - `SELECT *`
-//!
-//! Deferred (surface as [`EmissionError::Unsupported`] with `ProtoShape` kind):
-//! PIVOT, GROUPING SETS, ROLLUP, CUBE, LATERAL VIEW, TABLESAMPLE, CTE,
-//! UNION/INTERSECT/EXCEPT, window functions, HOFs, `json_tuple` rewrites,
-//! command statements.
-//!
 //! **INV10:** imports only value-level types from `crate::types` plus
 //! intra-τ modules. No `crate::parser`, `crate::logical`, `crate::expression`.
 //!
-//! **Plan-id policy (Open Decision 12):** every [`UnresolvedColumn`] emitted
-//! by this module has `plan_id = None`.
+//! Every [`UnresolvedColumn`] emitted by this module has `plan_id = None`.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -88,7 +75,6 @@ pub fn lower_statement_or_ddl(
             let ast = lower_query(*q, &CteScope::new())?;
             Ok(SqlStatement::Query(ast))
         }
-        // ── CREATE [OR REPLACE] TEMP[ORARY] VIEW ──────────────────────────
         Statement::CreateView(cv) if cv.temporary => {
             // Spark-emulated parse errors (match Spark 4.1.1 ParseException
             // wording exactly). These fire before unsupported-clause guards
@@ -127,7 +113,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── Non-temporary CREATE VIEW ─────────────────────────────────────
         Statement::CreateView(ref cv) if cv.or_replace && cv.if_not_exists => {
             Err(EmissionError::Unsupported {
                 kind: UnsupportedKind::ProtoShape,
@@ -154,7 +139,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── CREATE TABLE ──────────────────────────────────────────────────
         Statement::CreateTable(CreateTable {
             name,
             columns,
@@ -210,7 +194,7 @@ pub fn lower_statement_or_ddl(
             initialize,
             require_user,
         }) => {
-            // Bail loudly on unsupported clauses.
+            // Reject unsupported clauses.
             if or_replace {
                 bail_boundary_proto!(
                     "sql::create_table::or_replace",
@@ -503,8 +487,7 @@ pub fn lower_statement_or_ddl(
 
             let table_name = extract_simple_name(&name, "sql::create_table::name")?;
 
-            // Lower column definitions: name + type, with bail on constraints
-            // (DEFAULT, NOT NULL, CHECK, etc.).
+            // Lower column definitions and reject column constraints.
             let fields: Vec<StructField> = columns
                 .into_iter()
                 .map(|col| {
@@ -530,7 +513,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── DROP TABLE / DROP VIEW ────────────────────────────────────────
         Statement::Drop {
             object_type: ObjectType::Table,
             if_exists,
@@ -636,7 +618,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── INSERT INTO ───────────────────────────────────────────────────
         Statement::Insert(Insert {
             insert_token: _,
             optimizer_hint,
@@ -660,7 +641,7 @@ pub fn lower_statement_or_ddl(
             settings,
             format_clause,
         }) => {
-            // Bail loudly on unsupported clauses.
+            // Reject unsupported clauses.
             if optimizer_hint.is_some() {
                 bail_boundary_proto!(
                     "sql::insert::optimizer_hint",
@@ -755,7 +736,6 @@ pub fn lower_statement_or_ddl(
                 );
             }
 
-            // Extract the table name.
             let table_name = match table {
                 TableObject::TableName(ref obj_name) => {
                     extract_simple_name(obj_name, "sql::insert::table_name")?
@@ -774,12 +754,8 @@ pub fn lower_statement_or_ddl(
                 reason: "INSERT without a source query is not supported".to_owned(),
             })?;
 
-            // Determine whether this is INSERT ... VALUES or INSERT ... SELECT.
-            // VALUES bodies arrive as `Query { body: SetExpr::Values(..) }`.
             let body = *source_query;
             if body.with.is_some() || body.order_by.is_some() || body.limit_clause.is_some() {
-                // INSERT ... SELECT with ORDER BY / LIMIT / WITH — lower as
-                // a full query.
                 let ast = lower_query(body, &CteScope::new())?;
                 return Ok(SqlStatement::Ddl(DdlStatement::InsertSelect {
                     table: table_name,
@@ -788,7 +764,6 @@ pub fn lower_statement_or_ddl(
             }
             match *body.body {
                 SetExpr::Values(values) => {
-                    // Lower each row of literal values.
                     let rows: Vec<Vec<Expression>> = values
                         .rows
                         .into_iter()
@@ -804,7 +779,6 @@ pub fn lower_statement_or_ddl(
                     }))
                 }
                 _ => {
-                    // Reassemble the Query and lower it.
                     let reassembled = Query {
                         with: None,
                         body: body.body,
@@ -826,7 +800,6 @@ pub fn lower_statement_or_ddl(
             }
         }
 
-        // ── TRUNCATE TABLE ────────────────────────────────────────────────
         Statement::Truncate(Truncate {
             table_names,
             partitions,
@@ -879,11 +852,8 @@ pub fn lower_statement_or_ddl(
 
 /// Reject unsupported clauses common to both temp and non-temp CREATE VIEW.
 ///
-/// Takes the whole [`sqlparser::ast::CreateView`] rather than its individual
-/// clause fields: eight of the ten are same-typed `bool`/`Option`, so a
-/// positional argument list was a silent-transposition hazard (only one of the
-/// twelve rejection branches below has a test). Named field reads make a
-/// mis-wire a compile error instead.
+/// Takes the whole [`sqlparser::ast::CreateView`] so each clause is checked by
+/// name rather than through positional arguments.
 fn reject_unsupported_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), EmissionError> {
     if !cv.columns.is_empty() {
         bail_boundary_proto!(
@@ -1236,7 +1206,7 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
             // `UNION BY NAME` is parseable in `SparkDialect` but positional
             // lowering would silently align columns by position — a wrong
             // result. Reject it as a Thunderduck-boundary error rather than
-            // mis-lower (ADR-022; loud-fail per CLAUDE.md gotcha #9).
+            // mis-lower (ADR-022).
             if matches!(
                 set_quantifier,
                 SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
@@ -1875,7 +1845,7 @@ fn lower_table_factor(
         // `TableFactor::Table` with `args: Some(..)`; a plain `FROM emp` has
         // `args: None`. Branch on `args` so the TVF path builds a
         // `CommonOp::TableFunction` while the bare-table path is preserved
-        // verbatim (no regression for CTE inlining / TableScan / aliases).
+        // verbatim, preserving CTE inlining, TableScan, and alias handling.
         TableFactor::Table {
             name,
             alias,
@@ -1933,9 +1903,7 @@ fn lower_table_factor(
                     // DataFrame front-end (`df.alias("e")`) so both front-ends
                     // produce the same CommonAST node for the same meaning
                     // (INV7, ADR-004). Emission's alias-hoisting recognizes
-                    // `AliasedRelation`; the retired `TableScan { alias:
-                    // Some(..) }` form buried the user alias inside a synthetic
-                    // subquery. Mirrors the CTE branch above.
+                    // `AliasedRelation`.
                     let scan = CommonAst::new(CommonOp::TableScan { table });
                     match alias {
                         Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
@@ -1990,7 +1958,7 @@ fn lower_table_factor(
             };
             // A user alias (`TABLE(range(3)) AS r(id)`) composes on top via
             // `ToDf` + `AliasedRelation`, same as the `Table`-with-args and
-            // `Derived` branches above — previously silently dropped here.
+            // `Derived` branches above.
             apply_table_alias(node, alias)
         }
         TableFactor::UNNEST {
@@ -2022,9 +1990,9 @@ fn lower_table_factor(
                 .map(|a| function_arg_to_expr(a, cte_scope))
                 .collect::<Result<_, _>>()?;
             // A user alias (`LATERAL explode(arr) AS x(v)`) composes the same
-            // way — previously silently dropped here. The `lateral: bool`
+            // way. The `lateral: bool`
             // flag remains swallowed by `..`; lateral correlation semantics
-            // are a separate, pre-existing gap this fix does not widen into.
+            // are a separate gap outside this lowering path.
             apply_table_alias(table_function_node(func_name, arg_exprs, false), alias)
         }
         // SQL `PIVOT` (BigQuery/Snowflake/Databricks). Unlike the DataFrame
@@ -2464,9 +2432,6 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
 /// other rewriting named windows. The parse-from-SQL parity test
 /// `expr_has_aggregate_classifier_table` guards against drift.
 fn expr_has_aggregate(expr: &Expr) -> bool {
-    // Fix pass (review M4): extend the walker to every composite
-    // shape the projection can contain. A missed shape used to mis-classify
-    // e.g. `SELECT count(x) IN (1, 2)` as non-aggregate.
     match expr {
         Expr::Function(f) => function_call_has_aggregate(f),
         Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
@@ -2516,7 +2481,6 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         | Expr::AtTimeZone {
             timestamp: expr, ..
         } => expr_has_aggregate(expr),
-        // ── SQL special forms ────────────────────────────────────────────
         // sqlparser parses `EXTRACT`/`CEIL`/`FLOOR`/`SUBSTRING`/`POSITION`/
         // `TRIM`/`OVERLAY` and bracket field access to dedicated `Expr`
         // variants (NOT `Expr::Function`). These arms MUST stay in lockstep
@@ -2617,11 +2581,6 @@ fn function_arg_has_aggregate(arg: &FunctionArg) -> bool {
 }
 
 fn is_aggregate_function_name(name: &str) -> bool {
-    // Fix pass (review M3 + perf OPT-5): defer to τ's canonical
-    // aggregate roster (the classifier column of the `AGG_SPECS` table in
-    // `transpiler_v2::type_inference`) instead of a locally-drifted 32-name
-    // subset. The lookup is case-insensitive without a per-call `String`
-    // allocation.
     is_aggregate_classifier_name(name)
 }
 
@@ -2669,7 +2628,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
             // shape the analyzer's nested-struct resolution (analyzer.rs
             // `resolve_column`'s tier (d), via `struct_qualifier_info` /
-            // `build_struct_extract_chain`, Pass F2) is written for. A 3-part
+            // `build_struct_extract_chain`) is written for. A 3-part
             // struct path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
             // "address", name:"geo.lat"}` so the analyzer can walk the struct;
             // 2-part refs `t.c` are byte-identical to before (parts[0] qualifier,
@@ -3297,12 +3256,8 @@ fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Express
                 body: Box::new(new_body),
             })
         }
-        // The historical hand-rolled walker left `InSubquery` and `Window`
-        // untouched (subqueries/windows inside a Spark lambda body would
-        // themselves be `UnsupportedProtoShape` from upstream lower_expr —
-        // never reaching this rewrite). `map_children` DOES descend into
-        // them, so pass them through explicitly to keep the rewrite
-        // byte-identical.
+        // Subqueries and windows are unsupported inside Spark lambda bodies;
+        // preserve these variants if they reach this rewrite.
         e @ (Expression::InSubquery(_) | Expression::Window(_)) => e,
         // Every other variant recurses structurally via `map_children`
         // (leaves come back unchanged).
@@ -3769,7 +3724,6 @@ fn resolve_named_windows_in_expr(
         } => {
             resolve_named_windows_in_expr(expr, defs)?;
         }
-        // ── SQL special forms ────────────────────────────────────────────
         // `&mut` mirror of `expr_has_aggregate`'s special-form arms — a
         // named-window ref can legally nest inside any of these (e.g.
         // `extract(YEAR FROM lag(ts) OVER w)`). Keep in lockstep; the parity
@@ -3899,7 +3853,7 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
         // interval` stays `DATE` either way (see `date_like_interval_result`
         // — `IntervalKind::YearMonth` and `IntervalKind::Calendar` both hit
         // its stay-`Date` arm), so re-kinding these to `YearMonth` is out of
-        // scope for the R1-6 fix.
+        // scope for the interval semantics.
         Slot::Months(factor) => IntervalExpression {
             months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
             days: 0,
@@ -3968,7 +3922,7 @@ fn extract_interval_string(expr: &Expr) -> Option<&str> {
 /// Lower a compound (`X TO Y`) interval literal. Supports ONLY the singular
 /// field pairs `YEAR TO MONTH` → [`IntervalKind::YearMonth`] and `DAY TO
 /// SECOND` → [`IntervalKind::DayTime`], the only two pairs that τ's field-less
-/// interval `DataType`s encode wire-exactly (per architecture-pass-3). Every
+/// interval `DataType`s encode wire-exactly. Every
 /// other pair, or any field precision, is the existing
 /// `sql::expr::interval::compound` Thunderduck boundary (ADR-022).
 fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
@@ -4588,7 +4542,7 @@ fn wrap_not(e: Expression, negated: bool) -> Expression {
 /// Spark `<=>`), NOT null-unsafe `=` (which would wrongly yield NULL on the NOT form
 /// with a NULL column). Components are AND-folded per tuple, tuples OR-folded, and
 /// `negated` (`NOT IN`) wraps the whole chain in `NOT` (exact complement, also never
-/// NULL). Mirrors the pass-138 `build_like_chain` reduce-fold + NOT-wrap.
+/// NULL).
 ///
 /// Every RHS element must be an `Expr::Tuple` of arity == `cols.len()`; a non-tuple
 /// element or an arity mismatch is a Thunderduck-boundary error (Spark rejects these
@@ -4829,12 +4783,11 @@ mod tests {
         }
     }
 
-    // ── timestampadd / timestampdiff unit demotion (intv-006 regression) ───
     //
     // sqlparser parses the leading datetime UNIT (`MONTH`, `DAY`, …) as an
     // `Expr::Identifier`; the generic identifier arm would lower it to an
     // `UnresolvedColumn`, and the analyzer would then raise a spurious
-    // `UnknownColumn { name: "MONTH" }`. These tests pin the fix: the unit is
+    // `UnknownColumn { name: "MONTH" }`. These tests pin the unit handling:
     // demoted to a string literal, and the plan analyzes to the Spark-parity
     // return type (TIMESTAMP for add, BIGINT/Long for diff).
 
@@ -4950,7 +4903,7 @@ mod tests {
     #[test]
     fn parse_inline_values_lowers_to_values_op() {
         // Top-level `VALUES` lowers to `CommonOp::Values` with default
-        // `col1..colN` names (pass-129).
+        // `col1..colN` names.
         let plan = parse("VALUES (1, 'a'), (2, 'b')").expect("should parse");
         match plan.op {
             CommonOp::Values { rows, column_names } => {
@@ -4970,7 +4923,7 @@ mod tests {
     #[test]
     fn parse_range_table_function_lowers_to_table_function_not_scan() {
         // `FROM range(5)` must lower to `CommonOp::TableFunction`, NOT a bare
-        // `TableScan{"range"}` (pass-141; the `..` used to swallow `args`).
+        // `TableScan{"range"}` (table-function arguments are preserved).
         let plan = parse("SELECT id FROM range(5)").expect("should parse");
         match plan.op {
             CommonOp::Project { input, .. } => match input.op {
@@ -4994,7 +4947,7 @@ mod tests {
     fn parse_range_table_function_with_alias_columns_renames_via_todf() {
         // `range(5) AS t(id2)` → AliasedRelation{ ToDf{ TableFunction, [id2] }, t }
         // — a user alias composes on top of the TVF via the shared
-        // `apply_table_alias` helper (pass-141).
+        // `apply_table_alias` helper.
         let plan = parse("SELECT id2 FROM range(5) AS t(id2)").expect("should parse");
         let aliased = match plan.op {
             CommonOp::Project { input, .. } => *input,
@@ -5025,12 +4978,6 @@ mod tests {
             other => panic!("expected TableFunction, got {other:?}"),
         }
     }
-
-    // ── TableFactor::TableFunction / TableFactor::Function alias handling
-    // (finding 3: the alias was silently dropped, unlike the sibling
-    // Table-with-args / Derived branches). Both `TABLE(f(...))` and
-    // `LATERAL f(...)` compose their alias via the shared `apply_table_alias`
-    // helper, mirroring `parse_range_table_function_with_alias_columns_renames_via_todf`. ──
 
     #[test]
     fn table_function_table_syntax_with_alias_columns_renames_via_todf() {
@@ -5117,7 +5064,7 @@ mod tests {
 
     #[test]
     fn parse_bare_table_still_lowers_to_table_scan() {
-        // Regression: `FROM emp` (args None) must keep the bare-table path.
+        // `FROM emp` (args None) must keep the bare-table path.
         let plan = parse("SELECT * FROM emp").expect("should parse");
         match plan.op {
             CommonOp::Project { input, .. } => {
@@ -5134,7 +5081,7 @@ mod tests {
     #[test]
     fn parse_bare_from_values_with_alias_columns_renames_via_todf() {
         // `SELECT * FROM VALUES (..) AS t(n, s)` → Project over AliasedRelation
-        // over ToDf(["n","s"]) over Values (pass-129 + pass-118 Derived arm).
+        // over ToDf(["n","s"]) over Values.
         let plan = parse("SELECT * FROM VALUES (1, 'a') AS t(n, s)").expect("should parse");
         let aliased = match plan.op {
             CommonOp::Project { input, .. } => *input,
@@ -5218,8 +5165,6 @@ mod tests {
             "sql::distinct_on"
         );
     }
-
-    // ── ceil/floor lowering (num-001/002/003) ────────────────────────────
 
     #[test]
     fn ceil_1arg_lowers_to_single_arg_function_call() {
@@ -5713,9 +5658,6 @@ mod tests {
         );
     }
 
-    // ── expr_has_aggregate descends into non-aggregate function args
-    // (finding 1: `abs(count(x))` used to misclassify the whole statement) ──
-
     #[test]
     fn aggregate_nested_inside_non_aggregate_function_is_still_aggregate_query() {
         // `abs(count(x))` — the outer call `abs` is not an aggregate, but its
@@ -5758,7 +5700,6 @@ mod tests {
         );
     }
 
-    // ── SQL special-form aggregate classification (agg-022 / agg-023) ──────
     //
     // sqlparser parses EXTRACT / SUBSTRING / POSITION / TRIM / OVERLAY /
     // CEIL / FLOOR / bracket-access to dedicated `Expr` variants (NOT
@@ -5925,8 +5866,7 @@ mod tests {
 
     #[test]
     fn parse_group_by_with_cube() {
-        // Postfix `GROUP BY <cols> WITH CUBE` → flat grouping, Cube kind. No
-        // corpus witness yet — this test keeps the Cube modifier arm live.
+        // Postfix `GROUP BY <cols> WITH CUBE` → flat grouping, Cube kind.
         let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY a, b WITH CUBE")
             .expect("WITH CUBE should parse");
         match plan.op {
@@ -5979,7 +5919,6 @@ mod tests {
 
     #[test]
     fn parse_select_unresolved_column_has_plan_id_none() {
-        // Open Decision 12 anchor.
         let plan = parse("SELECT id FROM t").expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
             panic!("expected Project");
@@ -6219,8 +6158,6 @@ mod tests {
         );
     }
 
-    // ── Pass 18: WITH RECURSIVE lowering ──────────────────────────────────
-
     #[test]
     fn parse_recursive_cte_009_lowers_to_recursive_cte_with_self_ref_table_scan() {
         // cte-009 shape: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL
@@ -6401,8 +6338,6 @@ mod tests {
 
     #[test]
     fn parse_pivot_lowers_to_common_op_pivot() {
-        // Pass 107: `SELECT * FROM t PIVOT (...)` now lowers to a
-        // `CommonOp::Pivot` with implicit (schema-derived) grouping.
         let plan =
             parse("SELECT * FROM t PIVOT (SUM(x) FOR y IN (1, 2))").expect("PIVOT should lower");
         match pivot_node(plan) {
@@ -6547,9 +6482,6 @@ mod tests {
 
     #[test]
     fn parse_div_keyword_lowers_to_integer_divide_cast() {
-        // Pass 73: SparkSQL's `a DIV b` — the SparkDialect's `parse_infix`
-        // registers DIV as an integer-division operator; v2_lowering
-        // wraps the resulting binary in a `CAST(... AS BIGINT)`.
         let plan = parse("SELECT a div 2 FROM t").expect("should parse");
         match plan.op {
             CommonOp::Project { projections, .. } => {
@@ -6568,8 +6500,6 @@ mod tests {
 
     #[test]
     fn parse_extract_year_lowers_to_year_function() {
-        // Pass 73: `EXTRACT(YEAR FROM col)` lowers to a FunctionCall to
-        // `year(col)` (INTEGER return-type, matching Spark).
         let plan = parse("SELECT EXTRACT(YEAR FROM d) FROM t").expect("should parse");
         match plan.op {
             CommonOp::Project { projections, .. } => match &projections[0] {
@@ -6585,10 +6515,6 @@ mod tests {
 
     #[test]
     fn single_arg_lambda_lowers_to_lambda_expression() {
-        // Pass 84: `x -> upper(x)` inside `transform(tags, ...)` must lower to
-        // `Expression::Lambda { params: ["x"], body: FunctionCall(upper) }`.
-        // Pass 86 L1 witness: the identifier `x` inside the body must be
-        // rewritten to `LambdaVariable("x")` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT transform(tags, x -> upper(x)) FROM emp").expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
             panic!("expected Project");
@@ -6615,10 +6541,6 @@ mod tests {
 
     #[test]
     fn multi_arg_lambda_lowers_to_lambda_expression() {
-        // Pass 84: `(acc, x) -> concat(acc, x)` inside `reduce(...)` must lower
-        // to `Expression::Lambda { params: ["acc", "x"], body: FunctionCall }`.
-        // Pass 86 L1 witness: both `acc` and `x` inside the body must be
-        // rewritten to `LambdaVariable` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT reduce(tags, '', (acc, x) -> concat(acc, x)) FROM emp")
             .expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
@@ -6650,14 +6572,14 @@ mod tests {
 
     #[test]
     fn nested_lambda_shadowing_preserved() {
-        // Pass 86 L2: nested-lambda shadowing witness. In
+        // Nested-lambda shadowing: in
         // `transform(arr1, x -> transform(arr2, y -> concat(x, y)))`, the
         // inner-lambda body references BOTH the outer's `x` and the inner's
         // `y`. After lowering, both must be rewritten to `LambdaVariable`:
         // outer's `x` reaches through the inner-Lambda arm because
         // `remaining = params \ inner.params = ["x"] \ ["y"] = ["x"]` (the
         // outer param survives the shadow-filter). Inner's `y` is rewritten
-        // by the inner-lambda pass itself.
+        // by the inner-lambda rewrite itself.
         let plan = parse("SELECT transform(arr1, x -> transform(arr2, y -> concat(x, y))) FROM t")
             .expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
@@ -6707,8 +6629,8 @@ mod tests {
 
     #[test]
     fn parse_syntax_error_returns_unsupported_proto_shape() {
-        // Review M2: sqlparser errors are boundary failures (input never
-        // reached CommonAst) → surface as `UnsupportedProtoShape`, not
+        // sqlparser errors are boundary failures (input never reaches
+        // CommonAst) → surface as `UnsupportedProtoShape`, not
         // `UnsupportedOp`. Exercised through the public entry point so the
         // top-level mapping (parser_v2::SparkSqlParserV2::parse) is anchored.
         use crate::parser_v2::SparkSqlParserV2;
@@ -6830,10 +6752,6 @@ mod tests {
             "sql::named_window::unknown"
         );
     }
-
-    // ── resolve_named_windows_in_expr descends into composite shapes
-    // (finding 2: a named-window ref nested in CASE/fn-args used to hit a
-    // spurious "not defined in WINDOW clause" error even though it was) ────
 
     #[test]
     fn named_window_ref_inside_case_branch_resolves() {
@@ -7174,8 +7092,6 @@ mod tests {
         assert_eq!(fc.args.len(), 4);
     }
 
-    // ── Pass 106 — uncorrelated subquery lowering ────────────────────────
-
     #[test]
     fn scalar_subquery_lowers_to_unanalyzed_scalar_subquery() {
         let plan = parse("SELECT (SELECT max(sal) FROM emp) AS gmax FROM emp").expect("parse");
@@ -7229,7 +7145,7 @@ mod tests {
 
     #[test]
     fn subquery_sees_outer_cte_scope() {
-        // Review M1: a subquery's `FROM <cte>` must inline the outer CTE body
+        // A subquery's `FROM <cte>` must inline the outer CTE body
         // (an AliasedRelation over the CTE's own plan), NOT a TableScan named
         // `c`. If a real table `c` existed, a TableScan would silently read it
         // instead of the CTE — Spark shadows the table with the CTE (cte-006).
@@ -7267,8 +7183,6 @@ mod tests {
             ),
         }
     }
-
-    // ── SQL PIVOT / UNPIVOT lowering (pass 107) ──────────────────────────
 
     /// Find the `CommonOp::Pivot` node under the outer `SELECT * FROM (…) PIVOT`.
     fn pivot_node(plan: CommonAst) -> CommonOp {
@@ -7428,8 +7342,8 @@ mod tests {
     fn lower_like_all_folds_to_and_chain() {
         // pr-004: sqlparser 0.61 mis-parses `LIKE ALL (…)` as `LIKE ALL(...)`
         // (function call). We detect that artifact and fold into an AND-chain.
-        // This test also PINS that parser artifact: a future sqlparser that
-        // gains native `LIKE ALL` changes the parse and fails here loudly.
+        // This test also pins that parser artifact: a future sqlparser that
+        // gains native `LIKE ALL` changes the parse and fails here.
         let plan = parse("SELECT id FROM t WHERE name LIKE ALL ('%a%', '%e%')")
             .expect("should parse+lower");
         match where_predicate(&plan) {
@@ -7499,7 +7413,7 @@ mod tests {
 
     #[test]
     fn lower_plain_like_still_single_pattern() {
-        // Regression guard: ordinary `LIKE 'p'` (any:false, non-ALL pattern) must
+        // Ordinary `LIKE 'p'` (any:false, non-ALL pattern) must
         // still reach the unchanged single-pattern arm.
         let plan = parse("SELECT id FROM t WHERE a LIKE 'x%'").expect("should parse+lower");
         match where_predicate(&plan) {
@@ -7589,7 +7503,7 @@ mod tests {
 
     #[test]
     fn lower_scalar_in_still_uses_inlist() {
-        // Regression: single-column IN keeps the scalar InListExpression path.
+        // Single-column IN keeps the scalar InListExpression path.
         let plan = parse("SELECT id FROM t WHERE a IN (1, 2)").expect("should parse+lower");
         match where_predicate(&plan) {
             Expression::InList(l) => assert!(!l.negated),
@@ -7658,8 +7572,6 @@ mod tests {
             other => panic!("expected Unary NOT, got {other:?}"),
         }
     }
-
-    // ── Complex-type bracket access + nested struct paths (cx-001/002/004) ──
 
     #[test]
     fn lower_array_index_builds_extract_value_over_array() {
@@ -8040,8 +7952,6 @@ mod tests {
         );
     }
 
-    // ── LATERAL VIEW lowering (cx-007/cx-008/cx-009) ────────────────────
-
     /// Helper: extract a `CommonOp::LateralView` from a lowered SQL that
     /// produces `Project { input: LateralView { .. }, .. }`.
     fn lateral_view_of(plan: CommonAst) -> (String, Vec<(String, Expression)>) {
@@ -8147,8 +8057,6 @@ mod tests {
         );
     }
 
-    // ── Pass 13 — LATERAL generator comma-syntax redirect to LateralView ──
-
     /// CONVERGENCE: `FROM emp e, LATERAL explode(e.tags) AS r(v)` produces a
     /// CommonAst structurally EQUAL to `FROM emp e LATERAL VIEW explode(e.tags) r
     /// AS v`. Both syntaxes must converge to the same LateralView node shape.
@@ -8164,7 +8072,7 @@ mod tests {
         );
     }
 
-    /// DISCRIMINATOR regression guard: non-LATERAL `FROM emp, explode(array(1,2))`
+    /// Non-LATERAL `FROM emp, explode(array(1,2))`
     /// still lowers to a CrossJoin with right=TableFunction, NOT a LateralView.
     /// sqlparser parses this as `TableFactor::Table { args: Some(...) }` (not
     /// `TableFactor::Function`), so the redirect predicate never fires.
@@ -8209,8 +8117,6 @@ mod tests {
             "comma-LATERAL and LATERAL VIEW posexplode must produce identical CommonAst"
         );
     }
-
-    // ── Pass-17: LATERAL derived-table join lowering ────────────────────
 
     #[test]
     fn lateral_join_no_on_lowers_to_join_with_lateral_true() {
@@ -8261,7 +8167,7 @@ mod tests {
 
     #[test]
     fn plain_on_join_lowers_with_lateral_false() {
-        // Regression: a plain `JOIN ... ON` must not set lateral.
+        // A plain `JOIN ... ON` must not set lateral.
         let plan = parse("SELECT * FROM emp JOIN dept ON emp.dept_id = dept.dept_id")
             .expect("should parse");
         match project_input(plan).op {

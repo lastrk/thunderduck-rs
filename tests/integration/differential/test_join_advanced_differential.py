@@ -26,7 +26,7 @@ class TestJoinAdvancedDifferential:
 
         This is the core ambiguity case that requires plan_id resolution.
         """
-        # Create two DataFrames with same column name 'id'
+        # Both inputs intentionally expose the same column name.
         employees_data = [
             (1, "Alice", 100),
             (2, "Bob", 200),

@@ -4,132 +4,75 @@
 
 require thdck_spark_funcs
 
-# --- Slow path trigger analysis ---
-# The slow path is taken when abs_a * 10^scale_adj overflows unsigned __int128 (max ~3.4e38).
-# For DECIMAL(38,0) / DECIMAL(5,2):
-#   result_scale = max(6, 0+5+1) = 6
-#   result_precision = (38-0)+2+6 = 46 -> capped to 38
-#   overflow adj: int_digits=46-6=40, min_scale=min(6,6)=6, 38-40<6 -> adjusted_scale=6
-#   result type: DECIMAL(38,6)
-#   scale_adj = 6 - 0 + 2 = 8
-#   So we need abs_a * 10^8 > 2^128 ~ 3.4e38 -> abs_a > 3.4e30
+# DECIMAL(38,0) / DECIMAL(5,2) yields DECIMAL(38,6) with scale_adj=8.
+# A 32-digit numerator times 10^8 exceeds unsigned __int128 and forces the
+# exact 256-bit slow path used by the following cases.
 
-# Verify result type for slow-path inputs
 query I
 SELECT typeof(spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 1.00::DECIMAL(5,2)));
 ----
 DECIMAL(38,6)
 
-# 32-digit number (10^32 - 1) / 1.00 = same number (no rounding needed)
-# abs_a = 99999999999999999999999999999999 (32 nines)
-# scale_adj = 8, abs_a * 10^8 ~ 10^40 > 2^128 -> slow path
-# Result: 99999999999999999999999999999999.000000
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 99999999999999999999999999999999.000000
 
-# Negative large value on slow path
-# -99999999999999999999999999999999 / 1.00 = -99999999999999999999999999999999.000000
 query I
 SELECT spark_decimal_div(-99999999999999999999999999999999::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 -99999999999999999999999999999999.000000
 
-# Slow path with actual division (exact result)
-# 99999999999999999999999999999999 / 3.00
-# abs_a = 99999999999999999999999999999999 (32 nines), abs_b = 300, scale_adj = 8
-# (abs_a * 10^8) / 300:
-# 99999999999999999999999999999999 / 3 = 33333333333333333333333333333333 exactly
-# So abs_a * 10^8 / 300 = 33333333333333333333333333333333 * 10^6 / 1 = 33333333333333333333333333333333000000
-# remainder = 0, no rounding needed
-# Result as DECIMAL(38,6): 33333333333333333333333333333333.000000
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333333.000000
 
-# Slow path with ROUND_HALF_UP triggered
-# 99999999999999999999999999999998 / 3.00
-# abs_a = 99999999999999999999999999999998, abs_b = 300, scale_adj = 8
-# 99999999999999999999999999999998 = 3*33333333333333333333333333333332 + 2
-# (abs_a * 10^8) / 300:
-# = 33333333333333333333333333333332*10^6 + 200000000/300
-# = 33333333333333333333333333333332000000 + 666666 remainder 200
-# quotient = 33333333333333333333333333333332666666, remainder = 200
-# ROUND_HALF_UP: 2*200 = 400 >= 300 -> round up!
-# Result as DECIMAL(38,6): 33333333333333333333333333333332.666667
 query I
 SELECT spark_decimal_div(99999999999999999999999999999998::DECIMAL(38,0), 3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333332.666667
 
-# Slow path: division by 6 producing .500000 (exact at 6 decimal places)
-# (99999999999999999999999999999999 * 10^8) / 600 = 16666666666666666666666666666666500000 remainder 0
-# No rounding needed
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 6.00::DECIMAL(5,2));
 ----
 16666666666666666666666666666666.500000
 
-# Slow path: both negative -> positive result
-# (-99999999999999999999999999999999) / (-3.00) = same magnitude, positive
 query I
 SELECT spark_decimal_div(-99999999999999999999999999999999::DECIMAL(38,0), -3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333333.000000
 
-# Slow path: negative dividend, positive divisor
-# (-99999999999999999999999999999999) / 3.00 = negative result
 query I
 SELECT spark_decimal_div(-99999999999999999999999999999999::DECIMAL(38,0), 3.00::DECIMAL(5,2));
 ----
 -33333333333333333333333333333333.000000
 
-# Slow path: positive dividend, negative divisor
-# 99999999999999999999999999999999 / (-3.00) = negative result
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), -3.00::DECIMAL(5,2));
 ----
 -33333333333333333333333333333333.000000
 
-# Slow path: large value divided by 7 (non-trivial rounding)
-# 99999999999999999999999999999999 / 7.00
-# abs_a = 99999999999999999999999999999999, abs_b = 700, scale_adj = 8
-# (abs_a * 10^8) / 700 = abs_a * 10^6 / 7
-# 99999999999999999999999999999999 * 10^6 = 99999999999999999999999999999999000000
-# / 7 = 14285714285714285714285714285714142857 remainder 1
-# 2*1 = 2 < 7 -> no round up
-# Result as DECIMAL(38,6): 14285714285714285714285714285714.142857
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 7.00::DECIMAL(5,2));
 ----
 14285714285714285714285714285714.142857
 
-# Slow path: large even value / 2.00 -> exact (no rounding)
-# 99999999999999999999999999999998 / 2.00 = 49999999999999999999999999999999.000000
 query I
 SELECT spark_decimal_div(99999999999999999999999999999998::DECIMAL(38,0), 2.00::DECIMAL(5,2));
 ----
 49999999999999999999999999999999.000000
 
-# Slow path: large odd value / 2.00 -> exact at 6 decimal places
-# (abs_a * 10^8) / 200 = 49999999999999999999999999999999500000 remainder 0
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 2.00::DECIMAL(5,2));
 ----
 49999999999999999999999999999999.500000
 
-# Slow path: power of 10 numerator (10^31) / 1.00
-# abs_a = 10^31, scale_adj = 8, abs_a * 10^8 = 10^39 > 2^128 -> slow path
 query I
 SELECT spark_decimal_div(10000000000000000000000000000000::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 10000000000000000000000000000000.000000
 
-# Slow path with small divisor causing large quotient
-# 50000000000000000000000000000000 / 1.50
-# = 33333333333333333333333333333333.333333
 query I
 SELECT spark_decimal_div(50000000000000000000000000000000::DECIMAL(38,0), 1.50::DECIMAL(5,2));
 ----

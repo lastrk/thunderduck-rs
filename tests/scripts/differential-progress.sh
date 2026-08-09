@@ -5,10 +5,6 @@
 # tests/integration/differential_progress.md with the commit SHA and delta vs
 # the previous measurement.
 #
-# Replaces the retired per-corpus recorders `v2-progress.sh` (DataFrame
-# corpus ledger: v2_progress.md) and `v2-sql-progress.sh` (SQL corpus ledger:
-# v2_sql_progress.md); those ledgers are frozen as history.
-#
 # Usage:
 #     tests/scripts/differential-progress.sh
 #

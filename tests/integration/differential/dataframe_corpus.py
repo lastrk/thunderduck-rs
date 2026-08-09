@@ -76,9 +76,7 @@ from pyspark.sql.types import (
 NAN = float("nan")
 
 
-# ---------------------------------------------------------------------------
 # Input DataFrames — explicit schemas, deliberate nulls / NaN / edge values
-# ---------------------------------------------------------------------------
 
 def build_inputs(spark: SparkSession) -> Dict[str, DataFrame]:
     emp_schema = StructType([
@@ -189,9 +187,7 @@ def build_inputs(spark: SparkSession) -> Dict[str, DataFrame]:
     return {"emp": emp, "dept": dept, "emp2": emp2, "nums": nums, "raw": raw}
 
 
-# ---------------------------------------------------------------------------
 # Case registry
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Case:
@@ -207,9 +203,8 @@ class Case:
     expected_error: Optional[str] = None
     # Per-case float-comparison tolerance override for the harness's
     # assert_dataframes_equal (None = harness default 1e-6). Used by the tpch
-    # cluster to preserve the legacy suite's epsilon=0.01 on monetary
-    # aggregates — tightening it during the migration would flip
-    # baseline-passing queries red for a reason unrelated to τ.
+    # cluster to preserve epsilon=0.01 on monetary aggregates; tightening it would
+    # flip passing queries red for a reason unrelated to τ.
     epsilon: Optional[float] = None
 
 
@@ -220,7 +215,6 @@ def case(id, category, description, build, flags=(), expected_error=None, epsilo
     CASES.append(Case(id, category, description, build, tuple(flags), expected_error, epsilon))
 
 
-# ── 1. Projection & column manipulation ────────────────────────────────────
 case("proj-001", "projection", "select by name", lambda I: I["emp"].select("id", "name", "age"))
 case("proj-002", "projection", "select Column objects", lambda I: I["emp"].select(F.col("id"), F.col("salary")))
 case("proj-003", "projection", "select with arithmetic + alias", lambda I: I["emp"].select((F.col("salary") * 1.1).alias("raise")))
@@ -246,7 +240,6 @@ case("proj-015", "projection", "chained withColumn (5 deep)", lambda I: (I["emp"
 # succeeds (all columns, 2 rows); τ must return the same, cleanly.
 case("proj-016", "projection", "qualified star over limit-wrapped block (F12 star-strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(2).select("e.*"))
 
-# ── 2. Filtering & predicates ──────────────────────────────────────────────
 case("filt-001", "filter", "filter by Column predicate", lambda I: I["emp"].filter(F.col("age") > 30))
 case("filt-002", "filter", "where by SQL string — INV7", lambda I: I["emp"].where("age > 30 and active = true"))
 case("filt-003", "filter", "AND / OR / NOT combination", lambda I: I["emp"].filter((F.col("age") > 30) & (F.col("active")) | (~F.col("active"))))
@@ -262,19 +255,12 @@ case("filt-012", "filter", "startswith / endswith / contains", lambda I: I["emp"
 case("filt-013", "filter", "eqNullSafe (<=>)", lambda I: I["emp"].filter(F.col("dept_id").eqNullSafe(F.lit(None))))
 case("filt-014", "filter", "two chained filters", lambda I: I["emp"].filter(F.col("age") > 25).filter(F.col("salary") < 130000))
 case("filt-015", "filter", "filter on computed column", lambda I: I["emp"].withColumn("tenure_pos", F.col("age") - 18).filter(F.col("tenure_pos") > 10))
-# Wrap-boundary strand witnesses (tasks/select-block-follow-ups.md item 3):
-# an alias-qualified reference above a clause-ordinal wrap (Filter cannot
-# merge past an occupied LIMIT/DISTINCT slot, so emission wraps under
-# __td_sub and the analyzer-stamped qualifier strands). Spark accepts both;
-# red on the τ side until wrap-boundary qualifier rewriting lands — the
-# fitness signal item 3 is gated on (ADR-022).
+# An alias-qualified reference above a clause-ordinal wrap (Filter cannot merge
+# past an occupied LIMIT/DISTINCT slot, so emission wraps under `__td_sub` and
+# the analyzer-stamped qualifier strands). Spark accepts both; τ must rewrite
+# the qualifier at the wrap boundary.
 case("filt-016", "filter", "alias-qualified filter above limit (strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).filter(F.col("e.salary") > 60000))
 case("filt-017", "filter", "alias-qualified filter above distinct (strand witness)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.active").distinct().filter(F.col("e.dept_id") == 101))
-# Attribute-lineage / qualified-resolution cluster (findings F8, F10 in
-# tasks/select-block-review-findings.md). Previously deferred pending ADR-023;
-# LANDED via ADR-024 tier-3e (Pass F3, 2026-07-13) — now GREEN and part of the
-# select_block_corpus_baseline.txt regression oracle.
-#
 # filt-018 (F10): a dead alias `e` projected THROUGH to two original columns,
 # then filtered twice. The projected-through column keeps a live binding, so
 # both Spark and τ SUCCEED with an empty result (0 rows over
@@ -286,7 +272,6 @@ case("filt-018", "filter", "F10 — dead-alias projected-through column, double 
 # name-only fallback was deleted by ADR-024 tier-3e, closing the F8 divergence).
 case("filt-019", "filter", "F8 — dead-alias qualifying a select-created alias (Spark & τ error UNRESOLVED_COLUMN; landed via ADR-024 tier-3e)", lambda I: I["emp"].alias("e").select(F.col("dept_id").alias("k")).filter(F.col("e.k") == 101), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
-# ── 3. Literals, typed columns & casts (type-source stress) ─────────────────
 case("cast-001", "cast", "lit int / string / bool / double", lambda I: I["emp"].select(F.lit(1).alias("i"), F.lit("x").alias("s"), F.lit(True).alias("b"), F.lit(3.14).alias("d")))
 case("cast-002", "cast", "lit null typed via cast", lambda I: I["emp"].select(F.lit(None).cast("int").alias("ni")))
 case("cast-003", "cast", "cast int->double", lambda I: I["emp"].select(F.col("age").cast("double").alias("aged")))
@@ -300,7 +285,6 @@ case("cast-010", "cast", "cast chain int->string->int", lambda I: I["emp"].selec
 case("cast-011", "cast", "cast in arithmetic (mixed type promote)", lambda I: I["emp"].select((F.col("age").cast("long") + F.lit(1)).alias("agel")))
 case("cast-012", "cast", "try_cast bad string (spark4)", lambda I: I["emp"].select(F.expr("try_cast(name as int)").alias("tc")), flags=("spark4",))
 
-# ── 4. Conditionals & null-handling (nullability stress) ────────────────────
 case("cond-001", "conditional", "when/otherwise", lambda I: I["emp"].select(F.when(F.col("age") >= 40, "senior").otherwise("junior").alias("band")))
 case("cond-002", "conditional", "chained when (multi-branch)", lambda I: I["emp"].select(F.when(F.col("age") < 30, "a").when(F.col("age") < 45, "b").otherwise("c").alias("band")))
 case("cond-003", "conditional", "when WITHOUT otherwise -> nullable", lambda I: I["emp"].select(F.when(F.col("active"), F.col("salary")).alias("maybe_sal")))
@@ -318,7 +302,6 @@ case("cond-014", "conditional", "na.drop any", lambda I: I["emp"].na.drop("any",
 case("cond-015", "conditional", "na.drop thresh", lambda I: I["emp"].na.drop(thresh=2, subset=["dept_id", "bonus", "last_login"]))
 case("cond-016", "conditional", "na.replace value", lambda I: I["emp"].na.replace({"Alice": "ALICE"}, subset=["name"]))
 
-# ── 5. String functions ────────────────────────────────────────────────────
 case("str-001", "string", "concat", lambda I: I["emp"].select(F.concat(F.col("name"), F.lit("@x")).alias("u")))
 case("str-002", "string", "concat_ws", lambda I: I["emp"].select(F.concat_ws("-", F.col("name"), F.col("dept_id").cast("string")).alias("k")))
 case("str-003", "string", "substring", lambda I: I["emp"].select(F.substring(F.col("name"), 1, 2).alias("ss")))
@@ -340,7 +323,6 @@ case("str-018", "string", "levenshtein", lambda I: I["emp"].select(F.levenshtein
 case("str-019", "string", "soundex", lambda I: I["emp"].select(F.soundex("name").alias("sx")))
 case("str-020", "string", "regexp_extract_all (-> array, spark4)", lambda I: I["emp"].select(F.expr("regexp_extract_all(name, '[a-z]', 0)").alias(" all_lc")), flags=("spark4",))
 
-# ── 6. Math / numeric functions ────────────────────────────────────────────
 case("math-001", "math", "abs / signum", lambda I: I["nums"].select(F.abs("a").alias("ab"), F.signum("a").alias("sg")))
 case("math-002", "math", "round (scale) / bround", lambda I: I["nums"].select(F.round("x", 1).alias("r"), F.bround("x", 1).alias("br")))
 case("math-003", "math", "ceil / floor", lambda I: I["nums"].select(F.ceil("x").alias("c"), F.floor("x").alias("f")))
@@ -373,7 +355,6 @@ case("math-018", "math", "sqrt over non-nullable column is still nullable=True (
 case("math-019", "math", "sin over non-nullable column is still nullable=True (P5)", lambda I: I["emp"].select(F.sin("id").alias("si")), flags=("schema_only",))
 case("math-020", "math", "cbrt over non-nullable column is still nullable=True (P5)", lambda I: I["emp"].select(F.cbrt("id").alias("cb")), flags=("schema_only",))
 
-# ── 7. Date / time functions ───────────────────────────────────────────────
 case("dt-001", "datetime", "current_date / current_timestamp", lambda I: I["emp"].select(F.current_date().alias("cd"), F.current_timestamp().alias("ct")), flags=("nondeterministic",))
 case("dt-002", "datetime", "date_add / date_sub", lambda I: I["emp"].select(F.date_add("hire_date", 30).alias("plus"), F.date_sub("hire_date", 30).alias("minus")))
 case("dt-003", "datetime", "datediff", lambda I: I["emp"].select(F.datediff(F.lit("2026-06-30").cast("date"), F.col("hire_date")).alias("days")))
@@ -392,7 +373,6 @@ case("dt-015", "datetime", "make_date / make_timestamp", lambda I: I["emp"].sele
 case("dt-016", "datetime", "extract / datepart (spark4)", lambda I: I["emp"].select(F.expr("extract(YEAR FROM hire_date)").alias("ey")), flags=("spark4",))
 case("dt-017", "datetime", "timestamp tz convert (from/to_utc_timestamp)", lambda I: I["emp"].select(F.to_utc_timestamp(F.col("last_login"), "CET").alias("utc")))
 
-# ── 8. Aggregations (groupBy + agg) ────────────────────────────────────────
 case("agg-001", "aggregate", "count(*) global", lambda I: I["emp"].agg(F.count(F.lit(1)).alias("n")))
 case("agg-002", "aggregate", "count(col) ignores nulls", lambda I: I["emp"].agg(F.count("bonus").alias("n_bonus")))
 case("agg-003", "aggregate", "countDistinct", lambda I: I["emp"].agg(F.countDistinct("dept_id").alias("nd")))
@@ -429,21 +409,17 @@ case("agg-025", "aggregate", "groupBy alias-qualified key over limit (F9 aggrega
 # no downstream references, so this whole-matches the folded output list.
 case("agg-026", "aggregate", "grouping key restated in agg", lambda I: I["emp"].groupBy("dept_id").agg(F.col("dept_id"), F.sum("salary").alias("total_salary")))
 
-# ── 9. Grouping extensions (rollup / cube / pivot) ─────────────────────────
 case("grp-001", "grouping", "rollup", lambda I: I["emp"].rollup("dept_id", "active").agg(F.count(F.lit(1)).alias("n")))
 case("grp-002", "grouping", "cube", lambda I: I["emp"].cube("dept_id", "active").agg(F.count(F.lit(1)).alias("n")))
 case("grp-003", "grouping", "rollup with grouping_id", lambda I: I["emp"].rollup("dept_id", "active").agg(F.grouping_id().alias("gid"), F.count(F.lit(1)).alias("n")))
 case("grp-004", "grouping", "pivot with explicit values", lambda I: I["emp"].groupBy("dept_id").pivot("active", [True, False]).agg(F.count(F.lit(1)).alias("n")))
 case("grp-005", "grouping", "pivot without values (eager)", lambda I: I["emp"].groupBy("active").pivot("dept_id").agg(F.avg("salary")))
 case("grp-006", "grouping", "grouping() flag column", lambda I: I["emp"].cube("dept_id").agg(F.grouping("dept_id").alias("g"), F.count(F.lit(1)).alias("n")))
-# grp-007: pass-3 fix — `rewrite_grouping_id` (crates/core/src/transpiler_v2/emission.rs)
-# used to only walk FunctionCall/Alias/Cast/CaseWhen containers, so a no-arg
-# grouping_id() nested inside a Binary expr fell through untouched and reached
-# DuckDB as a literal zero-arg `grouping_id()` — a parse error. Now a generic
-# `children_mut` walk splices the grouping columns regardless of container shape.
+# `rewrite_grouping_id` walks nested expressions, so a no-arg `grouping_id()`
+# inside a Binary expression is replaced with the grouping columns instead of
+# reaching DuckDB as a zero-arg call.
 case("grp-007", "grouping", "rollup with grouping_id() nested in arithmetic", lambda I: I["emp"].rollup("dept_id", "active").agg((F.grouping_id() + 1).alias("gid1"), F.count(F.lit(1)).alias("n")))
 
-# ── 10. Window functions ───────────────────────────────────────────────────
 case("win-001", "window", "row_number over partition+order", lambda I: I["emp"].withColumn("rn", F.row_number().over(W.partitionBy("dept_id").orderBy(F.col("salary").desc()))))
 case("win-002", "window", "rank / dense_rank", lambda I: I["emp"].withColumn("rk", F.rank().over(W.partitionBy("dept_id").orderBy("salary"))).withColumn("drk", F.dense_rank().over(W.partitionBy("dept_id").orderBy("salary"))))
 case("win-003", "window", "percent_rank / cume_dist", lambda I: I["emp"].withColumn("pr", F.percent_rank().over(W.orderBy("salary"))).withColumn("cd", F.cume_dist().over(W.orderBy("salary"))))
@@ -457,7 +433,6 @@ case("win-010", "window", "rangeBetween", lambda I: I["emp"].withColumn("rb", F.
 case("win-011", "window", "aggregate over partition (no order)", lambda I: I["emp"].withColumn("dept_avg", F.avg("salary").over(W.partitionBy("dept_id"))))
 case("win-012", "window", "window then filter rn=1 (top-per-group)", lambda I: I["emp"].withColumn("rn", F.row_number().over(W.partitionBy("dept_id").orderBy(F.col("salary").desc()))).filter(F.col("rn") == 1))
 
-# ── 11. Joins (nullability + disambiguation) ───────────────────────────────
 case("join-001", "join", "inner join on column name", lambda I: I["emp"].join(I["dept"], on="dept_id", how="inner"))
 case("join-002", "join", "inner join on condition", lambda I: I["emp"].join(I["dept"], I["emp"].dept_id == I["dept"].dept_id, "inner").select(I["emp"]["name"], I["dept"]["dept_name"]))
 case("join-003", "join", "left outer -> right cols nullable", lambda I: I["emp"].join(I["dept"], on="dept_id", how="left"))
@@ -478,12 +453,9 @@ case("join-016", "join", "qualified star over outer join (right side, null-exten
 case("join-017", "join", "qualified star through post-join filter", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "inner").filter(F.col("d.budget") > 0).select("e.*"))
 
 
-# USING-join / default_projections corruption witnesses (review findings 1, 2,
-# 4, 5, 7 in tasks/select-block-review-findings.md). Spark hoists the USING
-# key first; DuckDB's `*` keeps it at its natural left position, so any path
-# that loses or shadows the join block's hoisted slot list silently mislabels
-# columns positionally on the wire. Born red by design — they are the
-# evidence gate that must flip green when the emission fixes land.
+# Spark hoists a USING key first; DuckDB's `*` keeps it at its natural position.
+# Losing or shadowing the join block's hoisted slot list therefore mislabels
+# columns positionally on the wire.
 def _join_022(I):
     # Inner join condition uses plan_id refs on an ambiguous name, so both
     # inner sides are stamped `__td_jl`/`__td_jr`; the inner join then inlines
@@ -499,12 +471,9 @@ case("join-019", "join", "multi-slot star over USING join (star-order witness)",
 case("join-020", "join", "nested USING join as re-wrapped join side (hoisted-slot drop witness)", lambda I: I["emp"].alias("a").join(I["nums"].alias("n"), F.col("a.id") == F.col("n.a")).join(I["emp2"].join(I["dept"], on="dept_id"), F.col("dept_name") == F.lit("Infrastructure")))
 case("join-021", "join", "user alias buried under USING parent (vis-exemption strand witness)", lambda I: I["emp"].alias("e").join(I["nums"].alias("n"), F.col("e.id") == F.col("n.a")).join(I["dept"], on="dept_id").select("e.name"))
 case("join-022", "join", "duplicate synthetic join alias (__td_jr collision witness)", _join_022)
-# join-023 (F11): the SAME user alias `x` on BOTH join sides. Spark ERRORS
+# The SAME user alias `x` on BOTH join sides makes Spark ERROR
 # AMBIGUOUS_REFERENCE (`x.id` could be either side) — it rejects the qualified
-# ref, even in the ON clause, when the qualifier binds both sides. Previously
-# deferred (τ bound the left first-match); LANDED via ADR-024 tier-3e (Pass F3)
-# — τ now matches Spark's error. Shares the qualified-resolution path with
-# F8/F10; part of the baseline regression oracle.
+# ref, even in the ON clause, when the qualifier binds both sides.
 case("join-023", "join", "F11 — duplicate user alias on both join sides (Spark & τ error AMBIGUOUS_REFERENCE; landed via ADR-024 tier-3e)", lambda I: I["emp"].alias("x").join(I["emp2"].alias("x"), F.col("x.id") == F.col("x.id")).select("x.salary"), expected_error="AMBIGUOUS_REFERENCE")
 # join-024 (Phase 3a): the un-realiased self-join `df.join(df, ...)` — the
 # SAME plan_id tagged on BOTH sides of the join's OWN condition. Spark Connect
@@ -535,7 +504,6 @@ def _join_026(I):
 
 case("join-026", "join", "ancestor project on above-join dup-name (salary) plan_id refs bind both sides correctly", _join_026)
 
-# ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):
     return I["emp"].select("id", "name", "dept_id", "age", "salary")
 
@@ -558,7 +526,6 @@ case("set-010", "setop", "union then distinct then orderBy", lambda I: _emp_proj
 case("set-011", "setop", "unionByName allowMissingColumns — pad-slot column resolves unqualified", lambda I: _emp_proj(I).unionByName(I["emp2"].alias("b"), allowMissingColumns=True).select("country"))
 case("set-012", "setop", "unionByName allowMissingColumns — pad-slot column rejects donor qualifier (Spark UNRESOLVED_COLUMN)", lambda I: _emp_proj(I).unionByName(I["emp2"].alias("b"), allowMissingColumns=True).select("b.country"), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
-# ── 13. Ordering, limit, offset, distinct ───────────────────────────────────
 case("ord-001", "ordering", "orderBy asc", lambda I: I["emp"].orderBy("salary"))
 case("ord-002", "ordering", "orderBy desc", lambda I: I["emp"].orderBy(F.col("salary").desc()))
 case("ord-003", "ordering", "sort multiple keys", lambda I: I["emp"].sort(F.col("dept_id").asc(), F.col("salary").desc()))
@@ -576,7 +543,6 @@ case("ord-013", "ordering", "orderBy a join-qualified passthrough column while t
     .select(F.col("e.dept_id"), F.col("d.dept_name"))
     .orderBy(F.col("e.dept_id"))))
 
-# ── 14. Complex types: arrays ───────────────────────────────────────────────
 case("arr-001", "array", "array() constructor", lambda I: I["emp"].select(F.array(F.col("age"), F.lit(0)).alias("arr")))
 case("arr-002", "array", "array_contains", lambda I: I["emp"].select(F.array_contains("tags", "rust").alias("has_rust")))
 case("arr-003", "array", "size (null vs empty)", lambda I: I["emp"].select(F.size("tags").alias("n_tags")))
@@ -595,7 +561,6 @@ case("arr-015", "array", "explode (drops null/empty rows)", lambda I: I["emp"].s
 case("arr-016", "array", "explode_outer (keeps null/empty)", lambda I: I["emp"].select("id", F.explode_outer("tags").alias("tag")))
 case("arr-017", "array", "posexplode (adds pos col)", lambda I: I["emp"].select("id", F.posexplode("tags").alias("pos", "tag")))
 
-# ── 15. Complex types: maps ─────────────────────────────────────────────────
 case("map-001", "map", "create_map", lambda I: I["emp"].select(F.create_map(F.lit("k"), F.col("name")).alias("m")))
 case("map-002", "map", "map_keys / map_values", lambda I: I["emp"].select(F.map_keys("attrs").alias("ks"), F.map_values("attrs").alias("vs")))
 case("map-003", "map", "map_entries", lambda I: I["emp"].select(F.map_entries("attrs").alias("ents")))
@@ -604,7 +569,6 @@ case("map-005", "map", "map_from_arrays", lambda I: I["emp"].select(F.map_from_a
 case("map-006", "map", "map_concat", lambda I: I["emp"].select(F.map_concat("attrs", F.create_map(F.lit("extra"), F.lit("1"))).alias("m")))
 case("map-007", "map", "explode map -> key,value cols", lambda I: I["emp"].select("id", F.explode("attrs").alias("k", "v")))
 
-# ── 16. Complex types: structs ──────────────────────────────────────────────
 case("struct-001", "struct", "struct() constructor", lambda I: I["emp"].select(F.struct("name", "age").alias("info")))
 case("struct-002", "struct", "dot access nested field", lambda I: I["emp"].select(F.col("address.city").alias("city")))
 case("struct-003", "struct", "getField", lambda I: I["emp"].select(F.col("address").getField("zip").alias("zip")))
@@ -615,7 +579,6 @@ case("struct-007", "struct", "named_struct of expressions", lambda I: I["emp"].s
 case("struct-008", "struct", "star-expand a struct", lambda I: I["emp"].select("id", "address.*"))
 case("struct-009", "struct", "unaliased single-level dot access (string select)", lambda I: I["emp"].select("address.city"))
 
-# ── 17. Higher-order functions ──────────────────────────────────────────────
 case("hof-001", "hof", "transform (array map)", lambda I: I["emp"].select(F.transform("tags", lambda x: F.upper(x)).alias("up_tags")))
 case("hof-002", "hof", "filter (array)", lambda I: I["emp"].select(F.filter("tags", lambda x: x.startswith("r")).alias("r_tags")))
 case("hof-003", "hof", "aggregate (fold)", lambda I: I["emp"].select(F.aggregate("tags", F.lit(""), lambda acc, x: F.concat(acc, x)).alias("cat")))
@@ -627,7 +590,6 @@ case("hof-008", "hof", "map_filter", lambda I: I["emp"].select(F.map_filter("att
 case("hof-009", "hof", "transform_values", lambda I: I["emp"].select(F.transform_values("attrs", lambda k, v: F.upper(v)).alias("up_vals")))
 case("hof-010", "hof", "transform_keys", lambda I: I["emp"].select(F.transform_keys("attrs", lambda k, v: F.concat(F.lit("attr_"), k)).alias("pref_keys")))
 
-# ── 18. na / stats / misc DataFrame methods ─────────────────────────────────
 case("misc-001", "misc", "describe (summary stats)", lambda I: I["emp"].describe("age", "salary"), flags=("schema_only",))
 case("misc-002", "misc", "summary with percentiles", lambda I: I["emp"].select("salary").summary("count", "min", "25%", "75%", "max"), flags=("schema_only",))
 case("misc-003", "misc", "fillna (DataFrame alias)", lambda I: I["emp"].fillna({"dept_id": 0}))
@@ -639,7 +601,6 @@ case("misc-008", "misc", "repartition (cosmetic, result-irrelevant)", lambda I: 
 case("misc-009", "misc", "coalesce partitions (cosmetic)", lambda I: I["emp"].coalesce(1), flags=("cosmetic",))
 case("misc-010", "misc", "hint (cosmetic)", lambda I: I["emp"].hint("broadcast"), flags=("cosmetic",))
 
-# ── 19. Type-inference & nullability stress (the divergent slice) ───────────
 case("type-001", "type_inference", "int + long -> long", lambda I: I["nums"].select((F.col("a") + F.col("lng")).alias("r")))
 case("type-002", "type_inference", "int + double -> double", lambda I: I["nums"].select((F.col("a") + F.col("x")).alias("r")))
 case("type-003", "type_inference", "decimal(10,2) + decimal(6,3) -> promoted decimal", lambda I: I["nums"].select((F.col("d1") + F.col("d2")).alias("r")))
@@ -663,7 +624,6 @@ case("type-020", "type_inference", "array of mixed numeric literals -> least com
 case("type-021", "type_inference", "boolean predicate column is non-null when operands non-null", lambda I: I["emp"].select((F.col("age") > 30).alias("pred")))
 case("type-022", "type_inference", "cast widening preserves null; narrowing may null (try)", lambda I: I["nums"].select(F.expr("try_cast(lng as int)").alias("maybe_overflow")), flags=("spark4",))
 
-# ── 20. Deep integration chains (10–20 ops; the realistic biased sample) ────
 case("chain-001", "integration", "filter→withColumn(when)→join→groupBy→agg→window→filter→order→select→limit (≈14 ops)", lambda I: (
     I["emp"]
       .filter(F.col("age").between(25, 60))
@@ -727,18 +687,12 @@ case("chain-006", "integration", "cube→grouping_id→cast→when→order (≈9
       .orderBy("gid", "country")))
 
 
-# ===========================================================================
-# EXPANSION — additional DataFrame-API families beyond the base set.
-# (The SQL front end — correlated subqueries, CTEs, etc. — is a separate corpus.)
-# ===========================================================================
 
 
-# ── 21. unpivot / melt / stack (wide <-> long) ──────────────────────────────
 case("piv-004", "pivot_unpivot", "DataFrame unpivot (wide->long)", lambda I: I["emp"].select("id", "age", "salary").unpivot(["id"], ["age", "salary"], "metric", "value"))
 case("piv-005", "pivot_unpivot", "DataFrame melt (alias of unpivot)", lambda I: I["emp"].select("id", "age", "salary").melt(["id"], ["age", "salary"], "metric", "value"))
 case("piv-006", "pivot_unpivot", "stack() to long form (age cast to DOUBLE to share a type with salary)", lambda I: I["emp"].select("id", F.expr("stack(2, 'age', CAST(age AS DOUBLE), 'salary', salary) as (metric, value)")))
 
-# ── 22. JSON functions ──────────────────────────────────────────────────────
 case("json-001", "json", "get_json_object (path extract)", lambda I: I["raw"].select(F.get_json_object("json_str", "$.a").alias("a")))
 case("json-002", "json", "json_tuple (multi-field)", lambda I: I["raw"].select("id", F.json_tuple("json_str", "a", "e")))
 case("json-003", "json", "from_json with explicit schema", lambda I: I["raw"].select(F.from_json("json_str", "a INT, b ARRAY<STRING>, e DOUBLE").alias("parsed")))
@@ -748,12 +702,10 @@ case("json-006", "json", "schema_of_json (infer schema string)", lambda I: I["ra
 case("json-007", "json", "from_csv with schema", lambda I: I["raw"].select(F.from_csv("csv_str", "qty INT, label STRING, price DOUBLE").alias("rec")))
 case("json-008", "json", "to_csv (struct -> csv string)", lambda I: I["emp"].select(F.to_csv(F.struct("id", "name", "age")).alias("c")))
 
-# ── 23. Hashing / checksum functions ────────────────────────────────────────
 case("hash-001", "hashing", "md5 / sha1 / crc32", lambda I: I["emp"].select(F.md5("name").alias("md5"), F.sha1("name").alias("sha1"), F.crc32(F.col("name").cast("binary")).alias("crc")))
 case("hash-002", "hashing", "sha2 with bit length", lambda I: I["emp"].select(F.sha2("name", 256).alias("sha256")))
 case("hash-003", "hashing", "hash / xxhash64 (multi-col)", lambda I: I["emp"].select(F.hash("name", "dept_id").alias("h"), F.xxhash64("name", "salary").alias("xx")))
 
-# ── 24. Interval types & temporal arithmetic ────────────────────────────────
 case(
     "intv-001",
     "interval",
@@ -789,27 +741,20 @@ case("intv-006", "interval", "timestampadd / timestampdiff (spark4)", lambda I: 
 case(
     "intv-007",
     "interval",
-    # pass-3 fix — `proto_to_data_type` (type_converter.rs) used to decode a
-    # `Kind::CalendarInterval` proto DataType as `DataType::YearMonthInterval`
-    # ("best-effort"); `.cast(CalendarIntervalType())` sends exactly this proto
-    # kind for the CAST target type (`convert_cast` -> `CastToType::Type`), so
-    # the mis-decode meant τ resolved the wrong interval subtype for the cast.
-    # Now it decodes to `DataType::Interval`, matching Spark's actual
-    # CalendarIntervalType. Same client-side Arrow decode gap as intv-001
-    # (`from_arrow_type` has no `is_interval` arm) fires on `.collect()`
-    # regardless of source (CAST vs make_interval), so both engines throw the
-    # same error class -> tri-state PASS, same shape as intv-001/002.
+    # `.cast(CalendarIntervalType())` sends `Kind::CalendarInterval`; decoding
+    # it as `DataType::Interval` matches Spark's CalendarIntervalType. PySpark's
+    # Arrow decoder has no interval arm, so both engines raise the same error on
+    # `.collect()`.
     "cast to CalendarIntervalType (proto DataType Cast target decode)",
     lambda I: I["emp"].select(F.lit("1 day").cast(CalendarIntervalType()).alias("iv")),
     expected_error="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
 )
-# intv-008: R1-6 fix witness. `F.expr(...)` routes the interval literal
+# `F.expr(...)` routes the interval literal
 # through the SQL front-end (same lowering as intv-004), so a sub-day-field
 # DayTimeIntervalType (HOURS) promotes DATE to TIMESTAMP while a day-only
 # interval (intv-004's shape) stays DATE. Verified against Spark 4.1.1.
 case("intv-008", "interval", "date + sub-day INTERVAL promotes to TIMESTAMP (R1-6)", lambda I: I["emp"].select((F.col("hire_date") + F.expr("INTERVAL 25 HOURS")).alias("promoted"), (F.col("hire_date") - F.expr("INTERVAL 25 HOURS")).alias("promoted_sub")))
 
-# ── 25. Newer array / map functions ─────────────────────────────────────────
 case("arr2-001", "array_new", "array_append / array_prepend", lambda I: I["emp"].select(F.array_append("tags", "new").alias("ap"), F.array_prepend("tags", "first").alias("pp")))
 case("arr2-002", "array_new", "array_insert (1-based position)", lambda I: I["emp"].select(F.array_insert("tags", 1, "head").alias("ai")))
 case("arr2-003", "array_new", "array_compact (drop nulls)", lambda I: I["emp"].select(F.array_compact(F.array(F.col("name"), F.lit(None).cast("string"))).alias("ac")))
@@ -818,23 +763,20 @@ case("arr2-005", "array_new", "array_remove / array_except / array_intersect", l
 case("map2-001", "map_new", "map_contains_key", lambda I: I["emp"].select(F.map_contains_key("attrs", F.lit("team")).alias("has_team")))
 case("map2-002", "map_new", "str_to_map", lambda I: I["raw"].select(F.str_to_map(F.lit("a:1,b:2"), F.lit(","), F.lit(":")).alias("m")))
 
-# ── 26. inline / explode-of-structs ─────────────────────────────────────────
 case("inl-001", "inline", "inline (array<struct> -> columns)", lambda I: I["emp"].select("id", F.inline(F.array(F.struct(F.col("name"), F.col("age"))))))
 case("inl-002", "inline", "inline_outer (keeps null/empty array rows)", lambda I: I["emp"].select("id", F.inline_outer(F.array(F.struct(F.col("dept_id"), F.col("salary"))))))
 
-# ── 27. URL / number-format / set lookup parsing ────────────────────────────
 case("parse-001", "parsing", "parse_url (host/query/protocol)", lambda I: I["raw"].select(F.expr("parse_url(url, 'HOST')").alias("host"), F.expr("parse_url(url, 'QUERY', 'q')").alias("q")), flags=("spark4",))
 case("parse-002", "parsing", "url_encode / url_decode", lambda I: I["raw"].select(F.expr("url_encode('a b&c')").alias("enc")), flags=("spark4",))
 case("parse-003", "parsing", "to_number with format -> decimal (row 2 mismatch throws ANSI)", lambda I: I["raw"].select(F.expr("to_number(num_str, '9,999.99')").alias("n")), flags=("spark4",), expected_error="INVALID_FORMAT.MISMATCH_INPUT")
 case("parse-004", "parsing", "try_to_number (null on bad input)", lambda I: I["raw"].select(F.expr("try_to_number(num_str, '999.99')").alias("n")), flags=("spark4",))
-# Grouping-separator value-parity witnesses (guard against the DuckDB
-# `try_cast` regression where '1,234.56' silently drops to NULL because
-# DuckDB's numeric cast does not strip `,`).  See ADR-015.
+# Grouping separators must not be dropped by DuckDB's numeric cast: the value
+# `'1,234.56'` must remain 1234.56.
 # parse-003b uses a nullable column input (`num_str` filtered to the sole
 # valid grouping row) rather than a string literal — Spark reports
 # `to_number(<non-null literal>, <literal>)` as non-nullable, which is a
 # separate τ nullability inference gap outside the scope of the input-strip
-# fix.  Value parity is what this witness locks in.
+# fix. The nullable-column input keeps this case focused on value parity.
 case("parse-003b", "parsing", "to_number(num_str, '9,999.99') on grouped input -> 1234.56", lambda I: I["raw"].filter(F.col("id") == 1).select(F.expr("to_number(num_str, '9,999.99')").alias("n")), flags=("spark4",))
 case("parse-004b", "parsing", "try_to_number literal with grouping -> DECIMAL(6,2) 1234.56", lambda I: I["raw"].select(F.expr("try_to_number('1,234.56', '9,999.99')").alias("n")), flags=("spark4",))
 case("parse-004c", "parsing", "try_to_number bogus input with grouping fmt -> NULL", lambda I: I["raw"].select(F.expr("try_to_number('bogus', '9,999.99')").alias("n")), flags=("spark4",))
@@ -842,17 +784,14 @@ case("parse-005", "parsing", "find_in_set", lambda I: I["emp"].select(F.expr("fi
 case("parse-006", "parsing", "split_part (1-based field)", lambda I: I["raw"].select(F.expr("split_part(csv_str, ',', 2)").alias("field2")), flags=("spark4",))
 case("parse-007", "parsing", "elt (1-based pick from args)", lambda I: I["emp"].select(F.expr("elt(2, 'a', name, 'c')").alias("picked")))
 
-# ── 28. Metadata / id / nondeterministic functions ──────────────────────────
 case("meta-001", "metadata", "monotonically_increasing_id", lambda I: I["emp"].select("id", F.monotonically_increasing_id().alias("mid")), flags=("nondeterministic",))
 case("meta-002", "metadata", "spark_partition_id (cosmetic/physical)", lambda I: I["emp"].select(F.spark_partition_id().alias("pid")), flags=("nondeterministic", "schema_only"))
 case("meta-003", "metadata", "typeof (runtime type string)", lambda I: I["emp"].select(F.expr("typeof(salary)").alias("t"), F.expr("typeof(bonus)").alias("tb")))
 case("meta-004", "metadata", "input_file_name (empty for in-memory)", lambda I: I["emp"].select(F.input_file_name().alias("f")), flags=("nondeterministic", "schema_only"))
 
-# ── 29. Sampling ────────────────────────────────────────────────────────────
 case("samp-001", "sampling", "sample with seed", lambda I: I["emp"].sample(0.5, seed=11), flags=("nondeterministic",))
 case("samp-002", "sampling", "sampleBy stratified", lambda I: I["emp"].sampleBy("dept_id", {10: 0.5, 20: 0.5, 30: 1.0}, seed=11), flags=("nondeterministic",))
 
-# ── 30. Additional aggregates ───────────────────────────────────────────────
 case("agg2-001", "aggregate_new", "any_value", lambda I: I["emp"].groupBy("dept_id").agg(F.any_value("name").alias("a")), flags=("schema_only",))
 case("agg2-002", "aggregate_new", "array_agg (alias of collect_list)", lambda I: I["emp"].groupBy("dept_id").agg(F.array_agg("name").alias("names")), flags=("schema_only",))
 case("agg2-003", "aggregate_new", "regression aggregates (regr_slope/regr_r2)", lambda I: I["emp"].agg(F.regr_slope("salary", "age").alias("slope"), F.regr_r2("salary", "age").alias("r2")))
@@ -860,85 +799,40 @@ case("agg2-004", "aggregate_new", "try_sum / try_avg (overflow-safe, spark4)", l
 case("agg2-005", "aggregate_new", "histogram_numeric", lambda I: I["emp"].agg(F.expr("histogram_numeric(salary, 3)").alias("hist")), flags=("schema_only",))
 case("agg2-006", "aggregate_new", "count_if + filtered agg combination", lambda I: I["emp"].groupBy("dept_id").agg(F.count_if(F.col("salary") > 90000).alias("n_high"), F.avg(F.when(F.col("active"), F.col("salary"))).alias("avg_active_sal")))
 
-# ── 31. Structural DataFrame methods ────────────────────────────────────────
 case("struc-001", "structural", "toDF (positional rename all columns)", lambda I: I["dept"].toDF("d_id", "d_name", "d_budget", "d_loc", "d_country"))
 case("struc-002", "structural", "colRegex (select by pattern)", lambda I: I["emp"].select(I["emp"].colRegex("`.*_id`")))
 case("struc-003", "structural", "repartitionByRange (cosmetic)", lambda I: I["emp"].repartitionByRange(3, "salary"), flags=("cosmetic",))
 case("struc-004", "structural", "withMetadata (column metadata, schema-affecting)", lambda I: I["emp"].withMetadata("salary", {"unit": "USD"}), flags=("schema_only",))
 case("struc-005", "structural", "selectExpr with star and exclude-like rebuild", lambda I: I["emp"].selectExpr("id", "name", "age + 1 AS age1", "salary / 1000 AS sal_k"))
 case("struc-006", "structural", "reduce HOF (alias of aggregate, spark4)", lambda I: I["emp"].select(F.expr("reduce(tags, '', (acc, x) -> concat(acc, x))").alias("cat")), flags=("spark4",))
-# F-todf-dupname (v2-corpus-followups.md): toDF's positional rename over a
+# `toDF` positionally renames a
 # child with DUPLICATE column names (both sides of a self-join project
 # "id"). A by-name rename_map at emission would collapse the positional
 # pairs [("id","a"),("id","b")] last-wins to id->b; the downstream
 # select("a") must resolve to the FIRST "id" (the self-join's "e" side).
 case("struc-007", "structural", "toDF positional rename over dup-named self-join child", lambda I: I["emp"].alias("e").join(I["emp"].alias("m"), F.col("e.manager_id") == F.col("m.id"), "left").select(F.col("e.id"), F.col("m.id")).toDF("a", "b").select("a"))
-# ── Review C1 witness ───────────────────────────────────────────────────────
-# `toDF` renames EVERY column, which severs referenceability via the
-# PRE-rename qualifier exactly as `withColumnRenamed` does. Spark 4.1.1 raises
-# UNRESOLVED_COLUMN.WITH_SUGGESTION here; τ used to RESOLVE it, because
-# `analyze_to_df` cloned+renamed the attributes without clearing
-# `source_quals` (the sibling `WithColumnsRenamed` arm does). Born red as an
-# error-parity divergence: "Spark raised …; τ returned N rows".
+# `toDF` renames every column, so a pre-rename qualifier is no longer
+# referenceable. Spark raises UNRESOLVED_COLUMN.WITH_SUGGESTION for that
+# reference.
 case("errcls-001", "error_class", "C1 — dead pre-toDF qualifier must not resolve", lambda I: I["emp"].select("id", "name").alias("t").toDF("a", "b").select("t.a"), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
-# ── Review A1 witnesses (DataFrame front end) ───────────────────────────────
-# Both were previously `AnalyzerError::Other`, which exited as gRPC
-# UNIMPLEMENTED with the class buried in prose, so `spark_error_class` could
-# only ever recover None — the cases could not pass an error-class comparison
-# at all. Classes below were OBSERVED against live Spark 4.1.1.
 case("errcls-002", "error_class", "A1 — union arity mismatch carries NUM_COLUMNS_MISMATCH", lambda I: I["emp"].union(I["dept"]), expected_error="NUM_COLUMNS_MISMATCH")
 case("errcls-003", "error_class", "A1 — toDF arity mismatch carries ASSIGNMENT_ARITY_MISMATCH", lambda I: I["emp"].toDF("only_one"), expected_error="ASSIGNMENT_ARITY_MISMATCH")
-# ── Review A1 bonus witnesses: τ was OVER-STRICT (Spark accepts these) ──────
-# The audit found τ rejecting input Spark runs. Verified twice against live
-# Spark 4.1.1 — it analysed AND returned rows. Spark permits duplicate names
-# in an output schema; it only rejects an ambiguous *reference*. These carry no
-# `expected_error`: they must return rows on both sides.
+# Spark permits duplicate names in an output schema and rejects only an
+# ambiguous reference, so these cases return rows on both sides.
 case("errcls-004", "error_class", "A1 — dropFields of an absent field is a no-op, not an error", lambda I: I["emp"].select(F.col("id")).withColumn("s", F.struct(F.col("id").alias("x"))).select(F.col("s").dropFields("nope").alias("kept")))
-# Same shape as errcls-004 but UNALIASED, which exposes a THIRD gap the A1
-# audit surfaced: `pretty_name` has no `UpdateFields` arm, so τ auto-names the
-# projection "expr" where Spark names it "update_fields(s, dropfield())". Same
-# family as the deferred prettyname-004 (Window) case — data matches, only the
-# auto-generated column name diverges. DEFERRED: not in the baseline, so its
-# redness is not a regression. errcls-004 above carries an explicit alias so it
-# tests the over-strictness fix without depending on this.
+# In the unaliased form, Spark names the projection
+# `update_fields(s, dropfield())`, while τ's `pretty_name` fallback uses
+# `expr`; the values otherwise match.
 case("errcls-006", "error_class", "A1 — unaliased dropFields pretty-name (DEFERRED: no UpdateFields pretty_name arm)", lambda I: I["emp"].select(F.col("id")).withColumn("s", F.struct(F.col("id").alias("x"))).select(F.col("s").dropFields("nope")))
 case("errcls-005", "error_class", "A1 — unpivot variable name may collide with an id column", lambda I: I["emp"].select("id", "salary").unpivot(["id"], ["salary"], "id", "v"))
 
-# ── 32. Time-window aggregate (tumbling) ────────────────────────────────────
 case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["emp"].filter(F.col("last_login").isNotNull()).groupBy(F.window("last_login", "1 day")).agg(F.count(F.lit(1)).alias("n")))
 
 
-# ── 32b. Raw SQL wrapped by DataFrame ops — DEFERRED (transpiler hardening) ──
-#
-# tasks/transpiler-hardening-deferred.md. These pin a Thunderduck-boundary gap
-# derived from the last 25 commits of the JVM Thunderduck (nubank/thunderduck),
-# where a cluster of fixes hardened the `spark.sql(...)`-wrapped-by-DataFrame-op
-# path: PR #58 (backtick leak under LIMIT/OFFSET), PR #60 (duplicate CTE render
-# when WithCTE is nested under Limit), and PR #59/#61/#62 (DESCRIBE/SHOW NPE
-# under Limit/Offset). In the JVM those were distinct symptoms of one root
-# cause: the plan-deserialization branch that handles `spark.sql(...)` wrapped
-# by DataFrame ops did not route the raw SQL through the SparkSQL parser.
-#
-# τ has the SAME root cause but a WIDER blast radius. `service.rs`
-# `relation_to_common_ast` dispatches on the ROOT relation only: a top-level
-# `RelType::Sql` goes to parser_v2, everything else to V2RelationConverter. The
-# instant `spark.sql(...)` is wrapped by ANY DataFrame op the root becomes a
-# structured relation (Limit / Offset / Filter / ... -> Sql), so the converter
-# runs; it recurses (`convert_limit`/`convert_offset`/`convert_filter` all call
-# `convert_input`) down to the nested `RelType::Sql` leaf and bails with a
-# Thunderduck-boundary error ("SQL text is owned by parser_v2, not
-# V2RelationConverter"). Spark accepts every one of these; τ never reaches the
-# parser that would normalize backticks / frame the CTE / pass the metadata
-# statement through. So the whole shape — not just the three JVM symptoms —
-# regresses.
-#
-# Born RED against τ and expected to STAY red until τ routes nested SQL leaves
-# through parser_v2 (the acceptance gate). They are NOT in
-# select_block_corpus_baseline.txt, so their redness is not a regression; they
-# are pinned in sql_wrap_witness_manifest.json ("deferred": true). Goldens were
-# RE-RECORDED from live Apache Spark 4.1.1 (2026-07-15, Linux devcontainer) and
-# are authoritative. Regenerate via:
-# `THUNDERDUCK_WORKTREE_ROOT=/workspace ./tests/scripts/run-differential-tests.sh --record core -k sqlwrap`.
+# Wrapping `spark.sql(...)` in a DataFrame operation leaves a nested
+# `RelType::Sql` below a structured relation. The converter does not route that
+# leaf through `parser_v2`, so Spark-accepted cases currently hit a
+# Thunderduck-boundary error.
 
 def _sqlwrap(sql, wrap):
     """Build closure: register I['emp'] as a temp view, run raw `spark.sql(sql)`,
@@ -959,61 +853,24 @@ case("sqlwrap-004", "sql_wrap", "DEFERRED — SELECT wrapped by .filter (gap is 
 case("sqlwrap-005", "sql_wrap", "DEFERRED — SELECT under .offset+.limit pagination (Root->Limit->Offset->Sql, the JVM PR#59/#62 plan shape)", _sqlwrap("SELECT id, name FROM sqlwrap_emp ORDER BY id", lambda df: df.offset(2).limit(2)), flags=("spark4",))
 
 
-# ── 32c. Unaliased projection auto-naming (toPrettySQL parity) — DEFERRED ────
-#
-# tasks/pretty-name-parity-deferred.md. Derived from the SAME last-25-commits
-# analysis of the JVM Thunderduck (nubank/thunderduck) that produced the
-# sqlwrap cluster above — specifically the neighbourhood of PR #55
-# (092a616a35, "Preserve source column name for bare Cast(col(c), T)
-# projections"). That JVM fix is a *deliberate divergence FROM Spark*: it
-# renames a bare `col(c).cast(T)` to `c` instead of Spark's auto-name
-# `CAST(c AS T)`. τ does NOT reproduce that bug — τ's `analyzer::pretty_name`
-# already matches Spark's `toPrettySQL` exactly for a bare Cast
-# (`CAST(c AS BIGINT)`) and `ensure_named` forces that alias into emission, so
-# a bare-cast projection is GREEN against the Spark oracle (no witness needed).
-#
-# But analyzing PR #55 surfaced a REAL adjacent gap in the same
-# unaliased-projection auto-naming family. `analyzer::pretty_name` carries an
-# explicit Thunderduck-boundary fallback — its own doc-comment states that the
-# shapes Spark renders in a form τ "does not yet match exactly (`CaseWhen`,
-# windows, subqueries, complex-type literals, …) keep the Thunderduck-boundary
-# fallback name `expr`." Every existing `cond-*` / `win-*` corpus case aliases
-# its projection (`.alias(...)` / `withColumn(name, ...)`), so this unaliased
-# auto-naming path is UNTESTED. When such a projection is unaliased, τ names
-# the output column `expr` while Spark's `toPrettySQL` names it
-# `CASE WHEN ... END` / `row_number() OVER (...)`; the differential
-# `_compare_schemas` flags the column-NAME mismatch → red.
-#
-# Born RED against τ and expected to STAY red until `pretty_name` renders these
-# shapes with Spark parity (the acceptance gate). They are NOT in
-# select_block_corpus_baseline.txt, so their redness is not a regression; they
-# are pinned in pretty_name_witness_manifest.json ("deferred": true). Goldens
-# were hand-authored from the known `emp` inputs; the column NAME (the field
-# that diverges) MUST be re-recorded via
-# `run-differential-tests.sh --record core -k prettyname-<nnn>` in the Linux
-# devcontainer to become authoritative (this analysis ran on a host with no
-# runnable τ/Spark). The born-red status does not depend on the exact name — τ
-# emits `expr`, which Spark never produces for these shapes.
+# Unaliased CASE and window projections use τ's fallback name `expr`, while
+# Spark's `toPrettySQL` names them from the rendered expression. These cases
+# exercise that schema-name parity boundary.
 case("prettyname-001", "pretty_name", "DEFERRED — unaliased when/otherwise (τ names col 'expr'; Spark 'CASE WHEN (age >= 40) THEN 1 ELSE 0 END')", lambda I: I["emp"].select(F.when(F.col("age") >= 40, 1).otherwise(0)))
 case("prettyname-002", "pretty_name", "DEFERRED — unaliased chained when (τ 'expr'; Spark 'CASE WHEN (age < 30) THEN 0 WHEN (age < 45) THEN 1 ELSE 2 END')", lambda I: I["emp"].select(F.when(F.col("age") < 30, 0).when(F.col("age") < 45, 1).otherwise(2)))
 case("prettyname-003", "pretty_name", "DEFERRED — unaliased when WITHOUT otherwise, nullable (τ 'expr'; Spark 'CASE WHEN active THEN salary END')", lambda I: I["emp"].select(F.when(F.col("active"), F.col("salary"))))
 case("prettyname-004", "pretty_name", "DEFERRED — unaliased window row_number (τ 'expr'; Spark 'row_number() OVER (...)') — second fallback shape (windows) from the same pretty_name boundary", lambda I: I["emp"].select(F.row_number().over(W.orderBy("id"))))
 
 
-# ── 33. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
 #
-# Query logic lives in sibling modules, extracted/moved VERBATIM from the
-# retired legacy test files:
-#   - tpch_dataframe_queries.py  (was the legacy TPC-H DataFrame test file's inner
-#     build_qNN closures; EPSILONS preserves each test's float tolerance)
-#   - tpcds_dataframe_queries.py (was tests/integration/tpcds_dataframe/;
-#     same module, new home)
+# Query logic lives in sibling modules; EPSILONS preserves each query's float
+# tolerance.
 # Both implement queries against `session.table(...)`, so the cases adapt via
 # the session that built I (`I["emp"].sparkSession`) — the harness registers
 # the parquet-backed TPC temp views on both engines' sessions (see
 # conftest._register_tpc_views + tpc_view_switcher for the benchmark-colliding
 # `customer` view). Red cases here are the τ fitness signal (ADR-022); see
-# .agent-output/tpc-baseline.md for the pre-migration pass/fail oracle.
+# .agent-output/tpc-baseline.md for the regression oracle.
 
 from differential.tpch_dataframe_queries import (  # noqa: E402
     EPSILONS as _TPCH_EPSILONS,
@@ -1048,9 +905,7 @@ for _n in _TPCDS_DF_QUERY_NUMS:
     )
 
 
-# ---------------------------------------------------------------------------
 # Coverage summary + optional self-check runner
-# ---------------------------------------------------------------------------
 
 def coverage() -> Dict[str, int]:
     counts: Dict[str, int] = {}

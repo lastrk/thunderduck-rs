@@ -28,9 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # SUM Boundary Value Tests (No Overflow)
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -134,9 +132,7 @@ class TestSumBoundaryValues:
         assert_dataframes_equal(ref, td, "sum_with_groupby_no_overflow", ignore_nullable=True)
 
 
-# =============================================================================
 # Return Type Verification
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -246,9 +242,7 @@ class TestAggregateReturnTypes:
         assert result == 600, f"Expected 600, got {result}"
 
 
-# =============================================================================
 # Arithmetic Expression Tests (No Overflow)
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -324,9 +318,7 @@ class TestArithmeticExpressions:
         assert_dataframes_equal(ref, td, "complex_arithmetic_expression", ignore_nullable=True)
 
 
-# =============================================================================
 # Sanity Checks (No Overflow)
-# =============================================================================
 
 
 @pytest.mark.differential

@@ -1,14 +1,7 @@
 #pragma once
 
-// Spark-bit-parity XXH64 primitives, mirroring
-// org.apache.spark.unsafe.hash.XXH64 (which is in turn a port of Yann
-// Collet's reference XXH64 algorithm). These produce uint64_t hashes; the
-// signed BIGINT return type used by spark_xxhash64 is a bit-reinterpret of
-// the result.
-//
-// All multi-byte reads are little-endian via memcpy; on x86_64 / aarch64
-// this compiles to a single mov. Arithmetic is uint64_t throughout, which
-// matches Java's signed-long modulo-2^64 wraparound bit-for-bit.
+// Spark's XXH64 variant. Arithmetic uses uint64_t for Java's modulo-2^64
+// behavior; little-endian reads use memcpy for portable unaligned access.
 
 #include <cstddef>
 #include <cstdint>

@@ -66,12 +66,8 @@ pub use super::ast::SetOpKind;
 pub(super) const DEFAULT_SUMMARY_STATS: &[&str] =
     &["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"];
 
-/// τ's schema type alias — points at [`ResolvedSchema`] (N9 INC-1). This
-/// auto-flips every `&Schema` reader (emission's 54 params among them) to
-/// `&ResolvedSchema` without touching their bodies.
+/// τ's resolved schema type alias.
 pub type Schema = ResolvedSchema;
-
-// ── TypedAst / TypedOp ──────────────────────────────────────────────────────
 
 /// A typed plan node: an operator plus its resolved output schema and the
 /// alias scope that output exposes.
@@ -146,13 +142,10 @@ macro_rules! scope_passthrough {
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
-    /// `(plan_id, field-range)` bindings, OUTERMOST join first —
+    /// `(plan_id, field-range)` bindings, outermost join first —
     /// [`RelScope::lookup_plan_id`] uses first match, so the nearest
-    /// enclosing join's range wins. Phase 3b: no side tag — `resolve_column`
-    /// always binds a plan_id ref bare (qualifier `None`) plus the attribute
-    /// identity (`expr_id`) of the resolved position in the emitting
-    /// operator's schema; emission derives which side to bind against via
-    /// that identity (see the module's governing invariant).
+    /// enclosing join's range wins. Plan-id references are bound bare and
+    /// carry the resolved attribute identity for emission-side binding.
     pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>)>,
     /// plan_ids bound on BOTH the left AND right side of the SAME join —
     /// the un-realiased self-join `df.join(df, ...)` reusing the identical
@@ -216,7 +209,7 @@ impl RelScope {
     /// already stamped, so this reads their `scope` fields and offsets
     /// ranges — it never re-walks a subtree.
     ///
-    /// Binding rules (formerly `collect_qualifier_bindings`):
+    /// Binding rules:
     /// - `TableScan{table}`: bind `table` to the full range.
     /// - `AliasedRelation{alias}`: bind `alias` to the full range; the child's
     ///   scope is dropped — emission re-scopes everything under it to `alias`.
@@ -349,9 +342,7 @@ fn merge_join_scopes(
     let right_range = left_len..left_len + right.resolved_schema.len();
     let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
 
-    // ADR-023 3b-i: a plan_id present in BOTH this join's OWN left and right
-    // sides is the un-realiased self-join `df.join(df, ...)` — genuinely
-    // ambiguous (Spark cannot tell which side is meant).
+    // A plan_id present on both sides of an unaliased self-join is ambiguous.
     let own_ambiguous: Vec<i64> = if keep_right {
         left_plan_ids
             .iter()
@@ -447,7 +438,7 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// Grouping expressions.
         grouping: Vec<Expression>,
-        /// The complete output list — see [`CommonOp::Aggregate`]'s doc (N7).
+        /// The complete output list; grouping columns may be restated here.
         aggregates: Vec<Expression>,
         /// GROUP BY variant.
         grouping_kind: crate::transpiler_v2::ast::GroupingKind,
@@ -572,7 +563,7 @@ pub enum TypedOp {
     /// analyzer computes the renamed output schema at construction (walking
     /// input fields; misses silently ignored per Spark semantics), so the
     /// node carries NO rename list — `resolved_schema` IS the rename, and
-    /// emission mirrors it positionally (Pass E2, F-todf-dupname fix).
+    /// emission mirrors it positionally.
     WithColumnsRenamed {
         /// The input relation.
         input: Box<TypedAst>,
@@ -742,22 +733,15 @@ pub enum TypedOp {
     },
 }
 
-// ── AnalyzerError (ADR-022 two-category split) ──────────────────────────────
-
-/// Errors surfaced by the τ analyzer.
-///
-/// Two categories per ADR-022:
+/// Errors surfaced by the τ analyzer. They are classified per ADR-022:
 ///
 /// - **Spark-emulated** — errors reference Spark would also raise. The client
 ///   sees the same error under Thunderduck as under Spark.
 /// - **Thunderduck-boundary** — errors that signal Thunderduck's incomplete
 ///   implementation (a plan / rule not yet lowered).
 ///
-/// The Display prefix (`[SPARK-EMULATED]` vs `[TDCK-BOUNDARY]`) enables
-/// grep-based classification and reviewer verification.
-/// Display prefix marking an [`AnalyzerError`] as ADR-022 Spark-emulated.
-/// Stripped by [`analyzer_error_to_emission_error`] before the Spark class
-/// token (if any) takes its place as the leading token on the wire.
+/// Display prefixes identify the category and are stripped before the error
+/// crosses the wire.
 pub const SPARK_EMULATED_PREFIX: &str = "[SPARK-EMULATED] ";
 /// Display prefix marking an [`AnalyzerError`] as a Thunderduck-boundary gap.
 pub const TDCK_BOUNDARY_PREFIX: &str = "[TDCK-BOUNDARY] ";
@@ -767,7 +751,6 @@ pub const TDCK_INTERNAL_PREFIX: &str = "[TDCK-INTERNAL] ";
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum AnalyzerError {
-    // ── Spark-emulated ─────────────────────────────────────────────────────
     /// The named table could not be resolved (missing from catalog / base types).
     #[error("[SPARK-EMULATED] table not found: `{name}`")]
     UnknownTable {
@@ -832,8 +815,7 @@ pub enum AnalyzerError {
     },
 
     /// A Spark-emulated error whose exact Spark error-class token has been
-    /// **observed against live Spark 4.1.1** (review A1; the per-site audit is
-    /// recorded in `tasks/tau-error-class-audit-2026-08.md`).
+    /// established from Spark 4.1.1 behavior.
     ///
     /// Prefer this over [`Self::Other`] whenever the class is known. `Other`
     /// means "Spark rejects this input too, but we have not established which
@@ -862,7 +844,6 @@ pub enum AnalyzerError {
         reason: String,
     },
 
-    // ── τ-internal ─────────────────────────────────────────────────────────
     /// A τ-internal invariant violation raised from the analyzer. Bridges to
     /// [`EmissionError::Internal`] → `Status::internal`.
     ///
@@ -878,7 +859,6 @@ pub enum AnalyzerError {
         reason: String,
     },
 
-    // ── Thunderduck-boundary ───────────────────────────────────────────────
     /// The named operator is not yet supported by the τ analyzer.
     #[error("[TDCK-BOUNDARY] operator `{op}` not yet implemented in analyzer: {reason}")]
     PuntedOperator {
@@ -899,14 +879,14 @@ pub enum AnalyzerError {
 }
 
 impl AnalyzerError {
-    /// The exact Spark error-class token this variant emulates, if any
-    /// (ADR-023 chunk 3b). `None` for `Other` (no specific class to surface)
+    /// The exact Spark error-class token this variant emulates, if any.
+    /// `None` for `Other` (no specific class to surface)
     /// and for the Thunderduck-boundary variants (no Spark class applies —
     /// these are τ's own gaps, not a Spark-emulated error).
     ///
     /// Best-effort mappings (subclass not reproduced): `AmbiguousLateralColumnAlias`
     /// and `TypeMismatch` are base-class only. `UnknownColumn` → the
-    /// `.WITH_SUGGESTION` subclass — ADR-023 3d: Spark emits it whenever
+    /// `.WITH_SUGGESTION` subclass; Spark emits it whenever
     /// candidate columns exist in scope, which holds for every shape that
     /// reaches `UnknownColumn` here.
     pub fn spark_class(&self) -> Option<&'static str> {
@@ -928,7 +908,7 @@ impl AnalyzerError {
     /// Which ADR-022 category (plus τ-internal) this variant belongs to.
     ///
     /// This — **not** `spark_class().is_some()` — is the bridge's branch
-    /// condition. Review A1: a Spark-emulated error with no established class
+    /// condition. A Spark-emulated error with no established class
     /// is still Spark-emulated, and keying on the class made every such error
     /// fall to the Thunderduck-boundary path and exit as gRPC UNIMPLEMENTED,
     /// telling clients "τ doesn't support this" about inputs Spark itself
@@ -980,8 +960,6 @@ pub enum ErrorCategory {
     Internal,
 }
 
-// ── analyze() — the top-level entry point ───────────────────────────────────
-
 /// Analyze a plan: resolve columns, assign types, derive nullability.
 ///
 /// Returns a [`TypedAst`] whose every plan node carries a resolved
@@ -993,8 +971,6 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
     // comments below mark where each conceptual pass runs.
     analyze_node(ast, base_types, None)
 }
-
-// ── Public helpers ──────────────────────────────────────────────────────────
 
 /// INV5: walk a [`TypedAst`] and return `true` iff every node carries a
 /// fully-resolved schema and every embedded `ColumnReference` carries
@@ -1091,7 +1067,7 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
 /// ADR-022 classification.
 ///
 /// Branches on [`AnalyzerError::category`], **not** on whether a Spark class
-/// is known (review A1). Spark-emulated errors become
+/// is known. Spark-emulated errors become
 /// [`EmissionError::SparkEmulated`] — carrying the class token when one has
 /// been established, and `None` otherwise, which renders a clean prefix-free
 /// message rather than a fabricated token. Either way they exit as
@@ -1138,14 +1114,11 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
     }
 }
 
-// ── Internal: single-pass bottom-up analyzer ────────────────────────────────
-
 /// Analyze `input`, clone its resolved schema, and wrap it in a caller-built
 /// [`TypedOp`] variant. The output schema is a straight passthrough — used by
 /// operators that neither add, drop, nor retype columns (Filter, Sort, Limit,
-/// Deduplicate, Sample, SampleBy, NaDrop, NaReplace). NOT `AliasedRelation`
-/// (N9 increment 3): it resets lineage to its own alias, so it builds its
-/// typed node directly rather than through this straight-clone helper.
+/// Deduplicate, Sample, SampleBy, NaDrop, NaReplace). `AliasedRelation`
+/// resets lineage to its own alias and is built separately.
 ///
 /// The `build_op` closure receives the typed input by value so it can move it
 /// into a `Box`; it returns a `Result` so callers may perform failable
@@ -1162,10 +1135,7 @@ fn passthrough_schema_arm(
     Ok(TypedAst::new(op, resolved_schema))
 }
 
-/// ADR-023 tier-3 leaf-seed helper: overwrite EVERY field's `source_quals`
-/// with the SAME uniform `quals` set — shared by the `TableScan` and
-/// `AliasedRelation` origination arms, where every output column is equally
-/// "from" the table/alias being scanned or renamed.
+/// Seed every output attribute with the same source-qualifier set.
 fn seed_source_quals(schema: ResolvedSchema, quals: BTreeSet<String>) -> ResolvedSchema {
     ResolvedSchema::new(
         schema
@@ -1182,7 +1152,6 @@ fn analyze_node(
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
-        // ── Leaves ────────────────────────────────────────────────────────
         CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
 
         CommonOp::TableScan { table } => {
@@ -1194,14 +1163,8 @@ fn analyze_node(
                     .ok_or_else(|| AnalyzerError::UnknownTable {
                         name: table.clone(),
                     })?;
-            // A `TableScan` is an origination point — mint fresh ids for its
-            // columns. An alias, if any, sits on an enclosing
-            // `AliasedRelation`, which overwrites both the scope binding and
-            // the lineage below it (Spark shadowing).
-            //
-            // ADR-023 tier-3 leaf seed: EVERY column of a `TableScan` is
-            // equally "from" the table — seed the SAME qualifier set onto
-            // every minted attribute.
+            // A table scan mints fresh ids and seeds every column with the
+            // table qualifier. An enclosing alias replaces that lineage.
             let mut quals = BTreeSet::new();
             quals.insert(table.clone());
             Ok(TypedAst::new(
@@ -1277,26 +1240,13 @@ fn analyze_node(
             reason: "unnest analysis (not implemented in τ)".to_owned(),
         }),
 
-        // ── Unary ─────────────────────────────────────────────────────────
         CommonOp::Project { input, projections } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
-            // Pass 85 — expand `df.colRegex("`.*_id`")` projections BEFORE
-            // resolution. Each `UnresolvedRegex` becomes N `UnresolvedColumn`
-            // refs (one per matching input field, schema order preserved).
+            // Expand regex projections before resolution.
             let projections = expand_regex_projections(projections, &typed_input.resolved_schema)?;
-            // Pass 90 — expand `F.inline(arr)` / `F.inline_outer(arr)`
-            // projections into N synthetic per-struct-field projections. Each
-            // becomes `Alias(inline_field(arr, "<name>"), "<name>")` (inner)
-            // or `Alias(inline_outer_field(arr, "<name>"), "<name>")` (outer).
-            // Runs BEFORE `resolve_and_stamp` — the synthesized args are
-            // resolved by the outer walk. Corpus: inl-001, inl-002.
+            // Expand inline projections before resolution.
             let projections = expand_inline_projections(projections, &typed_input.resolved_schema)?;
-            // Pass 91 — expand `F.json_tuple(json, k1, ..., kN)` projections
-            // into N synthetic per-key projections. Each becomes
-            // `Alias(json_tuple_field(json, "<ki>"), "c<i>")` — positional
-            // names per Spark's `Generator.elementSchema`, NOT the key
-            // literals. Runs after inline expansion, before
-            // `resolve_and_stamp`. Corpus: json-002.
+            // Expand json_tuple projections before resolution.
             let projections = expand_json_tuple_projections(projections)?;
             // piv-006 — expand `stack(N, v11, ..., vNK) AS (a1, ..., aK)`
             // (wrapped by `parser_v2::SparkSqlParserV2::parse_expression` as
@@ -1304,19 +1254,12 @@ fn analyze_node(
             // per-column projections `Alias(stack_col(v1i, v2i, ..., vNi),
             // "ai")`. Emission maps `stack_col(...)` to `UNNEST([...])`.
             let projections = expand_stack_projections(projections)?;
-            // Pass 9 (pr-007) — Spark's Lateral Column Alias (LCA): a later
-            // SELECT-list item may reference an earlier item's alias, e.g.
-            // `SELECT salary * 1.1 AS raised, raised - salary AS delta`.
-            // Left-to-right fold; substitutes fully-inlined earlier aliases
-            // into later items BEFORE `resolve_and_stamp` ever sees them, so
-            // the rest of resolution/typing is completely unaware of LCA.
+            // Inline earlier SELECT-list aliases for Spark's lateral-column
+            // alias behavior before ordinary resolution.
             let projections =
                 expand_lateral_column_aliases(projections, &typed_input.resolved_schema)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
-            // N8: every non-Star, non-bare-reference entry is wrapped as a
-            // named `Alias` right after resolution — the Project's output
-            // list becomes a list of `NamedExpression`s by construction, the
-            // same invariant Spark's analyzer enforces via
+            // Give each computed output a name, matching Spark's
             // `UnresolvedAlias` → `Alias` resolution.
             let projections = projections
                 .into_iter()
@@ -1364,44 +1307,14 @@ fn analyze_node(
                 extended_schema.clone(),
             );
             if extended_schema.len() == original_schema.len() {
-                // No increment-2 promotion (design 023 step 5) — byte-
-                // identical to the pre-increment-2 shape.
                 Ok(sort)
             } else {
-                // Increment 2 pushed hidden aggregate/projection outputs into
-                // the Sort's child to bind a key that resolves against the
-                // child's own input but matches no existing SELECT-list
-                // entry (Spark `ResolveReferencesInSort`'s trim-`Project`
-                // pattern). LIMIT/OFFSET stay inside the Sort; only the
-                // extra, now-visible trailing columns are trimmed back off.
-                //
-                // O8 (design note, no behavior here): the Sort's ORDER BY
-                // (and LIMIT/OFFSET) is kept INSIDE this Sort node — i.e.
-                // inside the child/derived table the trim `Project` below
-                // wraps — ON PURPOSE. The hidden sort keys are addressable
-                // there unambiguously by identity (via `expr_id`); hoisting
-                // the ORDER BY onto the *outer* trim would move it into a
-                // scope where a hidden key's name can shadow a visible
-                // output alias and silently order wrong — the N10 dup-name
-                // hazard, DuckDB-verified on the ord-014 shape
-                // (`SELECT salary AS id FROM emp ORDER BY id` orders by
-                // `salary`, not the original `id`, once `id` is a bare outer
-                // reference). Emission (`build_sort` then `build_project` in
-                // `emission.rs`) renders this as
-                // `SELECT <trim> FROM (… ORDER BY … [LIMIT n]) sub` with no
-                // outer ORDER BY; output row order then relies on DuckDB
-                // preserving a derived table's ORDER BY through an
-                // order-preserving projection (confirmed via `EXPLAIN`: a
-                // `PROJECTION` parent over a pipeline-breaking `ORDER_BY`) —
-                // an execution-model property of the target engine, not a
-                // SQL-standard guarantee. The differential corpora
-                // canonicalize output rows (`sorted(rows, key=repr)`) and so
-                // CANNOT detect a row-order regression here; the guard is
-                // the emission unit tests
-                // `sort_trim_project_orders_by_key_inside_derived_table_q078_shape`
-                // and
-                // `sort_trim_project_keeps_order_by_shadow_safe_ord014_shape`
-                // in `emission.rs`.
+                // Hidden keys are promoted into this derived Sort and trimmed
+                // here. ORDER BY and LIMIT/OFFSET must stay inside: hoisting
+                // would rebind duplicate names (ord-014). Preserving row order
+                // through the trim is a DuckDB execution property, and the
+                // differential harness sorts rows; the q078/ord-014 emission
+                // shape tests are therefore the regression guard.
                 let trim_projections: Vec<Expression> = original_schema
                     .fields
                     .iter()
@@ -1440,8 +1353,7 @@ fn analyze_node(
             let typed_input = analyze_node(*input, base_types, outer)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
             let grouping = resolve_expr_list(grouping, &ctx)?;
-            // N8: `aggregates` IS the complete output list (N7) — wrap every
-            // computed entry as a named `Alias`, same invariant as Project.
+            // Wrap computed output entries as named aliases.
             // `grouping` is NOT wrapped — it is an internal GROUP BY key
             // list, not an output list (its restated copy inside
             // `aggregates`, if any, gets wrapped there instead).
@@ -1455,9 +1367,7 @@ fn analyze_node(
             let having = having
                 .map(|h| resolve_boolean_predicate(h, &ctx, "having-condition"))
                 .transpose()?;
-            // N7: `aggregates` IS the complete output list by construction —
-            // every front-end builds it that way (see `CommonOp::Aggregate`'s
-            // doc), so the output schema is a straight map over `aggregates`.
+            // The aggregate list is the complete output list.
             let mut output_fields: Vec<Attribute> = aggregates
                 .iter()
                 .map(|e| output_attribute(e, &typed_input.resolved_schema))
@@ -1497,12 +1407,10 @@ fn analyze_node(
             ))
         }
 
-        // ── WithColumns (add-or-replace by name, Spark semantics) ────────
         CommonOp::WithColumns { input, assignments } => {
             analyze_with_columns(*input, assignments, base_types, outer)
         }
 
-        // ── NA family ────────────────────────────────────────────────────
         CommonOp::NaFill {
             input,
             cols,
@@ -1531,7 +1439,6 @@ fn analyze_node(
             })
         }),
 
-        // ── Unpivot (Spark `df.unpivot(...)` / `df.melt(...)`) ──────────
         CommonOp::Unpivot {
             input,
             ids,
@@ -1548,22 +1455,18 @@ fn analyze_node(
             outer,
         ),
 
-        // ── Describe (Spark `df.describe(...)`) ─────────────────────────
         CommonOp::Describe { input, cols } => analyze_describe(*input, cols, base_types, outer),
 
-        // ── Summary (Spark `df.summary(...)`) ───────────────────────────
         CommonOp::Summary { input, statistics } => {
             analyze_summary(*input, statistics, base_types, outer)
         }
 
-        // ── FreqItems (Spark `df.stat.freqItems(...)`) ──────────────────
         CommonOp::FreqItems {
             input,
             cols,
             support,
         } => analyze_freq_items(*input, cols, support, base_types, outer),
 
-        // ── Crosstab — Thunderduck-boundary (ADR-022) ───────────────────
         // Output columns are DISTINCT(col2) — unknowable at plan time.
         // Mirror-image of Pivot[implicit-values]: same session-hook blocker
         //. Reject loudly rather than stamp a partial schema.
@@ -1572,7 +1475,6 @@ fn analyze_node(
             reason: "requires session-injected DISTINCT-query hook".to_owned(),
         }),
 
-        // ── Pivot (Spark `df.groupBy(...).pivot(...).agg(...)`) ─────────
         CommonOp::Pivot {
             input,
             grouping,
@@ -1589,7 +1491,6 @@ fn analyze_node(
             outer,
         ),
 
-        // ── Deduplicate (Spark `df.dropDuplicates` / `df.distinct`) ──────
         CommonOp::Deduplicate { input, on_columns } => {
             passthrough_schema_arm(*input, base_types, outer, |ti| {
                 Ok(TypedOp::Deduplicate {
@@ -1599,7 +1500,6 @@ fn analyze_node(
             })
         }
 
-        // ── Sample (Spark `df.sample(...)`) ─────────────────────────────
         CommonOp::Sample {
             input,
             lower_bound,
@@ -1616,7 +1516,6 @@ fn analyze_node(
             })
         }),
 
-        // ── SampleBy (Spark `df.sampleBy(col, fractions, seed)`) ───────
         CommonOp::SampleBy {
             input,
             col,
@@ -1632,20 +1531,15 @@ fn analyze_node(
             })
         }),
 
-        // ── ToDf (Spark `df.toDF(new1, new2, ...)`) ──────────────────────
         CommonOp::ToDf {
             input,
             column_names,
         } => analyze_to_df(*input, column_names, base_types, outer),
 
-        // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
         CommonOp::AliasedRelation { input, alias } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
-            // ADR-023 tier-3 leaf seed: an `AliasedRelation` is a fresh
-            // origination point for lineage purposes — EVERY column is now
-            // "from" `alias` alone, overwriting whatever it inherited below
-            // (emission re-scopes everything under it to `alias`, mirroring
-            // `RelScope::of`'s own AliasedRelation binding rule).
+            // An alias is a fresh lineage origin: every output column is
+            // attributable to the alias alone.
             let mut quals = BTreeSet::new();
             quals.insert(alias.clone());
             let resolved_schema = seed_source_quals(typed_input.resolved_schema.clone(), quals);
@@ -1658,7 +1552,6 @@ fn analyze_node(
             ))
         }
 
-        // ── WithColumnsRenamed (Spark `df.withColumnsRenamed(...)`) ──────
         CommonOp::WithColumnsRenamed { input, renames } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
             let rename_map: HashMap<String, String> = renames
@@ -1674,16 +1567,8 @@ fn analyze_node(
                 let mut nf = f.clone();
                 if let Some(n) = new_name {
                     nf.name = n;
-                    // P2 (Pass F3 stage 1, live-Spark-4.1.1-verified): a
-                    // rename severs referenceability via the PRE-rename
-                    // qualifier — `t.alias("t").withColumnRenamed("x",
-                    // "y").select("t.y")` raises UNRESOLVED_COLUMN even
-                    // though "t" still binds this node's alias scope;
-                    // `select("t.other")` (an UNRENAMED slot) resolves.
-                    // Clear only the renamed slot's inherited lineage — the
-                    // id is untouched (ADR-024's rename-keeps-id divergence
-                    // stands; renamed slots are simply not addressable via
-                    // their old qualifier anymore).
+                    // A rename clears only the renamed slot's inherited
+                    // lineage; its identity remains unchanged.
                     nf.source_quals.clear();
                 }
                 output_fields.push(nf);
@@ -1697,7 +1582,6 @@ fn analyze_node(
             ))
         }
 
-        // ── DropColumns (Spark `df.drop(...)`) ───────────────────────────
         CommonOp::DropColumns { input, drop_names } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
             let drop_lower: HashSet<String> = drop_names.iter().map(|s| fold_key(s)).collect();
@@ -1719,14 +1603,12 @@ fn analyze_node(
             ))
         }
 
-        // ── LateralView (Hive LATERAL VIEW explode/posexplode) ──────────
         CommonOp::LateralView {
             input,
             table_alias,
             columns,
         } => analyze_lateral_view(*input, table_alias, columns, base_types, outer),
 
-        // ── RecursiveCte (two-phase anchor-first) ──────────────────────
         CommonOp::RecursiveCte {
             name,
             column_names,
@@ -1743,7 +1625,6 @@ fn analyze_node(
             outer,
         ),
 
-        // ── Binary: Join ──────────────────────────────────────────────────
         CommonOp::Join {
             left,
             right,
@@ -1768,7 +1649,6 @@ fn analyze_node(
             outer,
         ),
 
-        // ── N-ary: SetOp with widening sub-sweep ──────────────────────────
         CommonOp::SetOp {
             kind,
             all,
@@ -1786,8 +1666,6 @@ fn analyze_node(
         ),
     }
 }
-
-// ── Extracted arm bodies (Pass 13 — OPP-V uniform arm shape) ────────────────
 
 /// Analyze a `LATERAL VIEW` node: resolve each generator column expression
 /// against the input schema, compute generated-field types/nullability, and
@@ -2074,16 +1952,9 @@ fn analyze_to_df(
     for (f, new_name) in input_fields.iter().zip(column_names.iter()) {
         let mut nf = f.clone();
         nf.name = new_name.clone();
-        // Review C1 / P2, same rule as the `WithColumnsRenamed` arm above: a
-        // rename severs referenceability via the PRE-rename qualifier, so the
-        // renamed slot loses its inherited lineage (the id is untouched —
-        // ADR-024's rename-keeps-id divergence still stands). Unconditional
-        // here because `toDF` renames EVERY column, unlike
-        // `withColumnsRenamed`'s partial rename map. Without this,
-        // `df.alias("t").toDF("y", ..).select("t.y")` resolves in τ and is
-        // UNRESOLVED_COLUMN in Spark. The SQL `FROM t AS x(a, b)` shape is
-        // unaffected: `v2_lowering` wraps `ToDf` in an `AliasedRelation`,
-        // whose `seed_source_quals` re-seeds every slot with `x` afterwards.
+        // Renaming clears inherited lineage for every slot. The ids remain
+        // attached to their logical columns; an outer alias can seed new
+        // lineage afterward.
         nf.source_quals.clear();
         output_fields.push(nf);
     }
@@ -2114,7 +1985,6 @@ fn analyze_join(
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_left = analyze_node(left, base_types, outer)?;
 
-    // ── LATERAL guards (analyzer-enforced invariants) ──────────────────
     if lateral && natural {
         return Err(AnalyzerError::SparkEmulated {
             class: "INCOMPATIBLE_JOIN_TYPES",
@@ -2134,12 +2004,11 @@ fn analyze_join(
         });
     }
 
-    // ── Right-child analysis ───────────────────────────────────────────
     // When `lateral`, the right child sees the left sibling's schema as
     // its OuterScope (correlated refs like `e.dept_id` resolve there).
-    // This REPLACES whatever `outer` was passed in — preserving pass-16's
-    // one-level-only invariant (the lateral's inner sees only its
-    // immediate left sibling, never the grandparent).
+    // This replaces whatever `outer` was passed in, enforcing one-level
+    // correlation: the lateral's inner sees only its immediate left sibling,
+    // never the grandparent.
     let typed_right = if lateral {
         let left_outer = OuterScope {
             schema: &typed_left.resolved_schema,
@@ -2248,14 +2117,6 @@ fn analyze_join(
         &typed_right.resolved_schema,
         join_type,
     );
-    // Output schema by join kind:
-    //   SEMI/ANTI  → left schema only (right's columns are semantically absent).
-    //   USING(...) → the USING columns appear ONCE (deduped), then
-    //                left's remaining columns, then right's remaining
-    //                columns. Matches DuckDB `SELECT * FROM l JOIN r
-    //                USING (k1, k2)` output shape and Spark's
-    //                `join(other, on=[...])`.
-    //   Otherwise  → simple concatenation.
     // Output schema by join kind (Spark-parity — verified against
     // corpus join cases). For USING joins, Spark hoists the USING
     // columns to position 0, then left's non-USING cols, then
@@ -2273,15 +2134,8 @@ fn analyze_join(
     //                                 semantics: non-null iff either
     //                                 side is non-null).
     //   CROSS                       → USING never applies.
-    // USING donor: same logical column as the chosen donor side —
-    // clone-with-mutation (FULL coalesces nullability but KEEPS the left
-    // side's id, per N9 INC-1's coalesced-key rule).
-    //
-    // ADR-023 tier-3 (folded in from the deleted `source_quals_of`): a USING
-    // key is referenceable via EITHER side's qualifier, regardless of which
-    // side donates the value/id — so the donor's `source_quals` is
-    // overwritten with the UNION of both sides' lineage (when present),
-    // never just the donor's own inherited set.
+    // A USING key remains referenceable through either side's qualifier;
+    // merge both donors' lineage onto the selected value/id.
     let build_using_prefix = |using: &[String]| -> Vec<Attribute> {
         let mut fields = Vec::with_capacity(using.len());
         for n in using {
@@ -2427,8 +2281,8 @@ fn analyze_recursive_cte(
     // that match case-insensitively but differ in case (e.g. the user wrote
     // `WITH RECURSIVE Chain(...) ... FROM Chain c`), and insert the schema
     // under those exact-case keys too — BaseTypes::lookup is case-sensitive.
-    // `BaseTypes` stores plain `StructType` bookkeeping (out of scope for
-    // this increment) — extract field VALUES per-column rather than calling
+    // `BaseTypes` stores plain `StructType` bookkeeping; extract field values
+    // per column rather than calling
     // the banned bulk `to_struct_type()` door.
     let self_ref_schema = StructType::new(
         cte_schema
@@ -2601,8 +2455,8 @@ fn analyze_set_op(
     // name. Positional pushdown is actively wrong here: the child's
     // column-order differs from the widened order by definition, so
     // wrapping `projections[i]` with `widened_schema.fields[i]`'s type
-    // mis-casts columns (e.g. `salary DOUBLE → id BIGINT`). Pass 76 /
-    // corpus witness: `set-003`. Skip the pushdown for by-name.
+    // mis-casts columns (for example, `salary DOUBLE → id BIGINT`). Skip the
+    // pushdown for by-name.
     if !by_name {
         for child in typed_children.iter_mut() {
             push_setop_casts(child, &widened_schema);
@@ -2773,8 +2627,6 @@ fn widen_by_position(
     Ok(ResolvedSchema::new(widened_fields))
 }
 
-// ── Expression resolution helpers ───────────────────────────────────────────
-
 /// Expand every top-level [`Expression::UnresolvedRegex`] projection into N
 /// [`Expression::UnresolvedColumn`] refs — one per `input_schema` field whose
 /// name matches the pattern. Non-regex projections pass through unchanged in
@@ -2893,11 +2745,7 @@ fn expand_inline_projections(
 ) -> Result<Vec<Expression>, AnalyzerError> {
     expand_projections(projections, |proj| {
         // Only fire on a bare top-level `FunctionCall("inline"|"inline_outer",...)`.
-        // Aliased or nested forms fall through unchanged (multi-alias
-        // `.alias("f1","f2",...)` and non-Project contexts are non-goals per
-        // the Pass-90 plan §Non-goals — they surface as boundary errors
-        // downstream if the corpus ever exercises them).
-        // N5: `f.name` is already canonical lowercase — match directly.
+        // Aliased or nested forms fall through unchanged.
         let (name_lower, args, is_outer) = match proj {
             Expression::FunctionCall(f) => match f.name.as_str() {
                 "inline" => (f.name.clone(), f.args.clone(), false),
@@ -3001,8 +2849,7 @@ fn json_tuple_key_char_is_unsafe(c: char) -> bool {
 ///
 /// Names are POSITIONAL (`c0, c1, ..., c<N-1>`) — matches Spark's
 /// `Generator.elementSchema`, NOT the key literals. Verified against
-/// PySpark docstring `pyspark/sql/functions/builtin.py:20737`. Corpus witness
-/// `json-002` uses bare (no `.alias(...)`) `json_tuple`.
+/// The positional names match Spark's generator element schema.
 ///
 /// Errors (ADR-022 two-category):
 ///
@@ -3027,8 +2874,7 @@ fn expand_json_tuple_projections(
     expand_projections(projections, |proj| {
         // Only fire on a bare top-level `FunctionCall("json_tuple", ...)`.
         // Aliased or nested forms fall through unchanged (multi-alias
-        // `.alias("k1", ...)` and non-Project contexts are non-goals per
-        // the Pass-91 plan §Non-goals — they surface as boundary errors
+        // `.alias("k1", ...)` and non-Project contexts fall through
         // downstream if the corpus ever exercises them).
         let args = match proj {
             Expression::FunctionCall(f) if f.name == "json_tuple" => f.args.clone(),
@@ -3116,7 +2962,6 @@ fn expand_json_tuple_projections(
 /// / [`resolve_and_stamp`], so downstream analysis only ever sees the
 /// fanned-out `stack_col` calls.
 ///
-/// Corpus witness: `piv-006`.
 fn expand_stack_projections(
     projections: Vec<Expression>,
 ) -> Result<Vec<Expression>, AnalyzerError> {
@@ -3223,7 +3068,6 @@ fn expand_stack_projections(
     })
 }
 
-// ── Lateral Column Alias (LCA) — pr-007 ─────────────────────────────────────
 //
 // `SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp`: Spark
 // lets a later SELECT-list item reference an earlier item's alias. τ's
@@ -3335,8 +3179,8 @@ fn expand_lateral_column_aliases(
 /// SAME fallible-fold primitive `resolve_and_stamp` itself uses, walking
 /// into `FunctionCall` args, `CaseWhen` branches, etc.
 ///
-/// Opaque per [`Expression::is_opaque_unit`] (the single opacity authority,
-/// N1), plus `UnresolvedRegex` — a documented pass-through matching
+/// Opaque per [`Expression::is_opaque_unit`], plus `UnresolvedRegex` — a
+/// documented pass-through matching
 /// `resolve_and_stamp`'s own extra arm — all pass through unchanged. A
 /// lambda's own bound parameter must never be mistaken for an outer lateral
 /// alias reference (e.g. `SELECT 1 AS x, transform(arr, x -> x + 1) FROM t` —
@@ -3408,9 +3252,6 @@ fn analyze_table_function(
 ) -> Result<TypedAst, AnalyzerError> {
     let empty_schema = ResolvedSchema::empty();
     let resolved_args = resolve_expr_list(args, &ResolveContext::bare(&empty_schema, base_types))?;
-    // N5: `name` arrives already canonical lowercase from
-    // `v2_lowering::table_function_node`, the single construction site — no
-    // per-consumer re-derivation needed.
     match name.as_str() {
         "range" if (1..=4).contains(&resolved_args.len()) => Ok(TypedAst::new(
             TypedOp::TableFunction {
@@ -3429,8 +3270,7 @@ fn analyze_table_function(
         // existing single-homed `.data_type()` / `.nullable()` arms (type_inference
         // + expression.rs). Spark's default output column is named `"col"`.
         "explode" | "explode_outer" if resolved_args.len() == 1 => {
-            // Gate: the argument must resolve to Array — Map args and non-collection
-            // types fall through to PuntedOperator (no witness, ADR-022).
+            // The argument must resolve to Array; other types are unsupported.
             let arg = &resolved_args[0];
             let arg_type = arg.data_type(&empty_schema);
             if !matches!(arg_type, DataType::Array(..)) {
@@ -3471,9 +3311,7 @@ fn analyze_table_function(
 }
 
 fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
-    // Opaque to resolution per [`Expression::is_resolve_opaque`] (the single
-    // opacity authority for the two resolution walkers, N1) — see that
-    // method's doc for the per-variant rationale.
+    // Opaque expressions are not traversed by resolution.
     if expr.is_resolve_opaque() {
         return Ok(expr);
     }
@@ -3515,17 +3353,9 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
             Ok(Expression::ExistsSubquery(e))
         }
-        // UpdateFields: recurse via the walker. τ used to additionally reject
-        // `dropFields("X")` for an X absent from the struct, citing Catalyst
-        // `UpdateFields.scala::checkInputDataTypes`. Observed against live
-        // Spark 4.1.1 (review A1 audit): **Spark accepts it** and returns the
-        // struct unchanged —
-        //   structs.select(col("s").dropFields("nope"))
-        //   -> update_fields(s, dropfield()): struct<x:bigint,y:bigint>
-        // so the guard made τ reject a query Spark runs. Dropping a
-        // non-existent field is a no-op, not an error.
+        // Dropping a missing struct field is a Spark no-op.
         Expression::UpdateFields(_) => expr.map_children(|e| resolve_and_stamp(e, ctx)),
-        // N4: recurse first (children fully resolved/typed), then materialize
+        // Recurse first, then materialize
         // the binary-arithmetic coercions (decimal-Div widening, Date ±
         // Interval correction) `binary_data_type`'s own inference implies but
         // does not insert into the tree. See
@@ -3534,7 +3364,7 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             let recursed = expr.map_children(|e| resolve_and_stamp(e, ctx))?;
             Ok(materialize_binary_coercions(recursed, ctx.schema))
         }
-        // N4 idempotency: an `implicit` Cast can arrive here already
+        // An `implicit` Cast can arrive here already
         // materialized (e.g. re-running `resolve_and_stamp` over a
         // `semantic_eq` rebind side). Recurse into the child first, then
         // collapse a redundant nested implicit Cast to the SAME target type
@@ -3561,12 +3391,7 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
                 }),
             })
         }
-        // N5: `resolve_and_stamp` is the always-hit choke point every
-        // resolved `FunctionCall` passes through exactly once (unlike
-        // `canonicalize_for_semantic_eq` or emission, which only fire on
-        // some paths) — the cheapest place to mechanically enforce the
-        // invariant that front-end conversion already established. Recursion
-        // is otherwise identical to the default arm below.
+        // Function names are canonicalized at the front-end boundary.
         Expression::FunctionCall(f) => {
             debug_assert!(
                 !f.name.bytes().any(|b| b.is_ascii_uppercase()),
@@ -3595,28 +3420,10 @@ fn resolve_expr_list(
         .collect()
 }
 
-// ── ORDER BY / aggregate-restatement resolution (design 023, increments 1+2) ─
-//
-// Mirrors Spark 4.1.1's `ResolveReferencesInSort` (resolve against the Sort's
-// child output first, then — if that fails, or the child is an `Aggregate`
-// and the key restates an aggregate — push resolution down to the child's
-// OWN input) plus `ResolveAggregateFunctions#buildAggExprList` (bind the
-// input-resolved key back onto a semantically-equal SELECT-list entry by
-// alias-stripped structural equality, excluding nondeterministic functions —
-// Spark's `semanticEquals`). Increment 2 (design 023 step 5) adds the
-// hidden-output/trim-Project path: when the input-resolved key matches NO
-// existing SELECT-list entry as a WHOLE, [`promote_aggregate_subtree`] /
-// [`promote_project_subtree`] walk it top-down, binding matching subtrees and
-// PROMOTING a remaining aggregate-function or grouping-expression subtree
-// (Aggregate child) or bare input column (Project child) into a brand new,
-// hidden SELECT-list entry — mirroring Spark's own `buildAggExprList` fold.
-// The Sort arm in [`analyze_node`] then wraps the Sort in a trim `Project`
-// restoring the original output schema whenever anything was appended. A
-// leftover bare `ColumnReference` under an `Aggregate` child that is neither
-// an aggregate-function argument nor a grouping expression still surfaces
-// `UnknownColumn` — confirmed against a live Spark 4.1.1 session that this is
-// exactly `UNRESOLVED_COLUMN.WITH_SUGGESTION` (Spark does NOT raise a
-// distinct `MISSING_AGGREGATION`-style error for this shape from `ORDER BY`).
+// Resolve ORDER BY keys against the child output first, then against an
+// Aggregate/Project child's input when Spark's aggregate-restatement rules
+// require it. Unmatched promotable keys become hidden outputs and are trimmed
+// from the final schema; unresolvable keys retain Spark's UnknownColumn error.
 
 /// Resolve every ORDER BY key of a `Sort` against its child `ti`. Per key:
 /// today's direct resolution (unchanged) when it succeeds and the key does
@@ -3639,12 +3446,8 @@ fn analyze_sort(
             })
         })
         .collect::<Result<Vec<_>, AnalyzerError>>()?;
-    // Increment 2 (design 023 step 5) may have appended hidden aggregate /
-    // projection entries to `ti.op` / `ti.resolved_schema` in place while
-    // resolving the keys above; the re-derived scope is provably identical
-    // to the carried `ti.scope` (N9 increment 3's growth-invariant proof,
-    // which replaced the unconditional re-stamp this fn used to perform) —
-    // assert it in debug builds rather than pay for live re-derivation.
+    // Promotion may grow the child schema; verify its scope remains derived
+    // from the same operator/schema pair.
     debug_assert_eq!(
         RelScope::of(&ti.op, &ti.resolved_schema),
         ti.scope,
@@ -3702,12 +3505,8 @@ enum SortChild<'a> {
     Project,
 }
 
-/// Steps 3-5 of the fallback (Spark `resolveColWithAgg` + `buildAggExprList`):
-/// re-resolve `original` against the child's OWN input (`Aggregate.input` /
-/// `Project.input`), then either bind it onto a semantically-equal entry in
-/// the child's OWN SELECT list (`Aggregate.aggregates` / `Project.projections`,
-/// increment 1), or — failing that — PROMOTE a subtree of it into a brand
-/// new hidden SELECT-list entry (increment 2, [`promote_subtree`]).
+/// Re-resolve against the child's own input, then bind to or promote a
+/// semantically matching output entry.
 ///
 /// Only `TypedOp::Aggregate` / `TypedOp::Project` children define an "own
 /// input" / "own SELECT list" here — any other child (e.g. `Deduplicate`)
@@ -3749,16 +3548,8 @@ fn rebind_sort_key(
     }
 }
 
-/// [`rebind_sort_key`]'s `TypedOp::Aggregate`/`TypedOp::Project` case. N7:
-/// `aggregates`/`projections` IS the complete output list by construction
-/// (see [`CommonOp::Aggregate`]'s doc), so `output_list[k]` always lines up
-/// with `schema.fields[k]` directly — no grouping-prefix offset. A prior
-/// version bailed whenever the grouping keys were not (heuristically)
-/// "already folded" (comparing `aggregates.len()` directly against
-/// `schema.len()`), which wrongly rejected an otherwise-valid whole-key match
-/// any time the GROUP BY keys were not restated bare in SELECT (tpcds-q085);
-/// that guard is kept (it still catches Star-expansion misalignment) but is
-/// now a plain length comparison with no offset term.
+/// The aggregate and project output lists align directly with schema fields;
+/// Star expansion is rejected when it breaks that positional invariant.
 fn rebind_over_child(
     original: Expression,
     child_input: &TypedAst,
@@ -3778,22 +3569,14 @@ fn rebind_over_child(
     let ctx = ResolveContext::of_input(child_input, base_types, outer);
     let input_resolved = resolve_and_stamp(original.clone(), &ctx)
         .map_err(|_| unresolvable_sort_key_error(&original))?;
-    // Increments 1+2 (design 023 step 5): [`promote_subtree`]'s own top-level
-    // check performs the increment-1 whole-key match itself before falling
-    // into the subtree walk, so there is no separate match here.
+    // `promote_subtree` checks whole-key matches before descending.
     let input_schema = &child_input.resolved_schema;
     promote_subtree(input_resolved, output_list, schema, input_schema, kind)
         .ok_or_else(|| unresolvable_sort_key_error(&original))
 }
 
-/// Bind the sort key to the EXISTING `entries[k]` entry (an Aggregate's
-/// `aggregates` or a Project's `projections` — both are the complete output
-/// list by construction, N7, so no prefix offset is ever needed): return a
-/// bare `ColumnReference` at schema position `k` — schema-neutral,
-/// `schema.fields[k]` already carries the name/type/nullable the entry
-/// produces. N8: every output-list entry is already a `NamedExpression`
-/// (bare ref, `Star`, or `Alias`) by construction, so this fn is read-only —
-/// there is no alias to pin.
+/// Bind a sort key to an existing output entry by returning a bare reference
+/// to its schema field. Output entries are already named and read-only.
 fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expression {
     debug_assert!(
         matches!(
@@ -3805,19 +3588,8 @@ fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expre
     Expression::ColumnReference(ColumnReference::from_attr(&schema.fields[k]))
 }
 
-/// `true` for `Expression` variants this fallback treats as an opaque,
-/// non-recursable, non-promotable unit — [`Expression::is_opaque_unit`] (the
-/// single opacity authority, N1) PLUS the subquery variants PLUS `Window`.
-/// `Window` matters specifically: its `.func` is a structural child
-/// (`Expression::children` descends into it, so [`contains_matching_call`]
-/// trips on `sum(x) OVER (...)` for the aggregate-classifier predicate), but
-/// promoting that INNER aggregate call would replace a window function's own
-/// `.func` with a bare `ColumnReference` — corrupting the window rather than
-/// resolving it.
-/// Increment 1 already left this shape as a documented, harmless bail
-/// (whole-key match never finds a literal `Window` entry to bind onto); this
-/// guard preserves that exact behavior under increment 2's added recursion
-/// instead of silently rewriting into an invalid tree.
+/// Whether sort-key promotion must treat an expression as opaque. Window and
+/// subquery bodies cannot be rewritten without changing their scope or shape.
 fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
     expr.is_opaque_unit()
         || matches!(
@@ -3829,27 +3601,23 @@ fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
         )
 }
 
-/// Increment 2 (design 023 step 5): recursively bind or PROMOTE subtrees of
-/// `expr` (already resolved against the child's OWN input schema) that
-/// increment 1's whole-key match left unbound. At each node, top-down:
-/// - a subtree that structurally matches (`semantic_eq`) an EXISTING
-///   `output_list` entry binds to that entry (N8: read-only — the entry is
-///   already a `NamedExpression` by construction, so there is no alias to
-///   pin) — increment 1's match, applied to a subtree instead of the whole
-///   key;
+/// Recursively bind or promote subtrees of `expr` already resolved against
+/// the child's own input schema. Structurally matching output entries bind
+/// directly; otherwise eligible aggregate, grouping, or bare-column
+/// subtrees are promoted to hidden outputs.
 /// - otherwise, per `kind`: for [`SortChild::Aggregate`], a subtree that is
 ///   itself an aggregate-classifier `FunctionCall`, or that matches
-///   (`semantic_eq`) a `grouping` entry, is PROMOTED via
+///   (`semantic_eq`) a `grouping` entry, is promoted via
 ///   [`promote_hidden_alias`] (a fresh `Alias(subtree, name)` MINTED onto
 ///   `output_list`); for [`SortChild::Project`], a bare `ColumnReference`
 ///   subtree is PROMOTED via [`promote_bare_column`] (pushed onto
-///   `output_list` verbatim, COPYING its identity — Spark
+///   `output_list` verbatim, copying its identity — Spark
 ///   `ResolveReferencesInSort`'s "add the missing ATTRIBUTE, not a computed
-///   subexpression"). Either way, dedup (a subtree already promoted earlier
-///   in the SAME walk, or by an earlier key in the same `ORDER BY`, is caught
+///   subexpression"). Deduplication (a subtree already promoted earlier
+///   in the same walk or by an earlier key in the same `ORDER BY`) is caught
 ///   by the whole-entry match above since it is now literally present in
 ///   `output_list`) — Spark `ResolveAggregateFunctions#buildAggExprList`'s
-///   own fold;
+///   by the whole-entry match above;
 /// - otherwise, recursion continues into its children (unless
 ///   [`opaque_to_subtree_promotion`] says the node is an opaque unit);
 /// - a `ColumnReference` LEAF that survives all of the above (neither bound
@@ -3930,12 +3698,7 @@ fn promote_hidden_alias(
     Expression::ColumnReference(ColumnReference::from(field))
 }
 
-/// [`promote_subtree`]'s `SortChild::Project` promotion: `expr` is a bare
-/// input `ColumnReference` passing through unmodified — COPY its existing
-/// identity from `input_schema` (by attribute id) rather than minting a
-/// fresh one for what is still the same logical column. `output_attribute`
-/// is the shared copy-or-mint home (item 3, N9/ADR-024) — same shape this
-/// arm used to hand-roll.
+/// Promote a bare input reference by copying its existing attribute identity.
 fn promote_bare_column(
     expr: Expression,
     projections: &mut Vec<Expression>,
@@ -3948,7 +3711,7 @@ fn promote_bare_column(
     Expression::ColumnReference(ColumnReference::from(field))
 }
 
-/// A hidden-promotion output name, uniquified against `aggregates`' EXISTING
+/// A hidden-promotion output name, uniquified against existing
 /// names (case-insensitive) so two structurally-different promoted subtrees
 /// never collide on the same schema field name.
 fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> String {
@@ -3971,8 +3734,7 @@ fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> St
 }
 
 /// The catch-all `UnknownColumn` for a sort key the fallback could not bind
-/// to any child SELECT-list entry (increment 2 handles the hidden-output/
-/// subtree case this leaves red). Named from the ORIGINAL (pre-resolution)
+/// to any child SELECT-list entry. Named from the original
 /// key when it is itself a bare column reference; otherwise from its
 /// output-name rendering, so the error text still names the offending key.
 fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
@@ -3995,19 +3757,16 @@ fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
 /// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
 /// name satisfies `pred` — the shared walk behind both the aggregate-
 /// classifier check ([`is_aggregate_classifier_name`], used to detect a Sort
-/// key that restates a SELECT-list aggregate, design 023 fallback trigger
-/// (ii)) and the nondeterministic-function check
+/// key that restates a SELECT-list aggregate) and the nondeterministic-
+/// function check
 /// ([`is_nondeterministic_fn_name`], used to exclude a Sort key that calls a
 /// nondeterministic function from the [`semantic_eq`] rebind fallback). Both
 /// rosters are name-keyed and non-exhaustive; per-instance nondeterminism
-/// identity is N9's deliverable.
 ///
 /// `Expression::children()` also descends into `WindowFunction.func`, so a
 /// key restating `sum(x) OVER (...)` also trips the aggregate check — that
-/// key was already red before increment 1 (an aggregate name under `Window`
-/// is not a plain SELECT-list aggregate to rebind onto), and
-/// `rebind_sort_key` simply fails to find a match and re-raises the original
-/// `UnknownColumn`, so this is harmless, not a new failure mode.
+/// A window aggregate is not a plain SELECT-list aggregate and therefore is
+/// not rebound.
 fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
     if let Expression::FunctionCall(f) = expr {
         if pred(&f.name) {
@@ -4038,8 +3797,7 @@ fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
 /// refs with equal ids are the same logical column no matter which schema
 /// each was resolved against, and two refs that happen to share a
 /// (qualifier-stripped) name but different ids (e.g. `t1.x` and `t2.x` after a
-/// join) are correctly told apart. This is strictly sounder than the
-/// increment-1 `ordinal`-based check it replaces, which only held within a
+/// join) are correctly told apart. This is sound across schemas because
 /// single shared input schema. NOTE: [`ColumnReference`]'s hand-written
 /// `PartialEq` deliberately EXCLUDES `expr_id` (it is derived data, not part
 /// of a reference's logical identity for every OTHER analyzer equality
@@ -4052,7 +3810,7 @@ fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
 /// compare many candidates against one fixed operand and so call
 /// [`semantic_eq_against`] directly (hoisting the fixed side's
 /// canonicalization out of the loop); this pairwise form is kept for the
-/// single-pair comparisons in this module's own tests.
+/// single-pair comparisons.
 #[cfg(test)]
 fn semantic_eq(a: &Expression, b: &Expression) -> bool {
     if contains_matching_call(a, is_nondeterministic_fn_name) {
@@ -4088,12 +3846,8 @@ fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
 /// `ColumnReference::eq`'s `expr_id` exclusion leaves open: two different
 /// input columns that happen to share a (qualifier-stripped) name — e.g.
 /// `t1.x` and `t2.x` after a join — canonicalize and `==`-compare IDENTICAL,
-/// so without this pass `semantic_eq` would bind to whichever SELECT-list
-/// entry happens to come first, silently picking the wrong one. D2/Pass F2:
-/// every resolved `ColumnReference` now carries a real `expr_id` (see
-/// [`super::expression::ColumnReference::expr_id`]'s doc — no remaining
-/// production site returns one `None`), so the `(None, _) => true` fallback
-/// below is a defensive default rather than a live escape hatch.
+/// so without the id check `semantic_eq` would bind to whichever SELECT-list
+/// entry happens to come first, silently picking the wrong one.
 fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     match (a, b) {
         (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
@@ -4109,8 +3863,8 @@ fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     }
 }
 
-/// Recursively strip every `Alias` wrapper and `implicit` Cast (N4 —
-/// analyzer-materialized coercions Spark's own `semanticEquals` never sees)
+/// Recursively strip every `Alias` wrapper and implicit Cast (analyzer
+/// materialization that Spark's `semanticEquals` does not see)
 /// and case-fold/qualifier-strip `ColumnReference` / `UnresolvedColumn`
 /// identity, producing the canonical form [`semantic_eq`] compares with `==`
 /// (and then re-walks via [`ids_compatible`]). Uses
@@ -4119,10 +3873,10 @@ fn ids_compatible(a: &Expression, b: &Expression) -> bool {
 /// covered without a hand-enumerated match; infallible (`Result<_,
 /// Infallible>`), so the `unwrap_or_else` below can never panic.
 ///
-/// `ColumnReference::expr_id` is deliberately PRESERVED (only
+/// `ColumnReference::expr_id` is preserved (only
 /// qualifier/name-case are normalized away here — `data_type`/`nullable` are
 /// carried through unchanged too, since [`ColumnReference`]'s hand-written
-/// `PartialEq` already excludes them from `==`, D1/E4) — [`semantic_eq`]'s
+/// `PartialEq` already excludes them from `==`) — [`semantic_eq`]'s
 /// `==` check cannot see `expr_id` either (`ColumnReference::eq` excludes
 /// it), but [`ids_compatible`] reads `expr_id` directly off these
 /// canonicalized trees. Dropping this preservation (e.g. re-normalizing
@@ -4133,20 +3887,16 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
     if let Expression::Alias(a) = expr {
         return canonicalize_for_semantic_eq(&a.expr);
     }
-    // N4: an `implicit` Cast is an analyzer-materialized coercion, invisible
-    // to Spark's own semantic-equality notion — strip it exactly like an
-    // `Alias` (see `CastExpression::implicit`'s doc).
+    // Implicit casts are analyzer materialization and are transparent to
+    // Spark's semantic equality.
     if let Expression::Cast(c) = expr {
         if c.implicit {
             return canonicalize_for_semantic_eq(&c.expr);
         }
     }
     let normalized = match expr {
-        // D1 (E4) made `PartialEq` exclude `data_type`/`nullable` outright, so
-        // this arm no longer needs to null them out to neutralize `==` — only
-        // `name`/`qualifier` are logical identity and get case-folded/stripped
-        // here. `data_type`/`nullable` are carried through UNCHANGED, same as
-        // `expr_id`.
+        // Names are case-folded and qualifiers are stripped; type, nullability,
+        // and identity remain attached to the reference.
         Expression::ColumnReference(c) => Expression::ColumnReference(ColumnReference {
             name: fold_key(&c.name),
             qualifier: None,
@@ -4159,9 +3909,6 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
             qualifier: None,
             plan_id: None,
         }),
-        // N5: no dedicated `FunctionCall` arm — `f.name` is already canonical
-        // lowercase from front-end construction, so lowercasing it again
-        // would be a no-op; the default `other.clone()` arm covers it.
         other => other.clone(),
     };
     normalized
@@ -4220,7 +3967,6 @@ fn analyze_single_column_subquery(
 pub(crate) const TD_JOIN_LEFT: &str = "__td_jl";
 pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
 
-// ── Alias-aware qualified-column resolution over joins ─────────────────────
 //
 // A relation alias (`d` in `... CROSS JOIN dept d`) is not a schema field —
 // the merged join schema (built by `ResolvedSchema::merge`, a positional
@@ -4292,9 +4038,8 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Resolve a join condition against the merged `left ⋈ right` schema.
-    /// Composition is [`merge_join_scopes`] — the same rules (and the same
-    /// contractual push order) [`RelScope::of`]'s Join arm uses. Phase 3b: no
-    /// synthetic `__td_jl`/`__td_jr` whole-side aliases are pushed anymore —
+    /// Composition is [`merge_join_scopes`], with no synthetic whole-side
+    /// aliases:
     /// this composite scope exists only to offset-merge the two sides' own
     /// aliases/plan_ids into one range space; a plan_id ref resolves
     /// bare+ordinal via [`resolve_column`]'s plan_id arm exactly as it would
@@ -4373,14 +4118,9 @@ impl<'a> ResolveContext<'a> {
     }
 }
 
-/// Build an `ExtractValue` chain rooted at `root` (the top-level struct
-/// COLUMN's own attribute — the source of the id/type/nullability stamped on
-/// the chain's root `ColumnReference`), walking `field_path`'s dot-separated
-/// segments as successive `ExtractValue` extractions. Shared by tier-(d)'s
-/// single- and (pre-Stage-2) multi-level struct-field resolution and its
-/// outer twin (`resolve_in_outer`'s struct arm, Stage 3) — the one
-/// construction site for "qualifier names a struct column, tail names a
-/// field path inside it".
+/// Build an `ExtractValue` chain rooted at the top-level struct attribute,
+/// preserving that attribute's identity, type, and nullability. Shared by
+/// local and correlated struct-field resolution.
 ///
 /// `expr_id`: `root` IS the real top-level attribute this reference names,
 /// so its id is stamped directly on the chain's root ref — matching Spark's
@@ -4412,23 +4152,9 @@ fn build_struct_extract_chain(root: &Attribute, field_path: &str) -> Expression 
 /// when exactly one case-insensitive match exists across the outer schema's
 /// fields (zero or 2+ matches yield `None`).
 ///
-/// Returns the fully-built [`Expression`] on a hit, so [`resolve_column`]'s
-/// tier-(g) arm simply returns it. D2/Pass F2 stage 3: EVERY arm now stamps a
-/// real [`super::schema::ExprId`] — the struct-qualifier arm builds an
-/// `ExtractValue` chain via [`build_struct_extract_chain`] rooted at the
-/// OUTER struct COLUMN's own attribute (mirroring the local tier-(d) twin in
-/// [`resolve_column`], Pass F2 stages 1-2), and the relation-alias/unqualified
-/// arms stamp the matched outer attribute's id directly onto a
-/// [`ColumnReference`] that preserves the original qualifier verbatim (`e.g.`
-/// a correlated `e.salary` renders exactly as written; DuckDB's own
-/// correlated-subquery binder resolves it at runtime — same mechanism the
-/// pre-existing green correlated subquery cases ride). Global id uniqueness
-/// (one process-wide `AtomicU64`, `schema.rs`) makes stamping an OUTER id
-/// sound even though it is compared against LOCAL schemas elsewhere: the
-/// returned id can only equal a local (inner-schema) id if it genuinely is
-/// that same attribute, which never happens here by construction (an
-/// outer-scope lookup is only reached after every inner tier already failed
-/// to resolve the name).
+/// Returns a fully-built expression on a hit. Correlated references retain
+/// their qualifier and the matched outer attribute's identity; process-wide
+/// ids keep outer and inner attributes distinct.
 fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<Expression> {
     if let Some(q) = u.qualifier.as_deref() {
         // Struct-column precedence in the outer schema (matches resolve_column's
@@ -4483,35 +4209,20 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<Expre
 }
 
 fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
-    // Multi-level nested-struct navigation: `F.col("address.geo.lat")` arrives
-    // here as `UnresolvedColumn { qualifier: Some("address"), name: "geo.lat" }`
-    // (the Spark Connect converter does a single `splitn(2, '.')`). Emitting
-    // this ColumnReference verbatim produces `"address"."geo.lat"` which DuckDB
-    // rejects because it treats `geo.lat` as a single field key. Pass F2 stage
-    // 2: this is no longer a separate rewrite ahead of tier (d) below — a
-    // qualifier naming a top-level struct column resolves through tier (d)'s
-    // `struct_qualifier_info` (single- AND multi-level dotted paths both
-    // resolve there via `resolve_nested_field`) and `build_struct_extract_chain`
-    // handles the ExtractValue chain construction uniformly regardless of
-    // path depth.
+    // Dotted struct paths become ExtractValue chains; emitting the dotted tail
+    // as one identifier would make DuckDB reject the reference.
     // Unqualified: surface `AmbiguousColumn` whenever more than one field
     // (case-insensitive match, matching `field_by_name`'s Spark-compatible
     // rule) resolves. This is the single, central ambiguity check point —
     // it catches ambiguity everywhere a column reference is resolved
     // (projections, filters, sort keys, join conditions, ...), not just in
     // join conditions.
-    // Phase 3b: `ResolveContext::for_join_condition` no longer binds a scope
-    // for `__td_jl`/`__td_jr` (condition plan_id refs resolve through the
-    // shared plan_id arm below, bare+ordinal). A qualifier spelled
-    // `__td_jl`/`__td_jr` can therefore only be a user-typed reserved
-    // qualifier (F13) or a hand-built test AST — the analyzer never binds a
-    // scope for it, so it is rejected unconditionally below rather than
-    // falling through to tier (f)'s permissive name-only fallback.
+    // Synthetic join qualifiers are reserved for emission and never resolve
+    // as user qualifiers.
     let is_synthetic_join_qualifier = matches!(
         u.qualifier.as_deref(),
         Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
     );
-    // ── plan_id-scoped resolution (above-join disambiguation) ────────
     // When the ref is unqualified but carries a plan_id that maps to a
     // known join side, restrict resolution to that side's field range.
     // The condition and above-join paths now share this arm: `resolve_column`
@@ -4523,15 +4234,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // child — Spark tolerates refs resolvable unambiguously without it).
     if u.qualifier.is_none() {
         if let Some(pid) = u.plan_id {
-            // ADR-023 3b-i: a plan_id bound on BOTH sides of the SAME join
-            // (the un-realiased self-join `df.join(df, ...)`) is genuinely
-            // ambiguous — Spark itself cannot tell which side is meant.
+            // An unaliased self-join reusing a plan_id is ambiguous.
             // Checked BEFORE `plan_id_lookup`'s first-match so we raise
             // `AmbiguousColumnReference` instead of silently binding the left
-            // side. Phase 3a: this arm is the unification point, reached from
-            // both the join-CONDITION path (`ResolveContext::for_join_condition`
-            // seeds the own-intersection) and the above-join path
-            // (`RelScope::of`'s Join arm).
             if ctx.scopes.plan_id_is_ambiguous(pid) {
                 return Err(AnalyzerError::AmbiguousColumnReference {
                     name: u.name.clone(),
@@ -4540,18 +4245,11 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             if let Some(range) = ctx.plan_id_lookup(pid) {
                 let info = TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]);
                 if let Some((dt, nullable, attr)) = info {
-                    // ADR-024: `attr` borrows straight from `ctx.schema.fields`
-                    // (via the range sub-slice), so its `expr_id` needs no
-                    // re-basing.
+                    // The attribute is borrowed from the schema slice, so its
+                    // identity needs no re-basing.
                     let expr_id = Some(attr.expr_id);
-                    // Phase 3b (governing invariant): always bare — a
-                    // plan_id-scoped ref binds into the emitting operator's
-                    // schema by attribute identity, never by a stamped
-                    // join-side qualifier. Emission binds
-                    // `ColumnReference{qualifier: None, expr_id: Some(id)}`
-                    // against the attribute `id` names in
-                    // `input.resolved_schema.fields`, whether or not the
-                    // name is duplicated elsewhere in the schema.
+                    // Plan-id references are bare and bind in emission by
+                    // attribute identity, even when names are duplicated.
                     return Ok(Expression::ColumnReference(ColumnReference {
                         name: u.name,
                         qualifier: None,
@@ -4585,30 +4283,17 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         }
     }
     if is_synthetic_join_qualifier {
-        // F13: reserved emission-namespace qualifier. The analyzer never binds a
-        // scope for __td_jl/__td_jr (Phase 3b); reject unconditionally (Spark
-        // parity: UNRESOLVED_COLUMN), never fall through to tier (f)'s
-        // permissive name-only fallback.
+        // Reserved emission-namespace qualifiers are not user-bindable.
         return Err(AnalyzerError::UnknownColumn {
             name: u.name,
             qualifier: u.qualifier,
         });
     }
     let (dt, nullable, expr_id) = if let Some(q) = u.qualifier.as_deref() {
-        // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
-        // column wins over a relation-alias scope — struct-field access takes
-        // precedence, matching the pre-existing behavior this pass preserves.
-        // `struct_qualifier_info` resolves both single-level (`field_by_name`)
-        // and dotted multi-level (`resolve_nested_field`) tails against the
-        // struct; either way this resolves to an `ExtractValue` chain rooted
-        // at the struct COLUMN's own attribute (Pass F2 stages 1-2) rather
-        // than a raw qualified `ColumnReference` — DuckDB rejects
-        // `"address"."geo.lat"` for multi-level paths, and unifying
-        // single-level onto the same chain gives the root ref real attribute
-        // identity instead of an id-less stamp. `q`'s own spelling is
-        // discarded in favor of the schema's canonical `root.name` (DuckDB
-        // identifiers are case-insensitive, so this cannot change emitted
-        // behavior for any case-varying user spelling).
+        // A qualifier naming a top-level struct takes precedence over a
+        // relation alias.
+        // Both single- and multi-level paths become chains rooted at the
+        // struct attribute, preserving identity for emission.
         if TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema).is_some() {
             let root = ctx.schema.field_by_name(q).expect(
                 "struct_qualifier_info matched q as a top-level struct column on this same schema",
@@ -4625,22 +4310,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 Some(range) => {
                     match TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]) {
                         Some((dt, nullable, attr)) => {
-                            // ADR-024: `attr` borrows straight from
-                            // `ctx.schema.fields` (via the range sub-slice),
-                            // so its `expr_id` needs no re-basing.
+                            // The attribute is borrowed from the schema slice;
+                            // its identity needs no rebase.
                             let expr_id = Some(attr.expr_id);
-                            // ADR-023 3e-ii: a qualifier that binds a local
-                            // scope AND resolves to a name UNIQUE in the
-                            // output is the projected-through case the (now
-                            // retired) emission-side stranded-qualifier
-                            // rewrite handled at every wrap site (pre-wrap
-                            // `exposes(q)` ⟺ this `scoped_range(q) == Some`;
-                            // struct access already handled above). Drop it
-                            // now, at resolution: a unique bare name binds
-                            // positionally over any
-                            // wrapper, so the carried qualifier is never
-                            // needed and never strands. Duplicated names keep
-                            // the qualifier (the uniquify/reproject path).
+                            // A uniquely named projected column can bind bare
+                            // by identity; duplicated names retain the
+                            // qualifier for disambiguation.
                             let name_count = ctx
                                 .schema
                                 .fields
@@ -4670,9 +4345,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // to this arm: `q` binds 2+ ranges (a duplicate alias / bare
                 // table name on both sides of a join — `RelScope::lookup`
                 // collapses 2+ matches to `None`, same as 0), or `q` binds no
-                // scope at all (e.g. USING joins stay on the legacy path —
-                // `collect_qualifier_bindings` STOPs there). ADR-023 3b-i:
-                // distinguish them via `lookup_all` — 2+ is genuinely
+                // scope at all (for example, USING joins). Distinguish them
+                // via `lookup_all` — 2+ is genuinely
                 // ambiguous (Spark: AMBIGUOUS_REFERENCE) and must not fall
                 // through to the permissive legacy name-only lookup; 0 is
                 // resolved below.
@@ -4687,12 +4361,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             candidates,
                         });
                     }
-                    // Genuinely 0 scope hits for `q`. Every node's lineage is
-                    // AUTHORITATIVE (tier-3e — the deferred-lineage legacy
-                    // name-only fallback is retired): `q` binds no local
-                    // alias scope, so consult each field's own
-                    // `Attribute::source_quals` (N9 increment 3: intrinsic to
-                    // the attribute) directly.
+                    // With no scope hit, consult each field's own lineage.
                     let hits: Vec<usize> = ctx
                         .schema
                         .fields
@@ -4747,21 +4416,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         (dt, nullable, expr_id)
     };
     if matches!(dt, DataType::Unresolved) {
-        // (g) Outer-scope fallback: when ALL inner tiers have failed and an
-        // enclosing plan's scope is available (inside a subquery), attempt to
-        // resolve the reference against the outer plan's schema —
-        // `resolve_in_outer` builds the fully-stamped `Expression` itself
-        // (either an `ExtractValue` chain for outer struct-field access, or a
-        // `ColumnReference` preserving the qualifier verbatim so emission
-        // renders it as-is and DuckDB's own correlated-subquery binder
-        // resolves it at runtime — same mechanism the pre-existing green
-        // correlated subquery cases ride). D2/Pass F2 stage 3: every arm's
-        // stamped `expr_id` is the OUTER attribute's — never equal to any id
-        // in `ctx.schema` (ids are minted from one process-global counter, so
-        // an outer id can only coincide with a local one if it genuinely IS
-        // that same attribute), so every local consumer that binds by
-        // id-in-local-schema still misses exactly as it would have missed
-        // before this pass.
+        // After local resolution fails, try the immediate outer scope for a
+        // correlated reference. Preserve the outer attribute's identity.
         if let Some(outer) = ctx.outer {
             if let Some(expr) = resolve_in_outer(&u, outer) {
                 return Ok(expr);
@@ -4787,20 +4443,14 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
 /// by construction (E4/D3: `data_type`/`nullable` are non-`Option`) — it
 /// falls into the default recursion below.
 fn expression_is_fully_resolved(expr: &Expression) -> bool {
-    // Opaque per [`Expression::is_opaque_unit`] (the single opacity
-    // authority, N1): Lambda / LambdaVariable / RawSql / Interval bodies are
-    // never re-derived by this walker, so they count as trivially resolved.
-    // (`LambdaVariable` was previously handled by the default recursion arm
-    // below — a leaf with no children vacuously satisfies `.all(...)` — so
-    // folding it into this early return changes no behavior.)
+    // Opaque expression bodies are already resolved by their enclosing
+    // expression and are not re-derived here.
     if expr.is_opaque_unit() {
         return true;
     }
     match expr {
         Expression::UnresolvedColumn(_) => false,
-        // Pass 85 — pattern-driven column expander; expanded away by
-        // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
-        // If it survives to this check, treat it as unresolved.
+        // Regex projections should have expanded before this check.
         Expression::UnresolvedRegex(_) => false,
         // Subquery bodies must be analyzed: the inner plan is fully resolved
         // only once the analyzer has rewritten `Unanalyzed` → `Analyzed`.
@@ -4828,8 +4478,6 @@ fn subquery_plan_is_resolved(plan: &SubqueryPlan) -> bool {
     }
 }
 
-// ── Schema / expression naming ──────────────────────────────────────────────
-
 fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
     schema
         .fields
@@ -4837,39 +4485,9 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
         .any(|f| f.data_type.contains_unresolved())
 }
 
-/// Build the output [`Attribute`] contributed by a projection-position
-/// expression: name via [`expression_output_name`], type and nullability
-/// resolved against `input`. The single copy-or-mint home (item 3 of the
-/// N9/ADR-024 consolidation): [`promote_bare_column`] calls this directly
-/// instead of hand-rolling its own copy of the same shape.
-///
-/// N9 INC-1 identity rule (ADR-024): a bare `ColumnReference` whose
-/// `expr_id` matches an `input` attribute (first occurrence via
-/// [`ResolvedSchema::field_by_id`] — duplicate ids within one schema are
-/// clones of the same attribute from a duplicated projection, so first-match
-/// is sound) COPIES that attribute's `expr_id` — it is the identical logical
-/// column, merely passed through a `SELECT`. Everything else (`Alias`,
-/// computed expressions) MINTS a fresh id — it is a genuinely new column.
-///
-/// N9 INC-3 lineage rule (ADR-023 tier-3, folded in from the deleted
-/// `source_quals_of`): the COPY branch above additionally clones the source
-/// attribute's `source_quals` (via `src.clone()`) and unions in the
-/// reference's OWN stamped qualifier when present — a qualified passthrough
-/// (`e.dept_id`) is referenceable via either its inherited qualifier(s) or the
-/// one it was just referenced through. The MINT branch's fresh
-/// `Attribute::minted` carries EMPTY lineage — a created column (`Alias`,
-/// computed expression) inherits no qualifier (F8/filt-019 hinge).
-///
-/// Naming policy (shared with [`promote_bare_column`], verified benign): the
-/// COPY branch always stamps `name` via [`expression_output_name`] — the
-/// reference's OWN stamped user-case name — rather than the source
-/// attribute's verbatim name. For a plain SELECT passthrough the two agree
-/// modulo case (by construction). For `promote_bare_column`'s hidden
-/// promoted slot the attribute is trimmed away by the wrapping trim-`Project`
-/// (which re-binds by id, not by name or qualifier) immediately after use, so
-/// the case — and the qualifier-union into `source_quals` above — are both
-/// inert there: nothing downstream observes them before the slot is
-/// discarded.
+/// Build a projection output attribute. A bare reference matching an input
+/// identity copies that attribute and merges any stamped qualifier; aliases
+/// and computed expressions mint a fresh identity with empty lineage.
 fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
     if let Expression::ColumnReference(cr) = e {
         if let Some(id) = cr.expr_id {
@@ -4966,8 +4584,6 @@ fn project_output_schema(
     }
     Ok(ResolvedSchema::new(fields))
 }
-
-// ── Unpivot analysis ────────────────────────────────────────────────────────
 
 /// Analyze `CommonOp::Unpivot`: resolve the input, materialise the `values`
 /// list (empty ⇒ all non-id input columns per Spark), then stamp the output
@@ -5083,20 +4699,8 @@ fn analyze_unpivot(
         });
     }
 
-    // The former M2/M3 guards rejected (a) overlap between id and value
-    // columns, (b) a variable/value column name colliding with an id column,
-    // and (c) variable == value. Their comments asserted "Spark itself rejects
-    // overlap between ids and values" and "the stamped output schema would
-    // carry two fields with the same name — Spark rejects this". Both claims
-    // were falsified against live Spark 4.1.1 (review A1 audit): Spark accepts
-    // all four shapes and is perfectly happy to emit a duplicate-named output
-    // schema, because it only rejects an ambiguous *reference*, not a
-    // duplicate name in a schema. Observed:
-    //   unpivot(ids=[id], values=[id])            -> id:bigint, k:string, v:bigint
-    //   unpivot(ids=[id], values=[salary], "id")  -> id:bigint, id:string, v:double
-    //   unpivot(ids=[id], values=[salary], var=value="same")
-    //                                             -> id:bigint, same:string, same:double
-    // The guards therefore made τ reject queries Spark runs, so they are gone.
+    // Spark permits overlapping id/value names and duplicate output names;
+    // only ambiguous references are rejected.
 
     // Widen value-column types across `materialised_values`.
     let mut widened_type = DataType::Unresolved;
@@ -5145,8 +4749,6 @@ fn analyze_unpivot(
         output_schema,
     ))
 }
-
-// ── Describe / Summary analysis (Pass 80) ───────────────────────────────────
 
 /// Build the shared output schema for `describe` / `summary`: a `summary`
 /// STRING NOT NULL column followed by one STRING NULLABLE column per
@@ -5316,8 +4918,6 @@ fn analyze_freq_items(
     ))
 }
 
-// ── Pivot analysis (Pass 60) ────────────────────────────────────────────────
-
 /// Analyze `CommonOp::Pivot`: resolve the input, resolve grouping / pivot /
 /// aggregate expressions against the input schema, and stamp the output
 /// schema.
@@ -5355,8 +4955,7 @@ fn analyze_pivot(
     // eager DISTINCT query against DuckDB (Spark's Analyzer does this
     // eagerly). τ's analyzer has no session hook — implementing
     // it needs the base_types overlay extended with a value-query closure.
-    // Reject loudly with a Thunderduck-boundary error rather than stamping
-    // an incorrect schema. See Pass 60 notes for the follow-up work.
+    // Reject loudly rather than stamping an incorrect schema.
     if pivot_values.is_empty() {
         return Err(AnalyzerError::PuntedOperator {
             op: "Pivot[implicit-values]".to_owned(),
@@ -5382,14 +4981,13 @@ fn analyze_pivot(
             derive_implicit_grouping(input_schema, &pivot_column, &aggregates)
         }
     };
-    // N8: wrap every computed grouping entry as a named `Alias`, same
-    // invariant as Project/Aggregate — `grouping` is Pivot's own output-list
-    // prefix (see the schema-stamping doc above). `pivot_column` /
+    // Wrap every computed grouping entry as a named `Alias`; `grouping` is
+    // Pivot's output-list prefix. `pivot_column` /
     // `pivot_values` / `aggregates` are NOT wrapped: they own their naming
     // (the pivot-value × aggregate loop below derives output names directly
     // from them; emission consumes `aggregates` via `.unaliased()`).
-    // `derive_implicit_grouping` only ever produces bare `ColumnReference`s,
-    // so wrapping the `Implicit` branch is a no-op.
+    // `derive_implicit_grouping` produces bare references, so this is a no-op
+    // for implicit grouping.
     let grouping: Vec<Expression> = grouping.into_iter().map(ensure_named).collect();
     // Pivot values are literals; they only need type resolution against the
     // pivot column (Spark coerces them into that type at read). We defer
@@ -5474,7 +5072,7 @@ fn analyze_pivot(
 ///   resolves to `bigint nullable=False`.
 ///
 /// The grouping key (col0, string, nullability from col1) is folded ahead of
-/// the count columns at construction time via [`grouped_aggregate`] (N7) — the
+/// the count columns at construction time via [`grouped_aggregate`] — the
 /// output list is `[col0] ++ counts`, with the count columns' lexicographic
 /// sort applied BEFORE the prepend so col0 stays first.
 pub fn crosstab_to_aggregate(
@@ -5679,9 +5277,7 @@ fn literal_value_string(value: &LiteralValue) -> String {
         LiteralValue::Short(v) => v.to_string(),
         LiteralValue::Int(v) => v.to_string(),
         LiteralValue::Long(v) => v.to_string(),
-        // Pass 60 H1: Spark's Catalyst `Literal.sql` renders integral
-        // floats/doubles with a `.0` suffix ("1.0", not "1"). Match it
-        // so pivot output column names match Spark exactly.
+        // Spark renders integral float/double literals with a `.0` suffix.
         LiteralValue::Float(v) => format_float_pivot_name(f64::from(*v)),
         LiteralValue::Double(v) => format_float_pivot_name(*v),
         LiteralValue::Decimal { value, .. } => value.clone(),
@@ -5698,8 +5294,8 @@ fn literal_value_string(value: &LiteralValue) -> String {
 /// (integral doubles get a `.0` suffix; non-integral doubles use their
 /// natural decimal repr). NaN/infinity fall through to Rust's default
 /// `Display`, which emits `"NaN"` / `"inf"` / `"-inf"` — a lossless-but-not
-/// necessarily Spark-precise stringification. This is acceptable for pivot
-/// column names (Pass 60 finding M2 was dropped as info-only).
+/// necessarily Spark-precise stringification; these values are used only as
+/// pivot column names.
 fn format_float_pivot_name(v: f64) -> String {
     if v.is_finite() && v.fract() == 0.0 {
         format!("{v:.1}")
@@ -5733,7 +5329,7 @@ fn expression_output_name(expr: &Expression) -> String {
     }
 }
 
-/// N8 (Spark `UnresolvedAlias` → `Alias`): carry the schema output name on
+/// Carry the Spark `UnresolvedAlias` → `Alias` output name on
 /// the tree itself, so any consumer that walks a Project/Aggregate/Pivot
 /// output list can read the entry's declared name directly instead of
 /// re-deriving it via [`expression_output_name`]. Bare `ColumnReference`s and
@@ -5825,18 +5421,14 @@ fn pretty_name(expr: &Expression) -> String {
         Expression::Unary(u) => pretty_unary(u),
         Expression::FunctionCall(f) => {
             let args: Vec<String> = f.args.iter().map(pretty_name).collect();
-            // N5 uppercase overlay: `f.name` is canonical lowercase substrate
-            // identity; the small `SPARK_UPPER_PRETTY` roster is where Spark
-            // itself renders an UPPERCASE auto-name (see its doc).
+            // Spark's uppercase auto-name exceptions are listed separately.
             if SPARK_UPPER_PRETTY.contains(&f.name.as_str()) {
                 format!("{}({})", f.name.to_ascii_uppercase(), args.join(", "))
             } else {
                 format!("{}({})", f.name, args.join(", "))
             }
         }
-        // N4: an `implicit` Cast is an analyzer-materialized coercion, never
-        // part of what Spark itself names — transparent straight to the
-        // inner expression (see `CastExpression::implicit`'s doc).
+        // Analyzer-inserted casts are transparent to Spark's output naming.
         Expression::Cast(c) if c.implicit => pretty_name(&c.expr),
         // Spark's `Cast.sql` / `TryCast.sql` renders `CAST(<child> AS <TYPE>)`
         // / `TRY_CAST(<child> AS <TYPE>)` with the UPPERCASE Catalyst type
@@ -5953,8 +5545,6 @@ fn pretty_unary(u: &UnaryExpression) -> String {
     }
 }
 
-// ── Set-op widening (§5) ─────────────────────────────────────────────────────
-
 fn push_setop_casts(ast: &mut TypedAst, widened_schema: &ResolvedSchema) {
     // Only push CASTs into direct `Project` children whose projection list
     // matches the widened schema column-by-column. Non-Project inputs
@@ -5984,8 +5574,8 @@ fn push_setop_casts(ast: &mut TypedAst, widened_schema: &ResolvedSchema) {
             .then(|| target.data_type.clone());
             align_setop_projection(proj, &target.name, cast_to);
         }
-        // N9 INC-1: overwrite name/type/nullable from `widened_schema`
-        // POSITIONALLY, but KEEP THIS CHILD'S OWN ids — copying the
+        // Overwrite name/type/nullability positionally, but keep this child's
+        // own ids — copying the
         // widened schema's (child-0-derived) ids into every child would
         // silently reassign this child's columns' identity to child 0's.
         for (attr, target) in ast
@@ -6031,8 +5621,6 @@ fn align_setop_projection(expr: &mut Expression, name: &str, cast_to: Option<Dat
     });
 }
 
-// ── Join helpers (§6) ────────────────────────────────────────────────────────
-
 fn apply_join_nullability(
     left: &ResolvedSchema,
     right: &ResolvedSchema,
@@ -6063,8 +5651,6 @@ pub(super) fn flip_all_nullable(schema: &ResolvedSchema) -> ResolvedSchema {
         .collect();
     ResolvedSchema::new(fields)
 }
-
-// ── Values schema inference ─────────────────────────────────────────────────
 
 fn infer_values_schema(
     rows: &[Vec<Expression>],
@@ -6118,8 +5704,6 @@ fn infer_values_schema(
     Ok(StructType::new(fields))
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -6151,9 +5735,6 @@ mod tests {
         ])
     }
 
-    // ── shared expression / plan constructors ────────────────────────────
-
-    /// Bare `TableScan` over `name` (no alias).
     fn scan(name: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
             table: name.to_owned(),
@@ -6164,7 +5745,6 @@ mod tests {
         scan("emp")
     }
 
-    /// Unqualified unresolved column (no plan id).
     fn unresolved_col(name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.to_owned(),
@@ -6173,7 +5753,6 @@ mod tests {
         })
     }
 
-    /// Qualifier-scoped unresolved column (`qualifier.name`, no plan id).
     fn qcol(qualifier: &str, name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.to_owned(),
@@ -6210,7 +5789,6 @@ mod tests {
         })
     }
 
-    /// Non-distinct function call.
     fn func(name: &str, args: Vec<Expression>) -> Expression {
         Expression::FunctionCall(FunctionCall {
             name: name.to_owned(),
@@ -6219,7 +5797,6 @@ mod tests {
         })
     }
 
-    /// `expr AS alias`.
     fn alias_expr(expr: Expression, alias: &str) -> Expression {
         Expression::Alias(AliasExpression {
             expr: Box::new(expr),
@@ -6227,9 +5804,6 @@ mod tests {
         })
     }
 
-    /// Build a single-row `Values` plan with the given `(name, ty, value)`
-    /// triples. Column nullability follows Spark's Literal semantics (all
-    /// non-null unless the LiteralValue is `Null`).
     fn values_row(cols: &[(&str, DataType, LiteralValue)]) -> CommonAst {
         let row: Vec<Expression> = cols
             .iter()
@@ -6247,9 +5821,6 @@ mod tests {
         })
     }
 
-    // ── shared op builders (invariant default fields filled in) ──────────
-
-    /// `Join` with `using_columns` / `left_plan_ids` / `right_plan_ids` empty.
     fn join(
         left: CommonAst,
         right: CommonAst,
@@ -6269,7 +5840,6 @@ mod tests {
         })
     }
 
-    /// Positional `SetOp` (`by_name = false`, `allow_missing_columns = false`).
     fn set_op(kind: SetOpKind, all: bool, children: Vec<CommonAst>) -> CommonAst {
         CommonAst::new(CommonOp::SetOp {
             kind,
@@ -6280,7 +5850,6 @@ mod tests {
         })
     }
 
-    /// By-name `SetOp` (`allow_missing_columns = false`).
     fn set_op_by_name(kind: SetOpKind, all: bool, children: Vec<CommonAst>) -> CommonAst {
         CommonAst::new(CommonOp::SetOp {
             kind,
@@ -6291,7 +5860,6 @@ mod tests {
         })
     }
 
-    /// `unionByName(allowMissingColumns=True)` shape.
     fn union_by_name_allow_missing(children: Vec<CommonAst>) -> CommonAst {
         CommonAst::new(CommonOp::SetOp {
             kind: SetOpKind::Union,
@@ -6302,10 +5870,6 @@ mod tests {
         })
     }
 
-    /// `Aggregate` with plain `GROUP BY` (no grouping sets) and the given
-    /// HAVING clause. N7: `aggregates` IS the complete output list by
-    /// construction — callers pass the whole SELECT list (grouping columns
-    /// included, if restated) directly.
     fn aggregate_having(
         input: CommonAst,
         grouping: Vec<Expression>,
@@ -6322,7 +5886,6 @@ mod tests {
         })
     }
 
-    /// `Aggregate` with plain `GROUP BY`, no grouping sets, no HAVING.
     fn aggregate(
         input: CommonAst,
         grouping: Vec<Expression>,
@@ -6331,9 +5894,6 @@ mod tests {
         aggregate_having(input, grouping, aggregates, None)
     }
 
-    // ── shared BaseTypes builders ─────────────────────────────────────────
-
-    /// Overlay with the given `table → schema` entries pre-resolved.
     fn base_types_for(tables: &[(&str, StructType)]) -> BaseTypes {
         BaseTypes::from_entries(
             tables
@@ -6347,12 +5907,6 @@ mod tests {
         base_types_for(&[("emp", emp_schema()), ("dept", dept_schema())])
     }
 
-    // ── RelScope stamping ─────────────────────────────────────────────────
-    // Direct parity tests for the stamped scope (formerly the recursive
-    // `collect_qualifier_bindings` walk): binding rules per operator class.
-
-    /// `table` under an explicit alias — an `AliasedRelation` wrapper, the
-    /// shape both front-ends produce for `FROM table AS alias`.
     fn aliased_scan(table: &str, alias: &str) -> CommonAst {
         CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
@@ -6362,9 +5916,6 @@ mod tests {
         })
     }
 
-    /// An alias SHADOWS the base table name (Spark parity): `FROM emp AS e`
-    /// binds `e` only, never `emp`. `AliasedRelation`'s scope arm drops the
-    /// child's bindings and rebinds the whole range to the alias.
     #[test]
     fn rel_scope_aliased_scan_binds_alias_only_shadowing_table_name() {
         let bt = base_types_with_emp_dept();
@@ -6381,7 +5932,6 @@ mod tests {
             alias: "e".to_owned(),
         });
         let typed = analyze(ast, &bt).unwrap();
-        // Child's `emp` binding is dropped; only the alias is exposed.
         assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
     }
 
@@ -6466,7 +6016,6 @@ mod tests {
             condition: cond,
         });
         let typed = analyze(ast, &bt).unwrap();
-        // Filter passes the join's bindings through unchanged.
         let inner_scope = match &typed.op {
             TypedOp::Filter { input, .. } => input.scope.clone(),
             other => panic!("expected Filter, got {other:?}"),
@@ -6482,9 +6031,6 @@ mod tests {
             ("dept", dept_schema()),
             ("bonus", dept_schema()),
         ]);
-        // inner join (plan_ids 1|2), then outer join (plan_ids 1|3): the
-        // OUTER join's entry for pid 1 must precede the inner join's, so
-        // first-match resolution picks the nearest enclosing join's side.
         let inner = CommonAst::new(CommonOp::Join {
             left: Box::new(emp_scan()),
             right: Box::new(scan("dept")),
@@ -6527,9 +6073,7 @@ mod tests {
             .filter(|(pid, _)| *pid == 1)
             .collect();
         assert_eq!(pid1_entries.len(), 2);
-        // Outermost entry first: whole left side of the OUTER join (0..6).
         assert_eq!(pid1_entries[0].1, 0..6);
-        // Inner join's entry (0..4) follows.
         assert_eq!(pid1_entries[1].1, 0..4);
     }
 
@@ -6559,9 +6103,6 @@ mod tests {
         );
     }
 
-    // ── plan_id ambiguity resolution (ADR-023) ─────────────────────────────
-
-    /// Plan-id-tagged unresolved column (DataFrame disambiguation shape).
     fn pcol(name: &str, plan_id: i64) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.to_owned(),
@@ -6570,7 +6111,6 @@ mod tests {
         })
     }
 
-    /// `emp` (plan_id 1) ⋈ `dept` (plan_id 2) with the given condition.
     fn plan_id_join(condition: Option<Expression>) -> CommonAst {
         CommonAst::new(CommonOp::Join {
             left: Box::new(emp_scan()),
@@ -6585,11 +6125,6 @@ mod tests {
         })
     }
 
-    /// The [`ExprId`] of the attribute at merged-schema position `k` of a
-    /// resolved `Join` (left schema first, then right, exactly as
-    /// `resolve_column`'s plan_id arm indexes it) — the ADR-024 restatement
-    /// of what these tests used to assert directly via
-    /// `ColumnReference::ordinal`.
     fn merged_join_expr_id_at(typed: &TypedAst, k: usize) -> ExprId {
         let TypedOp::Join { left, right, .. } = &typed.op else {
             panic!("expected Join, got {:?}", typed.op);
@@ -6602,9 +6137,6 @@ mod tests {
         }
     }
 
-    /// Pull the `(left, right)` `ColumnReference`s out of a resolved `Join`'s
-    /// binary equality condition, for asserting the resolved qualifier /
-    /// `expr_id` ADR-023 Phase 1 stamps (or drops).
     fn join_condition_refs(typed: &TypedAst) -> (ColumnReference, ColumnReference) {
         let TypedOp::Join { condition, .. } = &typed.op else {
             panic!("expected Join, got {:?}", typed.op);
@@ -6626,10 +6158,6 @@ mod tests {
     #[test]
     fn adr023_phase1_unique_name_condition_drops_qualifier() {
         let bt = base_types_with_emp_dept();
-        // `id` (emp-only) and `dept_name` (dept-only) are each unique across
-        // the merged emp⋈dept condition schema — ADR-023 Phase 1 drops the
-        // synthetic qualifier at resolution, so neither side needs its
-        // `__td_jl`/`__td_jr` wrap alias.
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("id", 1)),
@@ -6646,12 +6174,6 @@ mod tests {
     #[test]
     fn adr023_phase1_dup_name_condition_resolves_bare_ordinal() {
         let bt = base_types_with_emp_dept();
-        // `dept_id` is duplicated across emp/dept. Phase 3b: the plan_id arm
-        // ALWAYS returns bare qualifier + ordinal (never a stamped
-        // `__td_jl`/`__td_jr` side qualifier) — emission binds the ref
-        // positionally against the merged condition schema instead
-        // (`requalify_column_ref`'s `is_left = k < left_len` split). The
-        // former demand-flag machinery is fully retired (Phase 4).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 1)),
@@ -6668,13 +6190,6 @@ mod tests {
     #[test]
     fn adr023_phase1_self_join_condition_still_wraps() {
         let bt = base_types_with_emp_dept();
-        // Self-join emp(plan_id=1) ⋈ emp(plan_id=2) ON id==id — `id` is
-        // duplicated in the merged self-join schema, so it stays genuinely
-        // ambiguous by NAME. Phase 3b: the plan_id arm nonetheless ALWAYS
-        // returns bare qualifier + ordinal — the ordinal alone (0 vs. 4)
-        // disambiguates the side; emission binds positionally instead of via
-        // a stamped synthetic qualifier. The former demand-flag machinery is
-        // fully retired (Phase 4).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("id", 1)),
@@ -6699,20 +6214,11 @@ mod tests {
     #[test]
     fn ancestor_ref_resolves_bare_ordinal_through_passthrough() {
         let bt = base_types_with_emp_dept();
-        // Table-name-qualified condition — resolves via the qualifier scope,
-        // so the condition itself stamps no synthetic names…
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(qcol("emp", "dept_id")),
             right: Box::new(qcol("dept", "dept_id")),
         });
-        // …and Phase 3b: the ancestor Project's plan_id-tagged `dept_id`
-        // reference (through the Filter passthrough) ALSO never stamps a
-        // synthetic qualifier anymore — the plan_id arm always resolves
-        // bare+ordinal, so no `__td_jl`/`__td_jr` qualifier exists to
-        // propagate anywhere. The ordinal alone (2, into the merged
-        // emp⋈dept schema, emp's `dept_id`) is the above-join
-        // disambiguation witness.
         let filtered = CommonAst::new(CommonOp::Filter {
             input: Box::new(plan_id_join(Some(cond))),
             condition: Expression::Binary(BinaryExpression {
@@ -6726,7 +6232,6 @@ mod tests {
             projections: vec![pcol("dept_id", 1)],
         });
         let typed = analyze(ast, &bt).unwrap();
-        // Walk Project → Filter → Join and check the resolved ancestor ref.
         let TypedOp::Project { input, projections } = &typed.op else {
             panic!("expected Project");
         };
@@ -6756,10 +6261,6 @@ mod tests {
             right: Box::new(qcol("dept", "dept_id")),
         });
         let inner = join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond));
-        // Phase 3b: the outer join's OWN condition (pid-7/8) never stamps a
-        // synthetic qualifier — the plan_id arm always resolves bare+ordinal.
-        // No ancestor demand can leak a synthetic qualifier either, through
-        // the ancestor Filter's own pid-7 `dept_id` reference below.
         let outer_cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 7)),
@@ -6792,11 +6293,6 @@ mod tests {
         else {
             panic!("expected Filter");
         };
-        // Ancestor ref resolves bare (vestigial witness): pid-7's own range
-        // is the whole inner join (0..6), and `dept_id`'s first occurrence
-        // within it is emp's `dept_id` at position 2 — no synthetic
-        // qualifier is ever stamped, regardless of the name being duplicated
-        // elsewhere in the outer schema.
         let Expression::Binary(BinaryExpression { left, .. }) = condition else {
             panic!("expected Binary condition");
         };
@@ -6807,9 +6303,6 @@ mod tests {
         assert_eq!(ancestor_ref.expr_id, Some(merged_join_expr_id_at(outer, 2)));
     }
 
-    // ── shared TypedAst extractors ────────────────────────────────────────
-
-    /// Output-schema field names, in order.
     fn field_names(typed: &TypedAst) -> Vec<&str> {
         typed
             .resolved_schema
@@ -6819,7 +6312,6 @@ mod tests {
             .collect()
     }
 
-    /// The widened schema of a `SetOp` node.
     fn widened_of(typed: &TypedAst) -> &ResolvedSchema {
         match &typed.op {
             TypedOp::SetOp { widened_schema, .. } => widened_schema,
@@ -6827,7 +6319,6 @@ mod tests {
         }
     }
 
-    /// The resolved grouping column names of a `Pivot` node.
     fn pivot_grouping_names(typed: &TypedAst) -> Vec<&str> {
         match &typed.op {
             TypedOp::Pivot { grouping, .. } => grouping
@@ -6840,8 +6331,6 @@ mod tests {
             other => panic!("expected TypedOp::Pivot, got {other:?}"),
         }
     }
-
-    // ── resolve pass ──────────────────────────────────────────────────────
 
     #[test]
     fn resolve_table_scan_seeds_schema_from_base_types() {
@@ -6871,12 +6360,9 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    // ── Pass 126 — table-qualified star (`t.*` / `alias.*`) ──────────────
-
     #[test]
     fn qualified_star_over_table_scan_expands_to_full_schema() {
         let bt = base_types_with_emp_dept();
-        // SELECT emp.* FROM emp
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![Expression::Star(StarExpression {
@@ -6890,7 +6376,6 @@ mod tests {
     #[test]
     fn qualified_star_over_semi_join_binds_left_relation_schema() {
         let bt = base_types_with_emp_dept();
-        // SELECT e.* FROM emp e LEFT SEMI JOIN dept d ON ...
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
                 CommonAst::new(CommonOp::AliasedRelation {
@@ -6909,14 +6394,12 @@ mod tests {
             })],
         });
         let typed = analyze(ast, &bt).expect("analyze e.* over semi join");
-        // Semi join yields only the left relation's columns; `e.*` binds them.
         assert_eq!(typed.resolved_schema, emp_schema());
     }
 
     #[test]
     fn qualified_star_with_unknown_qualifier_still_rejects() {
         let bt = base_types_with_emp_dept();
-        // SELECT bogus.* FROM emp — qualifier binds no in-scope relation.
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![Expression::Star(StarExpression {
@@ -6927,7 +6410,6 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    /// `q.*` projection under the given alias, over `input`.
     fn qstar_project(input: CommonAst, q: &str) -> CommonAst {
         CommonAst::new(CommonOp::Project {
             input: Box::new(input),
@@ -6937,7 +6419,6 @@ mod tests {
         })
     }
 
-    /// `emp e INNER JOIN dept d ON e.dept_id = d.dept_id`.
     fn emp_dept_aliased_join() -> CommonAst {
         join(
             aliased_scan("emp", "e"),
@@ -6954,7 +6435,6 @@ mod tests {
     #[test]
     fn qualified_star_over_plain_join_expands_left_range() {
         let bt = base_types_with_emp_dept();
-        // SELECT e.* FROM emp e JOIN dept d ON … — left side's columns only.
         let typed = analyze(qstar_project(emp_dept_aliased_join(), "e"), &bt)
             .expect("analyze e.* over join");
         assert_eq!(typed.resolved_schema, emp_schema());
@@ -6963,7 +6443,6 @@ mod tests {
     #[test]
     fn qualified_star_over_plain_join_expands_right_range() {
         let bt = base_types_with_emp_dept();
-        // SELECT d.* — right side's columns, at the offset range.
         let typed = analyze(qstar_project(emp_dept_aliased_join(), "d"), &bt)
             .expect("analyze d.* over join");
         assert_eq!(typed.resolved_schema, dept_schema());
@@ -6972,8 +6451,6 @@ mod tests {
     #[test]
     fn qualified_star_resolves_through_scope_passthrough() {
         let bt = base_types_with_emp_dept();
-        // SELECT e.* FROM (emp e JOIN dept d ON …) WHERE d.dept_id > 0 —
-        // Filter is scope-passthrough, so the join's bindings survive.
         let filtered = CommonAst::new(CommonOp::Filter {
             input: Box::new(emp_dept_aliased_join()),
             condition: Expression::Binary(BinaryExpression {
@@ -6989,8 +6466,6 @@ mod tests {
     #[test]
     fn qualified_star_nullability_reflects_outer_join_flip() {
         let bt = base_types_with_emp_dept();
-        // SELECT d.* FROM emp e LEFT OUTER JOIN dept d ON … — the right
-        // side's fields are null-extended; `d.*` must carry the flip.
         let outer_join = join(
             aliased_scan("emp", "e"),
             aliased_scan("dept", "d"),
@@ -7016,8 +6491,6 @@ mod tests {
     #[test]
     fn qualified_star_over_using_join_still_rejects() {
         let bt = base_types_with_emp_dept();
-        // USING joins have an empty RelScope (reorder/dedup breaks the
-        // contiguous-range invariant) — q.* stays a clean UnknownColumn.
         let using_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
             right: Box::new(aliased_scan("dept", "d")),
@@ -7036,7 +6509,6 @@ mod tests {
     #[test]
     fn qualified_star_ambiguous_duplicate_alias_rejects() {
         let bt = base_types_with_emp_dept();
-        // Both sides aliased `x` — `x.*` is ambiguous by construction.
         let dup_join = join(
             aliased_scan("emp", "x"),
             aliased_scan("dept", "x"),
@@ -7046,13 +6518,6 @@ mod tests {
         let err = analyze(qstar_project(dup_join, "x"), &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
-
-    // ── ADR-024 — resolved `expr_id` on ColumnReference ───────────────────
-    // `resolve_column` stamps the attribute identity of the resolved column
-    // within the producing node's `ctx.schema`; these tests pin the stamped
-    // id against the field it actually resolved to (ADR-023 tier 3a's
-    // `ordinal` predecessor pinned the same fact by 0-based position — the
-    // field no longer exists, so identity is now the fact under test).
 
     #[test]
     fn resolve_column_unqualified_matches_schema_index() {
@@ -7066,7 +6531,6 @@ mod tests {
             TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "salary");
-                    // `salary` is the 4th (0-based index 3) field of `emp_schema`.
                     assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -7078,9 +6542,6 @@ mod tests {
     #[test]
     fn resolve_column_qualified_tier_e_matches_schema_index() {
         let bt = base_types_with_emp_dept();
-        // SELECT d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
-        // — tier (e): qualifier `d` binds the join's right-side scope range
-        // (dept fields start at absolute index 4 in the merged schema).
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_dept_aliased_join()),
             projections: vec![qcol("d", "dept_name")],
@@ -7090,8 +6551,6 @@ mod tests {
             TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "dept_name");
-                    // `dept_name` is dept's 2nd field (offset 1), and dept
-                    // starts at absolute index 4 in the merged join schema.
                     assert_eq!(c.expr_id, Some(input.resolved_schema.fields[5].expr_id));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -7102,11 +6561,6 @@ mod tests {
 
     #[test]
     fn resolve_column_plan_id_over_join_matches_correct_side() {
-        // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)`; a Project above
-        // selecting `id` tagged plan_id=2 must resolve to the RIGHT side's
-        // `id` — absolute index 4 (0-based) in the merged 8-field schema.
-        // Phase 3b: the condition's own plan_id refs resolve bare too (no
-        // synthetic `__td_jl`/`__td_jr` qualifier is ever stamped).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("id", 1)),
@@ -7138,14 +6592,6 @@ mod tests {
         }
     }
 
-    // ── ADR-023 tier 3c — per-output-column source-qualifier lineage ─────
-    // N9 increment 3 folded `source_quals` INTO `Attribute` itself (mint/
-    // clone-site propagation) rather than deriving a parallel per-schema
-    // `Vec` in `RelScope`; `quals_of` reads the field-level source of truth
-    // these tests pin.
-
-    /// Read every field's `Attribute::source_quals` in schema order — the
-    /// N9 increment-3 replacement for the deleted `scope.source_quals` Vec.
     fn quals_of(schema: &ResolvedSchema) -> Vec<BTreeSet<String>> {
         schema
             .fields
@@ -7173,7 +6619,6 @@ mod tests {
             input: Box::new(emp_scan()),
             alias: "e".to_owned(),
         });
-        // SELECT e.dept_id, e.name FROM (emp AS e)
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(aliased),
             projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
@@ -7185,15 +6630,11 @@ mod tests {
 
     #[test]
     fn source_quals_project_alias_creates_empty_lineage() {
-        // filt-019/F8 hinge: an Alias'd projection is a CREATED column — it
-        // does NOT inherit its source's qualifier set, even though the
-        // aliased expression is itself a plain passthrough column.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
             alias: "e".to_owned(),
         });
-        // SELECT dept_id AS k FROM (emp AS e)
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(aliased),
             projections: vec![alias_expr(unresolved_col("dept_id"), "k")],
@@ -7204,9 +6645,6 @@ mod tests {
 
     #[test]
     fn source_quals_plain_join_composes_left_and_right() {
-        // emp e JOIN dept d ON e.dept_id = d.dept_id. `AliasedRelation`
-        // OVERWRITES the lineage below it, so each column's only qualifier is
-        // its side's alias — the base table name is shadowed, per Spark.
         let bt = base_types_with_emp_dept();
         let typed = analyze(emp_dept_aliased_join(), &bt).unwrap();
         let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
@@ -7218,13 +6656,6 @@ mod tests {
 
     #[test]
     fn source_quals_using_join_key_column_unions_both_sides() {
-        // ADR-023 3e-i: `emp e JOIN dept d USING(dept_id)`. Output schema
-        // (mirrors `analyze_join`'s USING construction): [dept_id(key), id,
-        // name, salary, dept_name] — the key first, then left's non-USING
-        // fields, then right's non-USING fields. The key's lineage is the
-        // UNION of both sides (a USING key is referenceable via either
-        // side's qualifier); a left non-key inherits only the left set, a
-        // right non-key only the right set.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -7249,10 +6680,6 @@ mod tests {
 
     #[test]
     fn source_quals_aggregate_grouping_col_inherits_source_aggregate_col_empty() {
-        // df.groupBy("dept_id").count() shape — grouping col inherits its
-        // source's qualifier set, the created `count` output col does not.
-        // N7: built via the production `grouped_aggregate` constructor (the
-        // DataFrame-shaped fold), not the SQL-shaped `aggregate` test helper.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(grouped_aggregate(
             scan("emp"),
@@ -7267,11 +6694,6 @@ mod tests {
 
     #[test]
     fn source_quals_aggregate_folded_grouping_col_inherits_source_aggregate_col_empty() {
-        // ADR-023 3e-iii: SparkSQL `SELECT dept_id, SUM(salary) FROM emp
-        // GROUP BY dept_id` shape — N7: `aggregates` IS the complete output
-        // list by construction, so the output schema is `aggregates` as-is
-        // (no grouping prepend). The folded `dept_id` passthrough
-        // column-reference must still inherit its source qualifier lineage.
         let bt = base_types_with_emp_dept();
         let ast = aggregate(
             scan("emp"),
@@ -7288,21 +6710,6 @@ mod tests {
 
     #[test]
     fn source_quals_star_projection_content_carries_through_and_is_tracked() {
-        // N9 increment 3: `source_quals` no longer lives in a separate
-        // `RelScope` Vec derived by a whole-schema pass with a size-correct
-        // empty fallback for deferred ops — it is now INTRINSIC to each
-        // `Attribute`, propagated by ordinary clone at each construction
-        // site. An unqualified `*` clones the input schema's fields
-        // VERBATIM (`project_output_schema`'s `Star`/`None` arm), so the
-        // bare `emp` scan's real per-column lineage (`{"emp"}`, seeded at
-        // the `TableScan` leaf even without an alias) rides straight
-        // through — unlike the OLD `source_quals_of`, which force-emptied
-        // every Star-projected column regardless of what was beneath it.
-        // Pass F3 Stage 4/5: Star projections were the last special case in
-        // tier-(f)'s authoritative-lineage gate — the gate itself is now
-        // gone (every node's lineage is authoritative), so a qualified
-        // reference over the star-projected scope resolves for real against
-        // the copied lineage rather than any name-only fallback.
         let bt = base_types_with_emp_dept();
         let star_project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -7325,13 +6732,6 @@ mod tests {
 
     #[test]
     fn source_quals_with_columns_renamed_clears_lineage_on_renamed_slot_only() {
-        // Pass F3 / P2 (live-Spark-4.1.1-verified): a WithColumnsRenamed
-        // rename severs referenceability via the PRE-rename qualifier — the
-        // renamed slot's inherited `source_quals` lineage is cleared (id
-        // untouched, per ADR-024's rename-keeps-id divergence); an UNRENAMED
-        // slot keeps its lineage unchanged. Pinned directly against the
-        // ATTRIBUTE content — see the dedicated resolution witness below for
-        // the observable resolve/reject behavior this content produces.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7360,12 +6760,6 @@ mod tests {
 
     #[test]
     fn resolve_column_with_columns_renamed_pre_rename_qualifier_rejects_renamed_slot() {
-        // Pass F3 Stage 4 / P2 (live-Spark-4.1.1-verified):
-        // `t.alias("t").withColumnRenamed("id", "y").select("t.y")` raises
-        // UNRESOLVED_COLUMN even though "t" still binds this node's alias
-        // scope — the rename severs referenceability via the PRE-rename
-        // qualifier. `select("t.other")` (an unrenamed slot, "name" here)
-        // resolves.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7406,10 +6800,6 @@ mod tests {
 
     #[test]
     fn source_quals_to_df_clears_lineage_on_every_slot() {
-        // Review C1, the ToDf mirror of
-        // `source_quals_with_columns_renamed_clears_lineage_on_renamed_slot_only`.
-        // `toDF` renames EVERY column, so unlike the partial-rename case there
-        // is no unrenamed slot to keep its lineage — all of them clear.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7438,11 +6828,6 @@ mod tests {
 
     #[test]
     fn resolve_column_to_df_pre_rename_qualifier_rejects_renamed_slot() {
-        // Review C1, the ToDf mirror of
-        // `resolve_column_with_columns_renamed_pre_rename_qualifier_rejects_renamed_slot`.
-        // `df.alias("t").toDF("c0", ..).select("t.c0")` raises
-        // UNRESOLVED_COLUMN in Spark even though "t" still binds this node's
-        // alias scope. Before this fix τ resolved it — a leniency divergence.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7477,12 +6862,6 @@ mod tests {
 
     #[test]
     fn resolve_column_sql_aliased_column_list_still_resolves_after_to_df_clear() {
-        // Review C1 ordering pin. The SQL `FROM emp AS x(a, b, c, d)` shape
-        // lowers to `ToDf` wrapped in an `AliasedRelation`
-        // (`v2_lowering::lower_table_factor`). C1's clear runs INSIDE the
-        // ToDf, but `AliasedRelation`'s `seed_source_quals` re-seeds every
-        // slot with `x` afterwards — so `x.a` must still resolve. This test
-        // fails if the clear is ever hoisted above the seed.
         let bt = base_types_with_emp_dept();
         let to_df = CommonAst::new(CommonOp::ToDf {
             input: Box::new(emp_scan()),
@@ -7510,12 +6889,6 @@ mod tests {
 
     #[test]
     fn resolve_column_set_op_first_child_qualifier_resolves_second_child_rejects() {
-        // Pass F3 Stage 4 / P1 (live-Spark-4.1.1-verified):
-        // `df1.alias("a").union(df2.alias("b")).select("a.x")` resolves
-        // (both rows); `select("b.x")` raises UNRESOLVED_COLUMN. τ's
-        // `widen_by_position` clones every output column from `children[0]`
-        // verbatim (id AND `source_quals`), so the set-op's lineage IS the
-        // first child's — never the second's.
         let bt = base_types_with_emp_dept();
         let a = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7557,15 +6930,6 @@ mod tests {
 
     #[test]
     fn authoritative_lineage_values_rejects_bogus_qualifier() {
-        // Pass F3 Stage 2: `Values`' lineage is AUTHORITATIVE — vacuously,
-        // since every field's lineage is empty by construction (no relation
-        // to inherit a qualifier from). BEFORE this flip, tier (f)'s legacy
-        // name-only fallback (`qualified_resolve_in`) ignored the qualifier
-        // entirely and matched by NAME alone — a bogus qualifier over a bare
-        // `Values` row would have silently resolved. AFTER the flip, 0
-        // lineage hits for the bogus qualifier degrade to Unresolved,
-        // surfacing a loud `UnknownColumn` instead of a silent name-only
-        // bind.
         let bt = base_types_with_emp_dept();
         let values = values_row(&[("x", DataType::Integer, LiteralValue::Int(1))]);
         let ast = CommonAst::new(CommonOp::Filter {
@@ -7588,10 +6952,6 @@ mod tests {
 
     #[test]
     fn authoritative_lineage_file_scan_rejects_bogus_qualifier() {
-        // Pass F3 Stage 2: `FileScan` (with a declared schema) has
-        // AUTHORITATIVE lineage for the same vacuous reason as `Values` — a
-        // bogus qualifier over a bare `FileScan` must raise `UnknownColumn`,
-        // not silently bind via the permissive legacy name-only fallback.
         let bt = base_types_with_emp_dept();
         let file_scan = CommonAst::new(CommonOp::FileScan {
             format: FileFormat::Parquet,
@@ -7622,15 +6982,6 @@ mod tests {
 
     #[test]
     fn resolve_column_using_join_semi_and_inner_alike_left_qualifier_resolves() {
-        // ADR-023 3e-i: the `left && right` (`left`-only for SEMI/ANTI)
-        // formula no longer special-cases USING joins — with both sides
-        // AUTHORITATIVE (`TableScan`), the join is TRACKED for both an
-        // INNER and a LeftSemi USING join alike (right's columns dropped
-        // from the output schema entirely for LeftSemi, but that does not
-        // affect trackedness, which reads only `left`). A left-qualified
-        // reference to a surviving column resolves for real (tier-(f)
-        // lineage path) rather than falling back to the legacy name-only
-        // path, for both join kinds.
         let bt = base_types_with_emp_dept();
         for join_type in [JoinType::Inner, JoinType::LeftSemi] {
             let join = CommonAst::new(CommonOp::Join {
@@ -7658,20 +7009,8 @@ mod tests {
         }
     }
 
-    // ── ADR-023 tier 3d/3e — resolver consults source_quals lineage ──────
-    // The resolver ACTS on `source_quals` directly for every node (tier-3e
-    // retired the deferred-lineage/legacy-name-only fallback entirely — see
-    // ADR-024's tier-3e amendment).
-
     #[test]
     fn resolve_column_projected_through_qualifier_drops_qualifier() {
-        // filt-018/F10 shape: `emp.alias("e").select("e.dept_id",
-        // "e.name").filter(...).filter(e.name==...)`. The SECOND filter
-        // resolves `e.name` against the Project's RESET alias scope (no "e"
-        // binding survives a Project) — tier (f) must consult
-        // `source_quals` (authoritative here) and resolve by ATTRIBUTE
-        // IDENTITY with the qualifier DROPPED, so emission renders the bare
-        // column and it binds by that identity over any wrapper.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7705,9 +7044,6 @@ mod tests {
             } => match b.left.as_ref() {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier, None);
-                    // position 1 (`name`) of `filter1`'s resolved schema —
-                    // the ADR-024 restatement of the `ordinal` this test
-                    // used to pin directly.
                     assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
                     assert_eq!(c.name, "name");
                 }
@@ -7719,11 +7055,6 @@ mod tests {
 
     #[test]
     fn resolve_column_created_alias_authoritative_empty_rejects() {
-        // filt-019/F8 shape: `emp.alias("e").select(col("dept_id").alias(
-        // "k")).filter(e.k==101)` — `k` is CREATED (source_quals ∅,
-        // authoritative for this Project). Tier (f) must NOT fall back to
-        // the permissive name-only lookup; it degrades to Unresolved so
-        // tier (g) raises `UnknownColumn` (no outer scope at the top level).
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7759,14 +7090,8 @@ mod tests {
         );
     }
 
-    // ── Pass F3 Stage 3 — passthrough-carrying ops flip AUTHORITATIVE ────
-
     #[test]
     fn resolve_column_drop_columns_surviving_qualifier_drops_qualifier() {
-        // Pass F3 Stage 3: `DropColumns` is now AUTHORITATIVE (passthrough-
-        // carrying) — a surviving column keeps its inherited lineage, so a
-        // qualified reference to it resolves by attribute identity with the
-        // qualifier dropped, mirroring Project's tier-(f) shape (filt-018).
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7811,8 +7136,6 @@ mod tests {
 
     #[test]
     fn resolve_column_with_columns_untouched_qualifier_drops_qualifier() {
-        // Pass F3 Stage 3: `WithColumns` is now AUTHORITATIVE — an untouched
-        // input column keeps its inherited lineage.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7857,10 +7180,6 @@ mod tests {
 
     #[test]
     fn resolve_column_with_columns_created_qualified_rejects() {
-        // Pass F3 Stage 3: the ASSIGNED column is CREATED (minted, empty
-        // lineage) even though `WithColumns` itself is now AUTHORITATIVE —
-        // tier (f) must reject a qualified reference to it, not fall back to
-        // the permissive legacy name-only lookup.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7890,8 +7209,6 @@ mod tests {
 
     #[test]
     fn resolve_column_unpivot_id_column_qualifier_drops_qualifier() {
-        // Pass F3 Stage 3: `Unpivot` is now AUTHORITATIVE — a preserved id
-        // column keeps its inherited lineage.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7939,8 +7256,6 @@ mod tests {
 
     #[test]
     fn resolve_column_unpivot_variable_column_qualified_rejects() {
-        // Pass F3 Stage 3: the synthetic variable column is CREATED (minted,
-        // empty lineage) — tier (f) must reject a qualified reference to it.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7973,8 +7288,6 @@ mod tests {
 
     #[test]
     fn resolve_column_pivot_grouping_column_qualifier_drops_qualifier() {
-        // Pass F3 Stage 3: `Pivot` is now AUTHORITATIVE — a grouping column
-        // keeps its inherited lineage.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -8022,8 +7335,6 @@ mod tests {
 
     #[test]
     fn resolve_column_pivot_value_column_qualified_rejects() {
-        // Pass F3 Stage 3: a pivoted output column is CREATED (minted, empty
-        // lineage) — tier (f) must reject a qualified reference to it.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -8056,14 +7367,7 @@ mod tests {
 
     #[test]
     fn resolve_column_correlated_outer_ref_preserves_qualifier() {
-        // tbl-005/sq-* shape: a correlated outer reference absent from the
-        // inner (tracked) scope must still resolve via tier (g)'s outer
-        // fallback, preserving the qualifier verbatim — DuckDB's own
-        // correlated-subquery binder resolves it at runtime.
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // SELECT * FROM emp e WHERE e.dept_id IN (
-        //     SELECT d.dept_id FROM dept d WHERE d.budget > e.salary
-        // )
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8121,13 +7425,6 @@ mod tests {
         }
     }
 
-    /// Pass F2 stage 3: a correlated qualifier naming a top-level STRUCT
-    /// column in the OUTER schema — `EXISTS (SELECT ... WHERE dept.location =
-    /// address.city)`, `address` bound only on the OUTER `emp` side — must
-    /// resolve through `resolve_in_outer`'s struct arm to an `ExtractValue`
-    /// chain rooted at the OUTER `address` attribute's own id, mirroring the
-    /// LOCAL tier-(d) twin. Live-Spark-verified shape (orchestrator probe):
-    /// Spark itself accepts this correlated bare-struct-field reference.
     #[test]
     fn resolve_in_outer_struct_arm_becomes_extract_value_chain_rooted_at_outer_id() {
         let addr_ty = DataType::Struct(StructType::new(vec![StructField::nullable(
@@ -8150,9 +7447,6 @@ mod tests {
                 ]),
             ),
         ]);
-        // SELECT * FROM emp e WHERE EXISTS (
-        //     SELECT * FROM dept WHERE dept.location = address.city
-        // )
         let inner = CommonAst::new(CommonOp::Filter {
             input: Box::new(scan("dept")),
             condition: Expression::Binary(BinaryExpression {
@@ -8224,11 +7518,6 @@ mod tests {
 
     #[test]
     fn resolve_column_using_join_qualified_ref_resolves() {
-        // Historical name/claim corrected (review NIT, N9 INC-3): USING joins
-        // over TRACKED (aliased) children are themselves tracked now — this
-        // shape resolves `e.name` via the tracked tier-(f) lineage path, not
-        // the legacy fallback the old test name advertised. The assertion
-        // (qualified ref resolves, no UnknownColumn) is unchanged either way.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Join {
@@ -8259,10 +7548,6 @@ mod tests {
 
     #[test]
     fn resolve_column_project_of_columns_qualifier_resolves() {
-        // A Project whose projection list is itself a set of qualified
-        // column references is AUTHORITATIVE — each entry COPIES its input
-        // attribute's lineage, so a qualified reference against the
-        // Project's own output resolves for real.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -8285,11 +7570,6 @@ mod tests {
 
     #[test]
     fn resolve_column_using_join_with_tracked_children_left_qualifier_resolves() {
-        // ADR-023 3e-i: `emp e JOIN dept d USING(dept_id)` — both children
-        // are TableScan{alias} (authoritative), so the USING join is now
-        // tracked too (formerly hard-coded `false`); a left-qualified
-        // reference to a surviving column resolves via the tier-(f) lineage
-        // path.
         let bt = base_types_with_emp_dept();
         let using_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -8313,9 +7593,6 @@ mod tests {
         analyze(filter, &bt).expect("USING join left qualifier must resolve");
     }
 
-    // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
-
-    /// Inner plan `SELECT <col> FROM emp` — a single-column subquery body.
     fn inner_select_col(col: &str) -> CommonAst {
         CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -8326,7 +7603,6 @@ mod tests {
     #[test]
     fn scalar_subquery_types_to_inner_single_column_and_becomes_analyzed() {
         let bt = base_types_with_emp_dept();
-        // SELECT (SELECT id FROM emp) AS s FROM emp
         let scalar = Expression::ScalarSubquery(ScalarSubquery {
             subquery: SubqueryPlan::Unanalyzed(Box::new(inner_select_col("id"))),
         });
@@ -8335,12 +7611,9 @@ mod tests {
             projections: vec![scalar],
         });
         let typed = analyze(ast, &bt).unwrap();
-        // `id` is Long; a scalar subquery is always nullable (no-row ⇒ NULL).
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
         assert!(typed.resolved_schema.fields[0].nullable);
         match &typed.op {
-            // N8: the bare (unaliased) `ScalarSubquery` entry is wrapped as
-            // `Alias(expr, "expr")` — `pretty_name`'s default fallback name.
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::Alias(a) => {
                     assert_eq!(a.alias, "expr");
@@ -8360,13 +7633,6 @@ mod tests {
         }
     }
 
-    /// tpcds-q044 shape: `(SELECT avg(salary) rank_col FROM emp GROUP BY
-    /// dept_id)` — the GROUP BY key is NOT in the SELECT list, a fully legal
-    /// SQL scalar subquery whose Spark output arity is 1 (`rank_col` only).
-    /// `ScalarSubquery`/`InSubquery` bodies are constructed ONLY by the SQL
-    /// front-end, whose `Aggregate` nodes always carry `aggregates` as the
-    /// complete SELECT list (N7) — the output schema is `aggregates` as-is
-    /// (no grouping prepend, no arity over-count, nothing to strip back off).
     #[test]
     fn scalar_subquery_grouped_single_column_not_restated_analyzes_ok() {
         let bt = base_types_with_emp_dept();
@@ -8390,8 +7656,6 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         match &typed.op {
-            // N8: the bare (unaliased) `ScalarSubquery` entry is wrapped as
-            // `Alias(expr, "expr")` — `pretty_name`'s default fallback name.
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::Alias(a) => {
                     assert_eq!(a.alias, "expr");
@@ -8417,9 +7681,6 @@ mod tests {
         }
     }
 
-    /// A genuine 2-column scalar subquery over a grouped aggregate (the
-    /// GROUP BY key IS separately selected alongside the aggregate) must
-    /// still be rejected.
     #[test]
     fn scalar_subquery_grouped_two_columns_is_still_spark_emulated_error() {
         let bt = base_types_with_emp_dept();
@@ -8478,7 +7739,6 @@ mod tests {
     #[test]
     fn exists_subquery_over_dept_analyzes_and_stays_boolean() {
         let bt = base_types_with_emp_dept();
-        // SELECT * FROM emp WHERE EXISTS (SELECT dept_id FROM dept)
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("dept")),
             projections: vec![unresolved_col("dept_id")],
@@ -8505,8 +7765,6 @@ mod tests {
     #[test]
     fn in_subquery_correlated_outer_ref_is_boundary_error() {
         let bt = base_types_with_emp_dept();
-        // Inner references a column absent from `dept` — analyzed in isolation
-        // this fails resolution (the correlated boundary, ADR-022).
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("dept")),
             projections: vec![unresolved_col("not_in_dept")],
@@ -8523,9 +7781,6 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    // ── Pass 16 — correlated subquery outer-scope fallback ─────────────
-
-    /// Dept schema with a `budget` column (not present in emp) for sq-010.
     fn dept_schema_with_budget() -> StructType {
         StructType::new(vec![
             StructField::not_null("dept_id", DataType::Integer),
@@ -8534,17 +7789,9 @@ mod tests {
         ])
     }
 
-    /// sq-010 shape: correlated IN subquery where the inner WHERE references
-    /// an outer column (`e.salary`) that exists ONLY in the outer table
-    /// (`emp`), not in the inner table (`dept`). The analyzer must resolve
-    /// `e.salary` against the outer scope and stamp it with `Double` /
-    /// `nullable=true` (matching emp's `salary` field).
     #[test]
     fn correlated_in_subquery_outer_ref_absent_from_inner_resolves() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // SELECT * FROM emp e WHERE e.dept_id IN (
-        //     SELECT d.dept_id FROM dept d WHERE d.budget > e.salary
-        // )
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8571,19 +7818,12 @@ mod tests {
             }),
         });
         let typed = analyze(ast, &bt).expect("sq-010 must resolve");
-        // Verify the outer `e.dept_id` resolved (outer type stamped).
         assert_eq!(typed.resolved_schema, emp_schema());
     }
 
-    /// Same absent-column correlation shape as sq-010, but using
-    /// ExistsSubquery. Verifies the `analyze_subquery_plan` path threads
-    /// the outer scope correctly.
     #[test]
     fn correlated_exists_subquery_outer_ref_absent_from_inner_resolves() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // SELECT * FROM emp e WHERE EXISTS (
-        //     SELECT 1 FROM dept d WHERE d.budget > e.salary
-        // )
         let inner = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
                 input: Box::new(scan("dept")),
@@ -8609,12 +7849,9 @@ mod tests {
         assert_eq!(typed.resolved_schema, emp_schema());
     }
 
-    /// Same absent-column correlation shape via ScalarSubquery.
     #[test]
     fn correlated_scalar_subquery_outer_ref_absent_from_inner_resolves() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // SELECT (SELECT max(d.budget) FROM dept d WHERE d.dept_id = e.dept_id
-        //         AND d.budget > e.salary) FROM emp e
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8647,18 +7884,12 @@ mod tests {
             })],
         });
         let typed = analyze(ast, &bt).expect("scalar subquery with outer ref must resolve");
-        // Scalar subquery resolves; output schema carries the scalar column.
         assert_eq!(typed.resolved_schema.fields.len(), 1);
     }
 
-    /// E2E emission test: sq-010 shape parsed → analyzed → dispatched.
-    /// The emitted SQL must contain the qualifier `e` on `salary` verbatim
-    /// inside the subquery (DuckDB's correlated-subquery binder uses it).
     #[test]
     fn correlated_in_subquery_emission_preserves_outer_qualifier() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // Build the same sq-010 shape as above but wrapped in a Project *
-        // so dispatch_op has a Project root.
         let inner_filter = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8689,25 +7920,15 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("sq-010 must resolve");
         let sql = super::super::emission::dispatch_op(&typed.op, &typed.resolved_schema).unwrap();
-        // The emitted SQL must contain the outer qualifier verbatim.
         assert!(
             sql.contains("e.salary"),
             "emission must preserve outer qualifier `e` on `salary`; got:\n{sql}"
         );
     }
 
-    /// One-level-only lock: a two-level-nested correlation where the
-    /// innermost subquery references the OUTERMOST alias via a column name
-    /// absent from BOTH inner schemas must still fail as UnknownColumn.
-    /// `OuterScope` deliberately has no `outer` field, so the grandparent's
-    /// scope is unrepresentable — the innermost plan only sees its
-    /// immediate parent.
     #[test]
     fn two_level_nested_correlation_to_grandparent_still_fails() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // Innermost subquery: SELECT 1 FROM dept d2 WHERE d2.dept_id = e.salary
-        // `e.salary` is from the grandparent (emp e), absent from both
-        // the immediate parent (dept d1) and the innermost (dept d2).
         let innermost = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
                 input: Box::new(scan("dept")),
@@ -8719,8 +7940,6 @@ mod tests {
                 right: Box::new(qcol("e", "salary")),
             }),
         });
-        // Middle subquery: SELECT d1.dept_id FROM dept d1
-        //     WHERE EXISTS (innermost)
         let middle = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8734,7 +7953,6 @@ mod tests {
             })),
             projections: vec![qcol("d1", "dept_id")],
         });
-        // Outer: SELECT * FROM emp e WHERE e.dept_id IN (middle)
         let ast = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
                 input: Box::new(scan("emp")),
@@ -8753,22 +7971,8 @@ mod tests {
         );
     }
 
-    /// ADR-023 3d update: this test used to pin the tier-(f) PERMISSIVE
-    /// name-only fallback — `e.dept_id` inside the inner query, where `e`
-    /// binds no inner scope, resolved by bare name against the inner
-    /// (`dept`) schema, ignoring the qualifier mismatch entirely, and won
-    /// over the outer type. That is exactly the F8-class bug 3d/3e closes:
-    /// the inner Filter/AliasedRelation(dept,"d")'s lineage is AUTHORITATIVE,
-    /// so tier (f) now correctly finds ZERO lineage hits for a qualifier the
-    /// inner scope never bound, degrades to `Unresolved`, and tier (g)
-    /// resolves `e.dept_id` as a genuine correlated OUTER reference —
-    /// matching real Spark semantics (`e` is the outer alias; a coincidental
-    /// inner name match must not shadow it). The outer type (`Long`) now
-    /// wins, not the inner (`Integer`).
     #[test]
     fn correlated_subquery_mismatched_qualifier_resolves_as_outer_reference() {
-        // emp.dept_id = Integer(nullable), dept.dept_id = Integer(not-null).
-        // Create a variation where emp has dept_id as Long to differentiate.
         let emp_long_dept_id = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("name", DataType::String),
@@ -8776,14 +7980,6 @@ mod tests {
             StructField::nullable("salary", DataType::Double),
         ]);
         let bt = base_types_for(&[("emp", emp_long_dept_id), ("dept", dept_schema())]);
-        // SELECT * FROM emp e WHERE e.dept_id IN (
-        //     SELECT dept_id FROM dept d WHERE d.dept_id = e.dept_id
-        // )
-        // The inner `dept_id` unqualified reference matches dept's Integer column.
-        // The inner `e.dept_id` has NO local binding for `e` (only `d` is
-        // bound) — under 3d's authoritative source_quals lineage it must
-        // resolve as a correlated OUTER reference (Long), not shadow onto
-        // dept's coincidentally-same-named Integer column.
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8793,8 +7989,6 @@ mod tests {
                 condition: Expression::Binary(BinaryExpression {
                     op: BinaryOp::Eq,
                     left: Box::new(qcol("d", "dept_id")),
-                    // e.dept_id: qualifier `e` not bound in inner scope → tier (f)
-                    // name-only lookup finds `dept_id` in dept's schema → Integer.
                     right: Box::new(qcol("e", "dept_id")),
                 }),
             })),
@@ -8812,9 +8006,6 @@ mod tests {
             }),
         });
         let typed = analyze(ast, &bt).expect("inner-precedence case must resolve");
-        // Dig into the inner subquery's filter condition to check the
-        // `e.dept_id` column reference's resolved type.
-        // Dig: outer Filter -> InSubquery -> Analyzed(Project(Filter(...)))
         let inner_cond = match &typed.op {
             TypedOp::Filter { condition, .. } => match condition {
                 Expression::InSubquery(i) => match &i.subquery {
@@ -8839,9 +8030,6 @@ mod tests {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier.as_deref(), Some("e"));
                     assert_eq!(c.name, "dept_id");
-                    // Must be Long (outer type, via correlation), NOT
-                    // Integer (dept's coincidentally-same-named column) —
-                    // ADR-023 3d.
                     assert_eq!(
                         c.data_type,
                         DataType::Long,
@@ -8854,19 +8042,9 @@ mod tests {
         }
     }
 
-    /// Qualifier-strictness: a qualified outer reference whose qualifier
-    /// binds NO scope in the outer context, but whose bare name exists in
-    /// the outer schema, must still fail as UnknownColumn. This locks the
-    /// "no name-only scan in the outer tier" invariant.
     #[test]
     fn correlated_subquery_qualified_outer_ref_with_unbound_qualifier_fails() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
-        // SELECT * FROM emp WHERE dept_id IN (
-        //     SELECT dept_id FROM dept d WHERE d.budget > bogus.salary
-        // )
-        // `bogus` is not the alias of any table in the outer scope.
-        // Even though `salary` exists in the outer emp schema, the
-        // qualifier-strict outer lookup must not find it.
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -8881,8 +8059,6 @@ mod tests {
             })),
             projections: vec![qcol("d", "dept_id")],
         });
-        // NOTE: outer emp has NO alias — so its name is "emp" in the scope,
-        // but the inner reference uses "bogus" as qualifier.
         let ast = CommonAst::new(CommonOp::Filter {
             input: Box::new(scan("emp")),
             condition: Expression::InSubquery(InSubquery {
@@ -8897,8 +8073,6 @@ mod tests {
             "qualified outer ref with unbound qualifier must fail; got: {err:?}"
         );
     }
-
-    // ── assign_types pass ────────────────────────────────────────────────
 
     #[test]
     fn assign_types_stamps_column_reference_type_and_nullability() {
@@ -8932,13 +8106,6 @@ mod tests {
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
 
-    // ── derive_nullability pass — outer join flipping ────────────────────
-
-    /// Analyze `emp JOIN dept` with the given join type and condition; return
-    /// the flipped per-side schemas plus the resolved schema. The join output
-    /// IS the positional concatenation of the flipped sides (left-only for
-    /// semi/anti), so the sides are recovered by slicing at the left child's
-    /// field count.
     fn analyze_emp_dept_join(
         jt: JoinType,
         cond: Option<Expression>,
@@ -8966,9 +8133,7 @@ mod tests {
             right: Box::new(qcol("dept", "dept_id")),
         });
         let (left, right, _) = analyze_emp_dept_join(JoinType::Left, Some(cond));
-        // Left preserved: `id` stays not-null.
         assert!(!left.field_by_name("id").unwrap().nullable);
-        // Right flipped: `dept_id` becomes nullable.
         assert!(right.field_by_name("dept_id").unwrap().nullable);
     }
 
@@ -8998,14 +8163,9 @@ mod tests {
         let (left, right, resolved) = analyze_emp_dept_join(JoinType::LeftSemi, None);
         assert_eq!(left, emp_schema());
         assert!(right.is_empty());
-        // Output schema is left-only.
         assert_eq!(resolved, emp_schema());
     }
 
-    // ── NATURAL JOIN analyzer desugar (jn-008) ───────────────────────────
-
-    /// `Join` with `natural: true` and no explicit condition/using —
-    /// the shape both front-ends produce for a SQL `NATURAL JOIN`.
     fn natural_join(left: CommonAst, right: CommonAst, join_type: JoinType) -> CommonAst {
         CommonAst::new(CommonOp::Join {
             left: Box::new(left),
@@ -9020,8 +8180,6 @@ mod tests {
         })
     }
 
-    /// `dept`-shaped table with NO column names in common with `emp_schema`
-    /// — exercises the empty-intersection NATURAL rewrite.
     fn dept_no_overlap_schema() -> StructType {
         StructType::new(vec![
             StructField::not_null("division", DataType::Integer),
@@ -9029,9 +8187,6 @@ mod tests {
         ])
     }
 
-    /// `emp`-shaped table whose join key is spelled `DEPT_ID` (uppercase) —
-    /// the E3 case-sensitivity witness: NATURAL's name intersection is exact
-    /// `==`, so this does NOT match `dept_schema`'s lowercase `dept_id`.
     fn emp_uppercase_dept_id_schema() -> StructType {
         StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -9041,11 +8196,6 @@ mod tests {
         ])
     }
 
-    /// LOAD-BEARING: NATURAL inner join over `emp`/`dept` (common column
-    /// `dept_id`) must analyze to a TypedAst byte-identical (full
-    /// `PartialEq`) to the same join expressed explicitly as
-    /// `USING (dept_id)` — proving the desugar rides the existing,
-    /// proven-green USING machinery unchanged.
     #[test]
     fn natural_inner_join_converges_with_equivalent_using_join() {
         let bt = base_types_with_emp_dept();
@@ -9065,8 +8215,6 @@ mod tests {
         let using_typed = analyze(using_ast, &bt).expect("using analyze");
         assert_eq!(natural_typed, using_typed);
 
-        // Output schema: dept_id (INT, nullable — left/emp donor) once and
-        // first, then emp's remaining columns, then dept's remaining columns.
         assert_eq!(
             field_names(&natural_typed),
             vec!["dept_id", "id", "name", "salary", "dept_name"]
@@ -9103,9 +8251,6 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let ast = natural_join(scan("emp"), scan("dept"), JoinType::Full);
         let typed = analyze(ast, &bt).expect("natural full analyze");
-        // FULL flips both sides fully nullable; every output field is
-        // nullable, including the USING-hoisted `dept_id` (coalesced
-        // `left.nullable && right.nullable`, both true post-flip).
         for f in &typed.resolved_schema.fields {
             assert!(f.nullable, "field {} must be nullable under FULL", f.name);
         }
@@ -9129,7 +8274,6 @@ mod tests {
             }
             other => panic!("expected Join, got {other:?}"),
         }
-        // Plain concatenation: emp's 4 fields + dept2's 2 fields.
         assert_eq!(typed.resolved_schema.fields.len(), 6);
     }
 
@@ -9157,7 +8301,6 @@ mod tests {
             }
             other => panic!("expected Join, got {other:?}"),
         }
-        // LEFT flips the right side fully nullable — `division` was not-null.
         let division_field = typed
             .resolved_schema
             .field_by_name("division")
@@ -9202,11 +8345,6 @@ mod tests {
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
 
-    /// E3 case-sensitivity witness: `DEPT_ID` (left) vs `dept_id` (right)
-    /// do NOT intersect under NATURAL's exact `==` match (Spark's
-    /// `Seq.intersect`, not τ's usual case-insensitive `field_by_name`) —
-    /// the empty intersection rewrites to a cartesian product carrying BOTH
-    /// columns.
     #[test]
     fn natural_join_case_sensitive_witness_both_columns_survive() {
         let bt = base_types_for(&[
@@ -9220,9 +8358,6 @@ mod tests {
             other => panic!("expected Join, got {other:?}"),
         }
         assert_eq!(typed.resolved_schema.fields.len(), 6);
-        // Exact (case-sensitive) presence check — `field_by_name` is
-        // case-insensitive and would conflate the two distinctly-cased
-        // fields, defeating the point of this witness.
         assert!(typed
             .resolved_schema
             .fields
@@ -9238,8 +8373,6 @@ mod tests {
     #[test]
     fn ambiguous_column_across_joins_surfaces_error() {
         let bt = base_types_with_emp_dept();
-        // Both `emp` and `dept` have `dept_id`; unqualified reference is
-        // ambiguous.
         let cond = unresolved_col("dept_id");
         let ast = join(scan("emp"), scan("dept"), JoinType::Inner, Some(cond));
         let err = analyze(ast, &bt).unwrap_err();
@@ -9249,14 +8382,9 @@ mod tests {
 
     #[test]
     fn resolve_column_projection_ambiguous_across_join_errors() {
-        // The central `resolve_column` ambiguity check catches ambiguous
-        // references anywhere — including projections above a join — not
-        // only inside the join condition itself.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(scan("emp"), scan("dept"), JoinType::Inner, None)),
-            // `dept_id` is present on both sides of the join — unqualified
-            // reference must fail.
             projections: vec![unresolved_col("dept_id")],
         });
         let err = analyze(ast, &bt).unwrap_err();
@@ -9275,12 +8403,9 @@ mod tests {
 
     #[test]
     fn resolve_column_projection_unambiguous_still_resolves() {
-        // Sanity anchor: an unqualified column that resolves uniquely across
-        // the joined schema must still resolve cleanly.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(scan("emp"), scan("dept"), JoinType::Inner, None)),
-            // `salary` only exists on `emp`.
             projections: vec![unresolved_col("salary")],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -9298,8 +8423,6 @@ mod tests {
 
     #[test]
     fn qualified_star_with_unknown_qualifier_errors() {
-        // `SELECT nonexistent.*` must not silently expand to `*`; it must
-        // surface `UnknownColumn` (formatted as `nonexistent.*`).
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -9320,8 +8443,6 @@ mod tests {
         }
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
-
-    // ── set-op widening (§5) ────────────────────────────────────────────
 
     fn tiny_int_plan() -> CommonAst {
         values_row(&[("x", DataType::Integer, LiteralValue::Int(1))])
@@ -9401,8 +8522,6 @@ mod tests {
 
     #[test]
     fn values_ragged_rows_returns_error_not_panic() {
-        // `VALUES (1,2),(3)` — a shorter later row must not index out of
-        // bounds (session-killing panic); Spark rejects with AnalysisException.
         let bt = BaseTypes::empty();
         let ast = CommonAst::new(CommonOp::Values {
             rows: vec![vec![int_lit(1), int_lit(2)], vec![int_lit(3)]],
@@ -9421,10 +8540,6 @@ mod tests {
         );
     }
 
-    /// Project the `dept_id` column (present on both `emp` and `dept`, but
-    /// with opposite nullability — `emp.dept_id` nullable, `dept.dept_id`
-    /// not-null) from the named table so set-op children carry a single
-    /// column of a known nullability.
     fn dept_id_from(table: &str) -> CommonAst {
         CommonAst::new(CommonOp::Project {
             input: Box::new(scan(table)),
@@ -9432,9 +8547,6 @@ mod tests {
         })
     }
 
-    /// INTERSECT nullability is an AND-fold (Spark `Intersect.computeOutput`):
-    /// nullable(emp.dept_id)=true ∧ non-nullable(dept.dept_id)=false ⇒ the
-    /// intersection column is **non-nullable**.
     #[test]
     fn setop_intersect_nullability_is_and_across_children() {
         let bt = base_types_with_emp_dept();
@@ -9450,12 +8562,9 @@ mod tests {
         );
     }
 
-    /// EXCEPT nullability is the LEFT child's only (Spark `Except.output =
-    /// left.output`). Left non-nullable, right nullable ⇒ output non-nullable.
     #[test]
     fn setop_except_nullability_is_left_child_only_nonnull_left() {
         let bt = base_types_with_emp_dept();
-        // Left = dept (non-nullable dept_id), Right = emp (nullable).
         let ast = set_op(
             SetOpKind::Except,
             false,
@@ -9468,12 +8577,9 @@ mod tests {
         );
     }
 
-    /// EXCEPT with a nullable LEFT and non-nullable right ⇒ output nullable
-    /// (left-only rule — the right child's non-nullability is irrelevant).
     #[test]
     fn setop_except_nullability_is_left_child_only_nullable_left() {
         let bt = base_types_with_emp_dept();
-        // Left = emp (nullable dept_id), Right = dept (non-nullable).
         let ast = set_op(
             SetOpKind::Except,
             false,
@@ -9486,8 +8592,6 @@ mod tests {
         );
     }
 
-    /// Regression guard for the unchanged Union OR-fold: nullable ∪
-    /// non-nullable ⇒ nullable.
     #[test]
     fn setop_union_nullability_is_or_across_children() {
         let bt = base_types_with_emp_dept();
@@ -9527,8 +8631,6 @@ mod tests {
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
 
-    /// Project a single named column from `table` — a `Project` child so the
-    /// set-op positional-cast pushdown (`push_setop_casts`) applies.
     fn project_col(table: &str, col: &str) -> CommonAst {
         CommonAst::new(CommonOp::Project {
             input: Box::new(scan(table)),
@@ -9536,17 +8638,8 @@ mod tests {
         })
     }
 
-    /// Pass 133 — corpus `set-009`: a 3-way `UNION ALL` where the last branch
-    /// widens (INT→BIGINT). Each non-`Star` branch projection must be
-    /// re-aliased to the widened first-branch name (`id`), casting only the
-    /// mismatched branch. The dept child subquery therefore emits
-    /// `CAST(dept_id AS BIGINT) AS id`, so `render_set_op`'s outer positional
-    /// `... AS id` binds instead of failing "column id cannot be referenced".
     #[test]
     fn setop_union_three_way_widening_aliases_and_casts_mismatched_branch() {
-        // SELECT id FROM emp UNION ALL SELECT id FROM emp2
-        //   UNION ALL SELECT dept_id FROM dept
-        // emp.id / emp2.id = LONG, dept.dept_id = INT → widened LONG, name `id`.
         let ast = set_op(
             SetOpKind::Union,
             true,
@@ -9572,15 +8665,8 @@ mod tests {
         );
     }
 
-    /// Pass 133 latent sibling: a same-type / different-name union. Both
-    /// branches are LONG, so NO cast is introduced, but the second branch's
-    /// `manager_id` must still be re-aliased to the widened first-branch name
-    /// `id` — otherwise its subquery output column is `manager_id` and the
-    /// outer positional `... AS id` cannot bind.
     #[test]
     fn setop_union_same_type_different_name_aliases_without_cast() {
-        // SELECT id FROM staff UNION ALL SELECT manager_id FROM staff
-        // both LONG → alias-only repair, no cast.
         let staff = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("manager_id", DataType::Long),
@@ -9606,9 +8692,6 @@ mod tests {
         );
     }
 
-    /// Non-Union set-ops by-name are punted (DuckDB does not support
-    /// `INTERSECT BY NAME` / `EXCEPT BY NAME`); Union by-name proceeds
-    /// normally, see [`setop_union_by_name_skips_positional_cast_pushdown`].
     #[test]
     fn setop_intersect_by_name_punts_with_boundary_prefix() {
         let bt = BaseTypes::empty();
@@ -9622,8 +8705,6 @@ mod tests {
         assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
     }
 
-    /// `range(5)` resolves to a single non-nullable `id: Long` column
-    /// (Spark 4.1.1 `range`; ADR-005). Pass-141.
     #[test]
     fn table_function_range_resolves_single_long_id_column() {
         let bt = BaseTypes::empty();
@@ -9640,8 +8721,6 @@ mod tests {
         assert!(!f.nullable, "range id column is non-nullable");
     }
 
-    /// An unknown table-valued function is an honest Thunderduck boundary —
-    /// `PuntedOperator`, not a silent wrong answer (ADR-022). Pass-141.
     #[test]
     fn table_function_unknown_tvf_punts() {
         let bt = BaseTypes::empty();
@@ -9655,9 +8734,6 @@ mod tests {
         assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
     }
 
-    /// Pass 13 — `explode(array(1,2,3))` as a bare TVF resolves to a
-    /// single-column schema `[col: Integer, non-nullable]` (Spark 4.1.1 default
-    /// output column name is `"col"`). Corpus: tbl-007.
     #[test]
     fn table_function_explode_array_resolves_single_col_column() {
         let bt = BaseTypes::empty();
@@ -9675,8 +8751,6 @@ mod tests {
         assert!(!f.nullable, "explode of non-null array is non-nullable");
     }
 
-    /// Pass 13 — `explode` with a non-Array argument (bare integer) still
-    /// punts as PuntedOperator — the gate rejects non-Array args.
     #[test]
     fn table_function_explode_non_array_arg_punts() {
         let bt = BaseTypes::empty();
@@ -9693,8 +8767,6 @@ mod tests {
         );
     }
 
-    /// Pass 13 — `explode(unresolved_col)` with no relation in scope yields
-    /// `AnalyzerError::UnknownColumn` (args resolve against empty schema).
     #[test]
     fn table_function_explode_unresolvable_arg_is_unknown_column() {
         let bt = BaseTypes::empty();
@@ -9715,9 +8787,6 @@ mod tests {
         );
     }
 
-    /// Pass 13 — `posexplode` as bare TVF is not implemented (no witness) —
-    /// still punts. The `posexplode` name hits the default `_` arm since it
-    /// is not in the `"explode"|"explode_outer"` match set.
     #[test]
     fn table_function_posexplode_still_punts() {
         let bt = BaseTypes::empty();
@@ -9731,29 +8800,19 @@ mod tests {
         assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
     }
 
-    /// Pass 76 — `UNION BY NAME` used to trip the positional-cast pushdown
-    /// (`push_setop_casts`), which mis-cast child columns whenever the child
-    /// column order differed from the widened schema order (e.g. corpus
-    /// `set-003`). The analyzer now skips pushdown when `by_name = true`; the
-    /// emission wrapper aligns child columns to the widened schema by NAME.
     #[test]
     fn setop_union_by_name_skips_positional_cast_pushdown() {
         let bt = BaseTypes::empty();
-        // Build two `Values` plans with the same column-name set but in
-        // different orders — pushdown would incorrectly cast `x` to `y`'s
-        // widened type if it fired.
         let left = CommonAst::new(CommonOp::Values {
             rows: vec![vec![int_lit(1), lit_str("a")]],
             column_names: vec!["x".to_owned(), "y".to_owned()],
         });
-        // Right side: reversed column order.
         let right = CommonAst::new(CommonOp::Values {
             rows: vec![vec![lit_str("b"), int_lit(2)]],
             column_names: vec!["y".to_owned(), "x".to_owned()],
         });
         let ast = set_op_by_name(SetOpKind::Union, true, vec![left, right]);
         let typed = analyze(ast, &bt).unwrap();
-        // Widened schema follows first-child column order.
         let (kind, by_name, child_schemas) = match &typed.op {
             TypedOp::SetOp {
                 kind,
@@ -9772,21 +8831,14 @@ mod tests {
         };
         assert_eq!(kind, SetOpKind::Union);
         assert!(by_name);
-        // Neither child's resolved_schema is the widened schema — pushdown
-        // is skipped for by_name. Left keeps `[x:Int, y:String]`; right
-        // keeps `[y:String, x:Int]`.
         assert_eq!(child_schemas[0].fields[0].name, "x");
         assert_eq!(child_schemas[0].fields[0].data_type, DataType::Integer);
         assert_eq!(child_schemas[1].fields[0].name, "y");
         assert_eq!(child_schemas[1].fields[0].data_type, DataType::String);
     }
 
-    // ── unionByName(allowMissingColumns=True) — Pass 77 (set-004) ────────
-
     #[test]
     fn union_by_name_allow_missing_partial_overlap_produces_ordered_union() {
-        // LEFT `{a: Long, b: Long}` × RIGHT `{b: Long, c: Long}`
-        // Expected widened schema: `{a nullable, b, c nullable}`.
         let bt = BaseTypes::empty();
         let left = values_row(&[
             ("a", DataType::Long, LiteralValue::Long(1)),
@@ -9813,8 +8865,6 @@ mod tests {
 
     #[test]
     fn union_by_name_allow_missing_disjoint_schemas() {
-        // LEFT `{a, b, c}` × RIGHT `{d, e, f}` → `{a, b, c, d, e, f}`,
-        // every field nullable.
         let bt = BaseTypes::empty();
         let left = values_row(&[
             ("a", DataType::Long, LiteralValue::Long(1)),
@@ -9836,8 +8886,6 @@ mod tests {
 
     #[test]
     fn union_by_name_allow_missing_widens_shared_column_type() {
-        // LEFT `{x: Integer}` × RIGHT `{x: Double, y: Integer}` →
-        // `{x: Double, y: Integer nullable}`.
         let bt = BaseTypes::empty();
         let left = values_row(&[("x", DataType::Integer, LiteralValue::Int(1))]);
         let right = values_row(&[
@@ -9859,8 +8907,6 @@ mod tests {
 
     #[test]
     fn union_by_name_allow_missing_rejected_without_by_name() {
-        // `allow_missing_columns = true` with `by_name = false` is
-        // Spark-emulated (Spark's Dataset API forbids the combination).
         let bt = BaseTypes::empty();
         let ast = CommonAst::new(CommonOp::SetOp {
             kind: SetOpKind::Union,
@@ -9882,15 +8928,6 @@ mod tests {
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
 
-    /// Item 3 (grab-bag / F3-O1 NIT): `a.unionByName(b.alias("b"),
-    /// allowMissingColumns=True)` where `z` exists ONLY in the aliased
-    /// RIGHT child `b` — Spark pads the FIRST child (`a`) with a null-alias
-    /// column for `z`, so the union output's `z` has no donor-qualifier
-    /// addressability: `b.z` is REJECTED (live-Spark-probed, 4.1.1). Before
-    /// this fix, `widen_by_name` cloned the donating (non-first) child's
-    /// `Attribute` wholesale, inheriting its qualifiers, making `b.z`
-    /// resolvable in τ — strictly more permissive than Spark. Names present
-    /// in the FIRST child (`x`) keep their donor qualifiers untouched (F3).
     #[test]
     fn union_by_name_allow_missing_clears_quals_for_name_missing_from_first_child() {
         let bt = BaseTypes::empty();
@@ -9932,11 +8969,6 @@ mod tests {
         );
     }
 
-    /// End-to-end companion to the schema/quals test above: a downstream
-    /// `Project` selecting the padded column bare (`z`) resolves (matches
-    /// Spark), but qualified by the donor's alias (`b.z`) is REJECTED with
-    /// `UnknownColumn` (`UNRESOLVED_COLUMN.WITH_SUGGESTION`, matching Spark
-    /// 4.1.1 live-probed behavior) — never silently resolvable in τ.
     #[test]
     fn union_by_name_allow_missing_bare_padded_col_resolves_qualified_rejected() {
         let bt = BaseTypes::empty();
@@ -9957,15 +8989,12 @@ mod tests {
         });
         let union = union_by_name_allow_missing(vec![left, right]);
 
-        // Bare `z` resolves.
         let bare_project = CommonAst::new(CommonOp::Project {
             input: Box::new(union.clone()),
             projections: vec![unresolved_col("z")],
         });
         analyze(bare_project, &bt).expect("bare padded column `z` must resolve");
 
-        // Qualified `b.z` is REJECTED — `b`'s donor qualifier does not
-        // survive onto the padded slot.
         let qualified_project = CommonAst::new(CommonOp::Project {
             input: Box::new(union),
             projections: vec![qcol("b", "z")],
@@ -9980,8 +9009,6 @@ mod tests {
 
     #[test]
     fn union_by_name_allow_missing_identical_name_sets_matches_strict() {
-        // Degenerate case: same names in both children — the widened schema
-        // must match the strict by-name path (Spark parity + set-003 shape).
         let bt = BaseTypes::empty();
         let left = values_row(&[
             ("a", DataType::Long, LiteralValue::Long(1)),
@@ -10000,8 +9027,6 @@ mod tests {
         assert!(!widened.fields[0].nullable);
         assert!(!widened.fields[1].nullable);
     }
-
-    // ── Display prefix categorization ────────────────────────────────────
 
     #[test]
     fn spark_emulated_variants_use_spark_prefix() {
@@ -10056,8 +9081,6 @@ mod tests {
         }
     }
 
-    // ── Star expansion — schema expanded, tree preserved ─────────────────
-
     #[test]
     fn project_star_expands_schema_but_keeps_star_in_tree() {
         let bt = base_types_with_emp_dept();
@@ -10066,9 +9089,7 @@ mod tests {
             projections: vec![Expression::Star(StarExpression { qualifier: None })],
         });
         let typed = analyze(ast, &bt).unwrap();
-        // Schema fully expanded.
         assert_eq!(typed.resolved_schema, emp_schema());
-        // Tree keeps Star node.
         match &typed.op {
             TypedOp::Project { projections, .. } => {
                 assert!(matches!(&projections[0], Expression::Star(_)));
@@ -10076,8 +9097,6 @@ mod tests {
             _ => panic!("expected Project"),
         }
     }
-
-    // ── has_resolved_schema — INV5 anchor ────────────────────────────────
 
     #[test]
     fn has_resolved_schema_true_for_analyzed_fixture() {
@@ -10093,8 +9112,6 @@ mod tests {
 
     #[test]
     fn has_resolved_schema_false_for_unresolved_manually_built_typed_ast() {
-        // A TypedAst manually built with an Unresolved schema field must
-        // report `has_resolved_schema = false`.
         let unresolved = TypedAst::new(
             TypedOp::SingleRow,
             ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
@@ -10104,7 +9121,6 @@ mod tests {
         );
         assert!(!has_resolved_schema(&unresolved));
 
-        // Or with a Project whose projection contains an UnresolvedColumn.
         let with_unresolved_expr = TypedAst::new(
             TypedOp::Project {
                 input: Box::new(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
@@ -10118,11 +9134,8 @@ mod tests {
         assert!(!has_resolved_schema(&with_unresolved_expr));
     }
 
-    // ── analyze composes the three passes ───────────────────────────────
-
     #[test]
     fn analyze_composes_resolve_assign_types_and_derive_nullability() {
-        // A Filter over TableScan exercises all three passes end-to-end.
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Gt,
@@ -10134,9 +9147,7 @@ mod tests {
             condition: cond,
         });
         let typed = analyze(ast, &bt).unwrap();
-        // Schema propagated from input.
         assert_eq!(typed.resolved_schema, emp_schema());
-        // Condition resolved.
         match &typed.op {
             TypedOp::Filter { condition, .. } => match condition {
                 Expression::Binary(b) => match b.left.as_ref() {
@@ -10152,15 +9163,8 @@ mod tests {
         }
     }
 
-    // ── analyzer_error_to_emission_error bridge ─────────────────────────
-
     #[test]
     fn analyzer_error_bridge_maps_spark_emulated_with_class_to_spark_emulated() {
-        // ADR-023 chunk 3b/3d: `UnknownColumn` has a known `spark_class()`
-        // (`UNRESOLVED_COLUMN.WITH_SUGGESTION`), so the bridge routes it to
-        // `EmissionError::SparkEmulated`. Since review A1 EVERY Spark-emulated
-        // variant goes there — classless ones with `class: None` — so this now
-        // pins the class propagation rather than the choice of variant.
         let e = AnalyzerError::UnknownColumn {
             name: "c".to_owned(),
             qualifier: None,
@@ -10180,11 +9184,6 @@ mod tests {
 
     #[test]
     fn analyzer_error_bridge_maps_ambiguous_column_reference_to_spark_emulated() {
-        // Phase 3a: `AmbiguousColumnReference` has a known `spark_class()`
-        // (`AMBIGUOUS_COLUMN_REFERENCE`), so the bridge routes it to
-        // `EmissionError::SparkEmulated` with the Display leading the exact
-        // Spark class token (mirrors `mod.rs`'s
-        // `generate_surfaces_ambiguous_column_with_spark_class_leading`).
         let e = AnalyzerError::AmbiguousColumnReference {
             name: "id".to_owned(),
         };
@@ -10212,16 +9211,6 @@ mod tests {
 
     #[test]
     fn analyzer_error_bridge_maps_classless_other_to_spark_emulated() {
-        // Review A1. `Other` carries no established Spark class, but it is
-        // still ADR-022 Spark-emulated — Spark rejects these inputs too. It
-        // must therefore bridge to `SparkEmulated { class: None }` and exit as
-        // INVALID_ARGUMENT, NOT to the old
-        // `Unsupported{name: "analyzer-spark-emulated"}` shape, which exited as
-        // UNIMPLEMENTED and told clients τ was missing a feature.
-        //
-        // With `class: None` the message must render prefix-free: inventing a
-        // token would make the differential oracle compare a fabricated class
-        // against Spark's real one.
         let e = AnalyzerError::Other {
             reason: "catch-all".to_owned(),
         };
@@ -10242,10 +9231,6 @@ mod tests {
 
     #[test]
     fn analyzer_error_bridge_maps_internal_to_emission_internal() {
-        // Review A1: a τ-internal invariant violation is neither ADR-022
-        // category. It must reach `EmissionError::Internal` (→ Status::internal)
-        // rather than being relabelled as a Spark error, which would blame the
-        // client for a τ bug.
         let e = AnalyzerError::Internal {
             reason: "union-of-names produced orphan name \"x\"".to_owned(),
         };
@@ -10261,8 +9246,6 @@ mod tests {
 
     #[test]
     fn analyzer_error_bridge_keeps_boundary_variants_unsupported() {
-        // The Thunderduck-boundary category is unchanged by review A1: these
-        // are honest "not implemented in τ" gaps and must stay UNIMPLEMENTED.
         let e = AnalyzerError::PuntedOperator {
             op: "FileScan".to_owned(),
             reason: "no arm".to_owned(),
@@ -10280,9 +9263,6 @@ mod tests {
 
     #[test]
     fn spark_class_mapping_matches_adr023_chunk_3b_table() {
-        // Direct pin of the `AnalyzerError::spark_class()` mapping table.
-        // ADR-023 3d: `UnknownColumn` now maps to the `.WITH_SUGGESTION`
-        // subclass (see `spark_class`'s doc comment).
         assert_eq!(
             AnalyzerError::UnknownTable {
                 name: "t".to_owned()
@@ -10372,15 +9352,8 @@ mod tests {
         }
     }
 
-    // ── Aggregate output schema uses function names ─────────────────────
-
-    // ── Unpivot output schema ───────────────────────────────────────────
-
     #[test]
     fn unpivot_stamps_schema_with_widened_value_column() {
-        // Anchor: piv-004 shape — ids=[id], values=[dept_id (INT), salary
-        // (DOUBLE)]. Spark widens INT + DOUBLE → DOUBLE; salary is nullable
-        // so the value column is nullable. Variable column is STRING NOT NULL.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10405,9 +9378,6 @@ mod tests {
 
     #[test]
     fn unpivot_empty_values_materialises_all_non_id_columns() {
-        // Anchor: Spark's default when `values` is empty is "all non-id
-        // input columns". The analyzer must materialise that expansion so
-        // the emission stage can render an explicit ON list.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10417,10 +9387,6 @@ mod tests {
             value_column_name: "value".to_owned(),
         });
         let typed = analyze(ast, &bt).unwrap();
-        // τ's coarse approximation via `unify_types`' String fallback — Spark
-        // itself would raise `UNPIVOT_VALUE_DATA_TYPE_MISMATCH` here for a
-        // mixed numeric+string value set; tracking M1 for follow-up hardening
-        // (systemic pattern across Unpivot/SetOp/TableFunction).
         match &typed.op {
             TypedOp::Unpivot { values, .. } => {
                 assert_eq!(
@@ -10452,11 +9418,6 @@ mod tests {
 
     #[test]
     fn unpivot_duplicate_across_ids_and_values_is_accepted_like_spark() {
-        // Review A1 audit. The removed M2 guard claimed "Spark rejects id/value
-        // overlap". Falsified against live Spark 4.1.1:
-        //   emp.unpivot(ids=["id"], values=["id"], "k", "v")
-        //   -> id:bigint, k:string, v:bigint   (accepted, one row per value col)
-        // τ must accept it too. Pins the corrected behaviour.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10480,13 +9441,6 @@ mod tests {
 
     #[test]
     fn unpivot_variable_column_colliding_with_id_is_accepted_like_spark() {
-        // Review A1 audit. The removed M3 guard claimed the duplicate-named
-        // output schema would be rejected by Spark. Falsified against live
-        // Spark 4.1.1 — it emits the duplicate name happily:
-        //   emp.unpivot(ids=["id"], values=["salary"], "id", "v")
-        //   -> id:bigint, id:string, v:double
-        // Spark only rejects an ambiguous *reference*, never a duplicate name
-        // in a schema. τ must therefore accept and stamp both "id" fields.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10518,10 +9472,6 @@ mod tests {
 
     #[test]
     fn unpivot_value_column_colliding_with_id_is_accepted_like_spark() {
-        // Review A1 audit, symmetric to the variable-column case above.
-        // Live Spark 4.1.1:
-        //   emp.unpivot(ids=["id"], values=["salary"], "k", "id")
-        //   -> id:bigint, k:string, id:double   (accepted)
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10540,8 +9490,6 @@ mod tests {
         assert_eq!(dup, 2, "expected two `id`-named output fields");
     }
 
-    // ── Aggregate output schema uses function names ─────────────────────
-
     #[test]
     fn aggregate_output_schema_stamps_count_result_as_long() {
         let bt = base_types_with_emp_dept();
@@ -10558,10 +9506,6 @@ mod tests {
 
     #[test]
     fn aggregate_grouping_expr_also_projected_is_not_prepended() {
-        // agg-007 shape: `GROUP BY <expr>` where the same expression is also
-        // projected under an alias. The grouping key is structurally equal to
-        // (the alias-stripped) first aggregate, so it is "already folded" and
-        // must NOT be re-prepended → resolved_schema has 2 fields, not 3.
         let bt = base_types_with_emp_dept();
         let senior = || {
             Expression::Binary(BinaryExpression {
@@ -10588,12 +9532,6 @@ mod tests {
 
     #[test]
     fn partial_grouping_fold_does_not_prepend_or_duplicate() {
-        // q053 shape: `GROUP BY dept_id, salary` with `SELECT dept_id,
-        // avg(salary) AS a` — only ONE of the two grouping keys (`dept_id`)
-        // is re-selected. Under the any-match rule this is still "already
-        // folded" (Spark's SELECT list is the authoritative output), so the
-        // grouping list must NOT be prepended: 2 fields, no duplicate
-        // `dept_id`.
         let bt = base_types_with_emp_dept();
         let avg_salary = func("avg", vec![unresolved_col("salary")]);
         let ast = aggregate(
@@ -10613,11 +9551,6 @@ mod tests {
 
     #[test]
     fn dataframe_path_grouping_absent_from_aggregates_still_prepends() {
-        // DataFrame path shape: `.groupBy("dept_id", "salary").agg(avg("salary")
-        // as "a")` — N7: `grouped_aggregate` builds `aggregates` as `grouping
-        // ++ agg_exprs` at construction time, so the grouping columns are
-        // always ahead of the aggregate expressions, matching Spark's
-        // `grouping ++ aggExprs` (`RelationalGroupedDataset.toDF`) layout.
         let bt = base_types_with_emp_dept();
         let avg_salary = func("avg", vec![unresolved_col("salary")]);
         let ast = CommonAst::new(grouped_aggregate(
@@ -10639,9 +9572,6 @@ mod tests {
 
     #[test]
     fn aggregate_having_resolves_input_column_inside_aggregate_call() {
-        // `HAVING avg(salary) > 80000` — `salary` is an INPUT column not present
-        // in the aggregate OUTPUT. Resolving against the input schema must
-        // succeed (would fail if resolved against the output schema).
         let bt = base_types_with_emp_dept();
         let avg_salary = || func("avg", vec![unresolved_col("salary")]);
         let having = Expression::Binary(BinaryExpression {
@@ -10677,7 +9607,6 @@ mod tests {
                 "count",
                 vec![Expression::Star(StarExpression { qualifier: None })],
             )],
-            // A bare integer literal is not a boolean predicate.
             Some(int_lit(5)),
         );
         match analyze(ast, &bt) {
@@ -10688,19 +9617,10 @@ mod tests {
         }
     }
 
-    // ── Pivot output schema (Pass 60) ───────────────────────────────────
-
-    /// Explicit-values Pivot with a single aggregate stamps output columns
-    /// named after each pivot value verbatim, all nullable (empty buckets
-    /// yield NULL per Spark). Corresponds to grp-004:
-    ///   emp.groupBy("dept_id").pivot("active", [True, False])
-    ///      .agg(count(lit(1)).alias("n"))
     #[test]
     fn analyze_pivot_explicit_bool_values_stamps_single_agg_output_schema() {
         let bt = base_types_with_emp_dept();
         let emp_scan = scan("emp");
-        // Add an `active` column to the emp schema via `withColumn` for the
-        // test — grp-004 expects an `active` bool column on emp.
         let with_active = CommonAst::new(CommonOp::WithColumns {
             input: Box::new(emp_scan),
             assignments: vec![("active".to_owned(), lit_bool(true))],
@@ -10714,18 +9634,14 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         let fields = &typed.resolved_schema.fields;
-        // Expected: dept_id + true + false = 3 output columns.
         assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].name, "dept_id");
         assert_eq!(fields[1].name, "true");
         assert_eq!(fields[2].name, "false");
-        // Pivot outputs are always nullable per Spark (empty-bucket NULL).
         assert!(fields[1].nullable);
         assert!(fields[2].nullable);
     }
 
-    /// Implicit-values Pivot (empty pivot_values) is a Thunderduck-boundary
-    /// case per ADR-022. τ has no eager-DISTINCT hook
     #[test]
     fn analyze_pivot_implicit_values_returns_boundary_punted_operator() {
         let bt = base_types_with_emp_dept();
@@ -10744,9 +9660,6 @@ mod tests {
         }
     }
 
-    /// Multi-aggregate explicit Pivot names outputs `<value>_<agg_alias>`
-    /// per Spark. Guard against name-collision between grouping and pivot
-    /// output columns as a bonus assertion.
     #[test]
     fn analyze_pivot_multi_agg_names_outputs_value_underscore_alias() {
         let bt = base_types_with_emp_dept();
@@ -10763,22 +9676,12 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         let names = field_names(&typed);
-        // Grouping (dept_id) + 2 pivot values × 2 aggregates = 5 output cols.
         assert_eq!(
             names,
             vec!["dept_id", "10_sum_sal", "10_cnt", "20_sum_sal", "20_cnt"]
         );
     }
 
-    /// Pass 021 — multi-aggregate PIVOT with UNALIASED aggregates names
-    /// outputs `<value>_<fn(args)>` per Spark's `toPrettySQL`, e.g.
-    /// `10_sum(salary)`, NOT the bare `10_sum` — verified empirically against
-    /// Spark 4.1.1 Connect (`groupBy(id).pivot(cat).agg(sum(val), avg(val))`
-    /// → columns `a_sum(val)`, `a_avg(val)`). No corpus case previously
-    /// exercised this unaliased shape (`pv-003` aliases both aggregates), so
-    /// this closes that gap and locks in the Spark-parity naming this pass
-    /// introduces (`expression_output_name`'s `FunctionCall` arm now routes
-    /// through `pretty_name`, which the pivot naming call site consumes).
     #[test]
     fn analyze_pivot_multi_agg_unaliased_names_outputs_value_underscore_pretty_name() {
         let bt = base_types_with_emp_dept();
@@ -10798,9 +9701,6 @@ mod tests {
         assert_eq!(names, vec!["dept_id", "10_sum(salary)", "10_avg(salary)"]);
     }
 
-    /// Pass 60 H1 — Spark's Catalyst `Literal.sql` renders integral doubles
-    /// with a `.0` suffix. `lit(1.0d)` becomes pivot column `"1.0"`, not
-    /// `"1"`. Non-integral doubles use their natural decimal repr.
     #[test]
     fn analyze_pivot_double_values_render_dot_zero_for_integral_spark_parity() {
         let bt = base_types_with_emp_dept();
@@ -10810,11 +9710,8 @@ mod tests {
             grouping: PivotGrouping::Explicit(vec![unresolved_col("dept_id")]),
             pivot_column: unresolved_col("salary"),
             pivot_values: vec![
-                // Integral double → "1.0".
                 lit_double(1.0),
-                // Negative integral double → "-2.0".
                 lit_double(-2.0),
-                // Non-integral float → "1.5".
                 Expression::Literal(Literal {
                     value: LiteralValue::Float(1.5),
                     data_type: DataType::Float,
@@ -10827,14 +9724,6 @@ mod tests {
         assert_eq!(names, vec!["dept_id", "1.0", "-2.0", "1.5"]);
     }
 
-    /// A NULL pivot value is a legitimate bucket. Spark's `PivotTransformer`
-    /// only rejects *non-foldable* pivot value expressions
-    /// (`NON_LITERAL_PIVOT_VALUES`); a `Literal(null)` is foldable and Spark
-    /// names its output column `"null"` (its `outputName` casts to string and
-    /// falls back to `"null"`). The values-less overload feeds a discovered
-    /// NULL straight into this path, so τ must accept it and stamp a `"null"`
-    /// column — verified against `RelationalGroupedDataset.pivot` /
-    /// `PivotTransformer.outputName` in Spark 4.x.
     #[test]
     fn analyze_pivot_accepts_null_literal_as_null_bucket() {
         let bt = base_types_with_emp_dept();
@@ -10844,8 +9733,6 @@ mod tests {
             grouping: PivotGrouping::Explicit(vec![unresolved_col("dept_id")]),
             pivot_column: unresolved_col("salary"),
             pivot_values: vec![
-                // A discovered NULL bucket (sorts first per Spark's nulls-first
-                // ordering) followed by a concrete value.
                 Expression::Literal(Literal {
                     value: LiteralValue::Null,
                     data_type: DataType::Null,
@@ -10856,16 +9743,9 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("NULL pivot value must be accepted");
         let names = field_names(&typed);
-        // grouping column, then the NULL bucket named "null", then "10".
         assert_eq!(names, vec!["dept_id", "null", "10"]);
     }
 
-    // ── Implicit PIVOT grouping / UNPIVOT ids (pass 107, SQL front-end) ──
-
-    /// SQL PIVOT supplies no grouping list. The analyzer derives it as
-    /// `input − pivot column − aggregate-referenced columns`, in input order.
-    /// emp = {id, name, dept_id, salary}; pivot on dept_id, agg avg(salary)
-    /// ⇒ grouping {id, name}.
     #[test]
     fn analyze_pivot_implicit_grouping_excludes_pivot_and_agg_refs() {
         let bt = base_types_with_emp_dept();
@@ -10880,9 +9760,6 @@ mod tests {
         assert_eq!(pivot_grouping_names(&typed), vec!["id", "name"]);
     }
 
-    /// `count(*)` references no column (its `Star` argument contributes
-    /// nothing), so every non-pivot column stays in the implicit grouping.
-    /// pivot on dept_id, agg count(*) ⇒ grouping {id, name, salary}.
     #[test]
     fn analyze_pivot_implicit_grouping_count_star_keeps_all_non_pivot_cols() {
         let bt = base_types_with_emp_dept();
@@ -10900,13 +9777,6 @@ mod tests {
         assert_eq!(pivot_grouping_names(&typed), vec!["id", "name", "salary"]);
     }
 
-    /// M2 regression: a column referenced only through a nested `CASE` /
-    /// `BETWEEN` must still be excluded from the implicit grouping. Before the
-    /// exhaustive `collect_referenced_columns`, the `Between` node fell into a
-    /// `_ => {}` catch-all, so `id` leaked back into the grouping (silent wrong
-    /// result). Agg `sum(CASE WHEN id BETWEEN 1 AND 2 THEN salary END)` on a
-    /// pivot over dept_id references {id, salary}; excluding those plus the
-    /// pivot column leaves grouping {name}.
     #[test]
     fn analyze_pivot_implicit_grouping_excludes_column_referenced_through_case_between() {
         let bt = base_types_with_emp_dept();
@@ -10933,11 +9803,6 @@ mod tests {
         assert_eq!(pivot_grouping_names(&typed), vec!["name"]);
     }
 
-    /// M1 regression: pivoting on an EXPRESSION column must exclude the
-    /// underlying REFERENCED column, not the expression's output name. Pivot
-    /// over `abs(dept_id)` references `dept_id`; the old code excluded the
-    /// literal name "abs" (no such column) and left `dept_id` in the grouping.
-    /// With structural exclusion, agg `avg(salary)` ⇒ grouping {id, name}.
     #[test]
     fn analyze_pivot_implicit_grouping_expression_pivot_excludes_referenced_column() {
         let bt = base_types_with_emp_dept();
@@ -10952,11 +9817,6 @@ mod tests {
         assert_eq!(pivot_grouping_names(&typed), vec!["id", "name"]);
     }
 
-    /// Finding 11 (v2-review-findings-2026-07-13.md): `derive_implicit_grouping`
-    /// stamps the source attribute's own `expr_id` on each implicit-grouping
-    /// `ColumnReference`, so the PIVOT's grouping output columns COPY
-    /// (id + lineage) from the underlying scan via `output_attribute` instead
-    /// of MINTING a fresh identity.
     #[test]
     fn analyze_pivot_implicit_grouping_output_attribute_carries_input_attribute_id() {
         let bt = base_types_with_emp_dept();
@@ -10998,9 +9858,6 @@ mod tests {
         );
     }
 
-    /// SQL UNPIVOT lists only value columns; the analyzer derives ids as
-    /// `input − values`, in input order. values = {dept_id, salary}
-    /// ⇒ ids {id, name}.
     #[test]
     fn analyze_unpivot_implicit_ids_are_input_minus_values() {
         let bt = base_types_with_emp_dept();
@@ -11018,20 +9875,10 @@ mod tests {
             }
             other => panic!("expected TypedOp::Unpivot, got {other:?}"),
         }
-        // Output schema: <ids> + metric (STRING NN) + val (widened nullable).
         let names = field_names(&typed);
         assert_eq!(names, vec!["id", "name", "metric", "val"]);
     }
 
-    /// `UnpivotIds::Implicit` with an empty value list is nonsensical (both
-    /// axes implicit) — the analyzer rejects it as a τ-INTERNAL invariant
-    /// break, not as a Spark-emulated error.
-    ///
-    /// It is unreachable in production and can only be built by constructing
-    /// the `CommonAst` directly, as this test does: `Implicit` comes only from
-    /// the SQL path, and sqlparser parses the UNPIVOT `IN` list with
-    /// `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` dies at parse time.
-    /// Blaming the client for reaching it would be wrong.
     #[test]
     fn analyze_unpivot_implicit_ids_empty_values_is_internal_error() {
         let bt = base_types_with_emp_dept();
@@ -11055,11 +9902,7 @@ mod tests {
         }
     }
 
-    // ── Review-fix H1: missing dropField target is Spark-emulated error ──
-
     fn base_types_with_addr_table() -> BaseTypes {
-        // A one-column table `addrs(addr STRUCT<street, city, geo>)` — the
-        // shape used by struct-005/006 corpus cases.
         let addr_ty = DataType::Struct(StructType::new(vec![
             StructField::nullable("street", DataType::String),
             StructField::nullable("city", DataType::String),
@@ -11071,20 +9914,6 @@ mod tests {
         )])
     }
 
-    /// Review A1 audit (2026-08-06). τ used to reject `dropFields("X")` for an
-    /// `X` absent from the struct, citing Catalyst
-    /// `UpdateFields.scala::checkInputDataTypes`. Observed against **live Spark
-    /// 4.1.1**, that reading is wrong — Spark ACCEPTS it and returns the struct
-    /// unchanged:
-    ///
-    /// ```text
-    /// structs.select(col("s").dropFields("nope"))
-    ///   -> update_fields(s, dropfield()): struct<x:bigint,y:bigint>
-    /// ```
-    ///
-    /// Dropping a non-existent field is a no-op, so the guard made τ reject a
-    /// query Spark runs. This test now pins the corrected, Spark-matching
-    /// behaviour: analysis succeeds and the base struct's fields survive.
     #[test]
     fn analyze_update_fields_missing_drop_target_is_accepted_like_spark() {
         let bt = base_types_with_addr_table();
@@ -11110,11 +9939,7 @@ mod tests {
         );
     }
 
-    // ── Pass 65: multi-level nested-struct dot-path access ──────────────────
-
     fn base_types_with_nested_struct() -> BaseTypes {
-        // `emp(id BIGINT, address STRUCT<city STRING, geo STRUCT<lat DOUBLE, lng DOUBLE>>)`
-        // — the shape used by struct-004 corpus case.
         let geo_ty = DataType::Struct(StructType::new(vec![
             StructField::nullable("lat", DataType::Double),
             StructField::nullable("lng", DataType::Double),
@@ -11133,10 +9958,6 @@ mod tests {
         )])
     }
 
-    /// `F.col("address.geo.lat")` — the Spark Connect converter emits
-    /// `UnresolvedColumn { qualifier: "address", name: "geo.lat" }`. The
-    /// analyzer must rewrite this as an `ExtractValue` chain so emission
-    /// produces `("address").geo.lat` rather than `"address"."geo.lat"`.
     #[test]
     fn resolve_multi_level_nested_struct_path_becomes_extract_value_chain() {
         let bt = base_types_with_nested_struct();
@@ -11150,15 +9971,11 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         };
         assert_eq!(proj.len(), 1, "single projection");
-        // N8: an unaliased computed entry is wrapped as `Alias(expr, name)` —
-        // the pretty name of the leaf `ExtractValue` is its extraction key,
-        // "lat".
         let wrapped = match &proj[0] {
             Expression::Alias(a) => a,
             other => panic!("expected Alias (N8), got {other:?}"),
         };
         assert_eq!(wrapped.alias, "lat");
-        // Outer ExtractValue(ExtractValue(ColumnReference("address"), "geo"), "lat")
         let outer = match wrapped.expr.as_ref() {
             Expression::ExtractValue(ev) => ev,
             other => panic!("expected ExtractValue, got {other:?}"),
@@ -11188,18 +10005,11 @@ mod tests {
             }
             other => panic!("expected root ColumnReference('address'), got {other:?}"),
         }
-        // Output schema records the leaf field type — nullable Double.
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Double);
         assert!(typed.resolved_schema.fields[0].nullable);
     }
 
-    /// Single-level dot access (`F.col("address.city")`, struct-002) — Pass
-    /// F2 stage 1 unifies this onto the SAME `ExtractValue` chain shape as
-    /// the multi-level case above, rather than a raw qualified
-    /// `ColumnReference`: the chain's root now carries the struct COLUMN's
-    /// own real attribute id (previously `None` under the discarded
-    /// `(dt, nullable, None)` tuple tier-(d) used to return).
     #[test]
     fn resolve_single_level_nested_struct_path_becomes_extract_value_chain() {
         let bt = base_types_with_nested_struct();
@@ -11213,9 +10023,6 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         };
         assert_eq!(proj.len(), 1, "single projection");
-        // N8: an unaliased computed entry is wrapped as `Alias(expr, name)` —
-        // the pretty name of the leaf `ExtractValue` is its extraction key,
-        // "city".
         let wrapped = match &proj[0] {
             Expression::Alias(a) => a,
             other => panic!("expected Alias (N8), got {other:?}"),
@@ -11239,23 +10046,13 @@ mod tests {
             }
             other => panic!("expected root ColumnReference('address'), got {other:?}"),
         }
-        // Output schema records the leaf field type — nullable String.
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::String);
         assert!(typed.resolved_schema.fields[0].nullable);
     }
 
-    /// The `ExtractValue` chain's root `ColumnReference` carries the SAME
-    /// `expr_id` as `address`'s own attribute in the input schema — Pass F2
-    /// stage 1's central claim: the struct COLUMN's real identity is now
-    /// stamped on the chain root rather than discarded.
     #[test]
     fn resolve_single_level_nested_struct_path_root_carries_column_expr_id() {
-        // Project the raw `address` column ALONGSIDE `address.city` in the
-        // SAME `analyze()` call, so both resolve against the identical
-        // (single) `TableScan`-minted `address` attribute — comparing ids
-        // minted across two SEPARATE `analyze()` calls would be comparing
-        // two different mints, not the same identity.
         let bt = base_types_with_nested_struct();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -11295,15 +10092,6 @@ mod tests {
         }
     }
 
-    /// Two same-named struct fields (`x`) of DIFFERENT types, reached through
-    /// two DIFFERENT root struct columns, must be DISCRIMINATED by
-    /// `semantic_eq` — Pass F2 stage 1's central claim. Before this pass,
-    /// tier-(d) stamped `expr_id: None` on the chain's root, so
-    /// `ids_compatible`'s `(None, _) => true` escape hatch let the two
-    /// canonicalize-`==` (name/qualifier-only) `ExtractValue` trees collide;
-    /// now the root carries its OWN struct column's real id, so
-    /// `ids_compatible` sees `(Some(id_a), Some(id_b))` and correctly rejects
-    /// the mismatch.
     #[test]
     fn semantic_eq_rejects_same_named_struct_field_different_root_ids() {
         let id_a = ExprId::fresh();
@@ -11327,9 +10115,6 @@ mod tests {
                 })),
             })
         };
-        // Same root NAME ("s") on both sides (as would arise from two
-        // differently-scoped occurrences canonicalizing identically), same
-        // field key "x", but DIFFERENT root ids and DIFFERENT field types.
         let a = extract("s", id_a, DataType::Integer);
         let b = extract("s", id_b, DataType::String);
         assert!(
@@ -11339,9 +10124,6 @@ mod tests {
         );
     }
 
-    /// Unknown nested field on an otherwise valid struct qualifier must
-    /// fall through to the standard resolver so the caller sees a proper
-    /// `UnknownColumn` (Spark-emulated) error rather than a silent rewrite.
     #[test]
     fn resolve_unknown_nested_field_falls_through_to_unknown_column() {
         let bt = base_types_with_nested_struct();
@@ -11355,8 +10137,6 @@ mod tests {
         }
     }
 
-    /// Case-insensitive drop matching a real field must succeed (not error).
-    /// Anchors the CI match in `validate_update_fields_ops`.
     #[test]
     fn analyze_update_fields_drop_field_case_insensitive_ok() {
         let bt = base_types_with_addr_table();
@@ -11369,11 +10149,8 @@ mod tests {
                 },
             )],
         });
-        // Successful analysis is the assertion.
         analyze(ast, &bt).expect("case-insensitive drop must analyze cleanly");
     }
-
-    // ── Describe / Summary analysis (Pass 80) ────────────────────────────
 
     fn base_types_with_emp() -> BaseTypes {
         base_types_for(&[("emp", emp_schema())])
@@ -11387,8 +10164,6 @@ mod tests {
         );
         assert_eq!(schema.fields[0].name, "summary");
         assert_eq!(schema.fields[0].data_type, DataType::String);
-        // Spark parity: `summary` is stamped nullable in Spark's schema even
-        // though every emitted value is a literal string.
         assert!(
             schema.fields[0].nullable,
             "`summary` column must be nullable per Spark parity"
@@ -11449,7 +10224,6 @@ mod tests {
             statistics: vec![],
         });
         let typed = analyze(ast, &bt).expect("analyze summary");
-        // Schema always covers the full input column list.
         assert_stats_output_schema(&typed.resolved_schema, &["id", "name", "dept_id", "salary"]);
         match typed.op {
             TypedOp::Summary { statistics, .. } => {
@@ -11465,12 +10239,6 @@ mod tests {
         }
     }
 
-    // ── FreqItems / Crosstab analysis (Pass 82) ──────────────────────────
-
-    /// Fixture with a stats-shaped schema that exercises all four
-    /// element-type variants (Integer, String, Double, Decimal). Pins ADR-015
-    /// Spark parity: freqItems must stamp `Array<source_type>` per column
-    /// (never a hardcoded `Array<String>`).
     fn base_types_with_stats() -> BaseTypes {
         let stats_schema = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -11502,10 +10270,7 @@ mod tests {
             support: 0.3,
         });
         let typed = analyze(ast, &bt).expect("analyze freqItems");
-        // Schema arity: one column per input col (no `summary` prefix — Spark
-        // freqItems doesn't emit a summary label column).
         assert_eq!(typed.resolved_schema.fields.len(), 4);
-        // Spark parity: each element type mirrors the source col.
         let expected: &[(&str, DataType)] = &[
             ("dept_id_freqItems", DataType::Integer),
             ("name_freqItems", DataType::String),
@@ -11550,16 +10315,12 @@ mod tests {
         let bt = base_types_with_stats();
         let ast = CommonAst::new(CommonOp::FreqItems {
             input: Box::new(scan("stats")),
-            // `Dept_ID` must resolve to `dept_id`.
             cols: vec!["Dept_ID".to_owned()],
             support: 0.01,
         });
         let typed = analyze(ast, &bt).expect("case-insensitive freqItems must analyze");
         assert_eq!(typed.resolved_schema.fields.len(), 1);
-        // Output name preserves caller casing (matches Describe/Summary).
         assert_eq!(typed.resolved_schema.fields[0].name, "Dept_ID_freqItems");
-        // Element type still resolves to Integer via field_by_name (also
-        // case-insensitive).
         match &typed.resolved_schema.fields[0].data_type {
             DataType::Array(elem, _) => assert_eq!(elem.as_ref(), &DataType::Integer),
             other => panic!("expected Array<Integer>, got {other:?}"),
@@ -11597,12 +10358,6 @@ mod tests {
         assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
     }
 
-    /// The `crosstab(col1, col2)` desugar (`crosstab_to_aggregate`) produces
-    /// the Spark-parity contingency-table schema: col0 = `CAST(col1 AS STRING)`
-    /// named `{col1}_{col2}` (nullability from col1), then one `bigint`
-    /// non-null count column per distinct col2 value, named by the value's
-    /// string form and sorted lexicographically ascending as strings. Mirrors
-    /// misc-006 (`crosstab(dept_id, active)`).
     #[test]
     fn crosstab_desugar_produces_spark_parity_contingency_schema() {
         let ct_schema = StructType::new(vec![
@@ -11611,8 +10366,6 @@ mod tests {
         ]);
         let bt = base_types_for(&[("ct", ct_schema)]);
 
-        // Hand the distinct values in "unsorted" (true before false) to prove
-        // the desugar re-sorts by the value's string form ('false' < 'true').
         let op = crosstab_to_aggregate(
             scan("ct"),
             "dept_id",
@@ -11631,7 +10384,6 @@ mod tests {
             "col0 nullability follows col1 (dept_id)"
         );
 
-        // Lexicographic string sort: 'false' before 'true'.
         assert_eq!(fields[1].name, "false");
         assert_eq!(fields[1].data_type, DataType::Long);
         assert!(!fields[1].nullable, "count columns are bigint non-null");
@@ -11641,12 +10393,8 @@ mod tests {
         assert!(!fields[2].nullable, "count columns are bigint non-null");
     }
 
-    // ── Sample / SampleBy analysis (Pass 83) ─────────────────────────────
-
     #[test]
     fn analyze_sample_schema_passthrough() {
-        // Anchor: `df.sample(0.5, seed=11)` produces the same schema as the
-        // input relation — Sample is schema-preserving.
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
             input: Box::new(scan("emp")),
@@ -11677,9 +10425,6 @@ mod tests {
 
     #[test]
     fn analyze_sample_with_replacement_flag_is_accepted_by_analyzer() {
-        // `with_replacement = true` is a Thunderduck-boundary case rejected by
-        // the emission stage, not the analyzer. This test pins the analyzer's
-        // schema-only responsibility.
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
             input: Box::new(scan("emp")),
@@ -11694,8 +10439,6 @@ mod tests {
 
     #[test]
     fn analyze_sample_by_resolves_col_and_passes_schema() {
-        // Anchor — samp-002: `sampleBy("dept_id", {10:0.5,...})` resolves the
-        // stratum column against the input schema and preserves the schema.
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::SampleBy {
             input: Box::new(scan("emp")),
@@ -11765,8 +10508,6 @@ mod tests {
         }
     }
 
-    // ── Pass 85 — expand_regex_projections + resolution predicate ────────
-
     fn regex_test_schema() -> ResolvedSchema {
         ResolvedSchema::minted(StructType::new(vec![
             StructField::not_null("customer_id", DataType::Long),
@@ -11801,7 +10542,6 @@ mod tests {
     fn expand_regex_projections_invalid_regex_returns_other_error() {
         let schema = regex_test_schema();
         let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
-            // Unbalanced `[` — invalid on both java.util.regex and Rust regex.
             pattern: "[unclosed".to_owned(),
             plan_id: None,
         })];
@@ -11841,7 +10581,6 @@ mod tests {
             non_regex_after.clone(),
         ];
         let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
-        // Layout: [name, customer_id, order_id, literal_1]
         assert_eq!(expanded.len(), 4);
         assert_eq!(expanded[0], non_regex_before);
         match &expanded[1] {
@@ -11864,12 +10603,6 @@ mod tests {
         assert!(!expression_is_fully_resolved(&expr));
     }
 
-    // ── Pass 90 — expand_inline_projections ──────────────────────────────
-
-    /// Helper — build `F.array(F.struct(col("name"), col("salary")))` shape
-    /// exactly as the ingress converter produces it for the corpus witness.
-    /// Uses fields present in this file's `emp_schema` fixture (`name` STRING?,
-    /// `salary` DOUBLE?) so `resolve_and_stamp` finds them at analysis time.
     fn array_of_struct_name_salary() -> Expression {
         let struct_call = func(
             "struct",
@@ -11882,9 +10615,6 @@ mod tests {
         func(if outer { "inline_outer" } else { "inline" }, vec![arg])
     }
 
-    /// Canonical inl-001 shape: `select("id", inline(array(struct(name, age))))`
-    /// widens into `[id, name, age]` — one projection per struct field, with
-    /// synthesized `Alias(inline_field(arr, "<n>"), "<n>")` shape.
     #[test]
     fn expand_inline_projections_widens_into_n_fields() {
         let bt = base_types_with_emp_dept();
@@ -11896,13 +10626,9 @@ mod tests {
             ],
         });
         let typed = analyze(ast, &bt).expect("analyze ok");
-        // Output schema: [id, name, salary].
         assert_eq!(field_names(&typed), vec!["id", "name", "salary"],);
-        // name field is String, salary field is Double.
         assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
         assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::Double);
-        // Post-expansion tree: three projections, latter two are
-        // Alias(inline_field(arr, "<n>"), "<n>").
         match &typed.op {
             TypedOp::Project { projections, .. } => {
                 assert_eq!(projections.len(), 3);
@@ -11935,8 +10661,6 @@ mod tests {
         }
     }
 
-    /// `inline_outer` widens the same way, but every output field is nullable
-    /// (Spark's `Inline` with `outer=true` — sentinel all-NULL row).
     #[test]
     fn expand_inline_outer_projections_marks_all_nullable() {
         let bt = base_types_with_emp_dept();
@@ -11955,8 +10679,6 @@ mod tests {
         }
     }
 
-    /// Prefix + suffix projections around an `inline` are preserved in place
-    /// — mirrors `expand_regex_projections_preserves_non_regex_projections_in_place`.
     #[test]
     fn expand_inline_preserves_prefix_and_suffix_projections() {
         let bt = base_types_with_emp_dept();
@@ -11969,21 +10691,15 @@ mod tests {
             ],
         });
         let typed = analyze(ast, &bt).expect("analyze ok");
-        // Layout: [id, name, salary, <literal_output_name>].
         let names = field_names(&typed);
         assert_eq!(names.len(), 4);
         assert_eq!(names[0], "id");
         assert_eq!(names[1], "name");
         assert_eq!(names[2], "salary");
-        // 4th field is the literal; the specific name is
-        // `expression_output_name`'s convention (not the focus of this test).
     }
 
-    /// Non-`Array<Struct<...>>` argument → Spark-emulated TypeMismatch. The
-    /// element is INT, not STRUCT — Spark's `Inline` rejects at analysis time.
     #[test]
     fn expand_inline_rejects_non_array_of_struct() {
-        // `arr : Array<Integer>` — element is not a struct.
         let bad_arg = func("array", vec![int_lit(1)]);
         let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "id",
@@ -11998,13 +10714,8 @@ mod tests {
         );
     }
 
-    /// Unresolvable arg → Thunderduck-boundary [`AnalyzerError::UnsupportedRule`]
-    /// (Display prefix `[TDCK-BOUNDARY]`). The message must be honest — no
-    /// silent fallthrough to a DuckDB catalog error. ADR-022 category-2.
     #[test]
     fn expand_inline_boundary_rejects_unresolved_element_type() {
-        // Reference a column that doesn't exist in the schema — data_type
-        // returns `Unresolved`, which we treat as a boundary case.
         let unresolved_arg = unresolved_col("no_such_col");
         let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "id",
@@ -12028,8 +10739,6 @@ mod tests {
         );
     }
 
-    /// Sibling boundary — same rule name for `inline_outer` (used to distinguish
-    /// the `[TDCK-BOUNDARY]` origin in reviewer / operator diagnostics).
     #[test]
     fn expand_inline_outer_boundary_rejects_unresolved_element_type_with_tdck_prefix() {
         let unresolved_arg = unresolved_col("no_such_col");
@@ -12051,8 +10760,6 @@ mod tests {
         );
     }
 
-    // ── Pass 91 — expand_json_tuple_projections ──────────────────────────
-
     fn json_tuple_call(json_col: &str, keys: &[&str]) -> Expression {
         let mut args: Vec<Expression> = Vec::with_capacity(keys.len() + 1);
         args.push(unresolved_col(json_col));
@@ -12073,8 +10780,6 @@ mod tests {
         base_types_for(&[("raw", raw_schema_with_json_str())])
     }
 
-    /// Canonical json-002 shape: `select("id", json_tuple("json_str", "a", "e"))`
-    /// widens into `[id, c0, c1]` — positional names, both nullable STRING.
     #[test]
     fn expand_json_tuple_widens_into_n_fields_with_positional_names() {
         let bt = base_types_with_raw();
@@ -12086,16 +10791,12 @@ mod tests {
             ],
         });
         let typed = analyze(ast, &bt).expect("analyze ok");
-        // Output schema: [id, c0, c1].
         let names = field_names(&typed);
         assert_eq!(names, vec!["id", "c0", "c1"]);
-        // Both fanout fields are String, nullable.
         assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
         assert!(typed.resolved_schema.fields[1].nullable);
         assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::String);
         assert!(typed.resolved_schema.fields[2].nullable);
-        // Post-expansion tree: three projections, latter two are
-        // Alias(json_tuple_field(json_str, "<k>"), "c<i>").
         match &typed.op {
             TypedOp::Project { projections, .. } => {
                 assert_eq!(projections.len(), 3);
@@ -12128,8 +10829,6 @@ mod tests {
         }
     }
 
-    /// Prefix + suffix projections around a `json_tuple` are preserved in
-    /// place — mirrors `expand_inline_preserves_prefix_and_suffix_projections`.
     #[test]
     fn expand_json_tuple_preserves_prefix_and_suffix_projections() {
         let bt = base_types_with_raw();
@@ -12147,11 +10846,8 @@ mod tests {
         assert_eq!(names[0], "id");
         assert_eq!(names[1], "c0");
         assert_eq!(names[2], "c1");
-        // The 4th field is the literal; its exact name follows
-        // `expression_output_name`'s convention (not the focus of this test).
     }
 
-    /// Zero keys (`json_tuple(json)`) → Spark-emulated `Other` error.
     #[test]
     fn expand_json_tuple_rejects_zero_keys() {
         let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[])])
@@ -12169,7 +10865,6 @@ mod tests {
         );
     }
 
-    /// Non-literal key arg → Spark-emulated `TypeMismatch`.
     #[test]
     fn expand_json_tuple_rejects_non_literal_key() {
         let bad_call = func(
@@ -12185,11 +10880,8 @@ mod tests {
         );
     }
 
-    /// Boundary-reject unsafe key chars → `[TDCK-BOUNDARY]` prefix,
-    /// `rule = "json_tuple-expansion"`.
     #[test]
     fn expand_json_tuple_boundary_rejects_unsafe_key_chars() {
-        // Single-quote in key would break the emitted SQL string literal.
         let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &["a'b"])])
             .expect_err("must reject key containing '");
         match &err {
@@ -12202,8 +10894,6 @@ mod tests {
             err.to_string().starts_with("[TDCK-BOUNDARY]"),
             "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
         );
-        // Dot / bracket in key would path-walk in DuckDB's json_extract_string
-        // but Spark treats them as flat key chars → boundary reject.
         for bad_key in ["a.b", "a[0]"] {
             let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[bad_key])])
                 .expect_err("must reject JSONPath metachars in key");
@@ -12216,13 +10906,8 @@ mod tests {
         }
     }
 
-    // ── na_fill_compatible predicate ─────────────────────────────────────────
-
-    /// Direct unit coverage of the shared predicate used by both
-    /// `analyze_na_fill` and `render_na_fill`.
     #[test]
     fn na_fill_compatible_matches_spark_fill_value_rules() {
-        // Numeric ↔ numeric (all pairs) → true.
         for c in [
             DataType::Byte,
             DataType::Short,
@@ -12240,28 +10925,18 @@ mod tests {
                 "{c:?} × Long should be compatible"
             );
         }
-        // Same-family scalars.
         assert!(na_fill_compatible(&DataType::String, &DataType::String));
         assert!(na_fill_compatible(&DataType::Boolean, &DataType::Boolean));
-        // Cross-family — the mismatches Spark silently skips.
         assert!(!na_fill_compatible(&DataType::String, &DataType::Long));
         assert!(!na_fill_compatible(&DataType::Long, &DataType::String));
         assert!(!na_fill_compatible(&DataType::Boolean, &DataType::Long));
         assert!(!na_fill_compatible(&DataType::String, &DataType::Boolean));
-        // Date / Timestamp never fill.
         assert!(!na_fill_compatible(&DataType::Date, &DataType::Long));
         assert!(!na_fill_compatible(&DataType::Timestamp, &DataType::Long));
     }
 
-    /// Regression for `chain-002`: `.na.fill(0)` on a mixed schema must (a)
-    /// preserve original nullability on non-numeric columns, (b) flip
-    /// nullability only on numeric columns. This exercises the `analyze()`
-    /// entry (shared by `generate_with_schema` and `analyze_schema` — verified
-    /// in `crates/core/src/transpiler_v2/mod.rs::{generate_with_schema,
-    /// analyze_schema}`).
     #[test]
     fn analyze_na_fill_empty_cols_int_value_skips_non_numeric_columns() {
-        // Schema: mixed [string, long, double, boolean].
         let mixed_schema = StructType::new(vec![
             StructField::nullable("s", DataType::String),
             StructField::nullable("l", DataType::Long),
@@ -12269,7 +10944,6 @@ mod tests {
             StructField::nullable("b", DataType::Boolean),
         ]);
         let bt = base_types_for(&[("t", mixed_schema)]);
-        // NaFill { cols: [], values: [Int(0)] } — client's `.na.fill(0)` form.
         let ast = CommonAst::new(CommonOp::NaFill {
             input: Box::new(scan("t")),
             cols: vec![],
@@ -12278,7 +10952,6 @@ mod tests {
         let typed = analyze(ast, &bt).expect("analyze NaFill must succeed");
         let fields = &typed.resolved_schema.fields;
         assert_eq!(fields.len(), 4);
-        // Non-numeric columns preserve original nullability (nullable=true).
         assert_eq!(fields[0].name, "s");
         assert_eq!(fields[0].data_type, DataType::String);
         assert!(
@@ -12291,7 +10964,6 @@ mod tests {
             fields[3].nullable,
             "Boolean column must stay nullable (type-incompatible with Int fill)"
         );
-        // Numeric columns become non-nullable (compatible fill).
         assert_eq!(fields[1].name, "l");
         assert_eq!(fields[1].data_type, DataType::Long);
         assert!(!fields[1].nullable, "Long column must flip to non-null");
@@ -12299,8 +10971,6 @@ mod tests {
         assert_eq!(fields[2].data_type, DataType::Double);
         assert!(!fields[2].nullable, "Double column must flip to non-null");
     }
-
-    // ── Pass 127 — Spark toPrettySQL default naming for unaliased exprs ───
 
     #[test]
     fn pretty_name_binary_arithmetic() {
@@ -12385,8 +11055,6 @@ mod tests {
         );
     }
 
-    // ── Pass 021 — toPrettySQL naming for unaliased aggregate/scalar columns ──
-
     #[test]
     fn pretty_name_cast_decimal_uppercase_spelling() {
         let expr = Expression::Cast(CastExpression {
@@ -12412,8 +11080,6 @@ mod tests {
         assert_eq!(pretty_name(&expr), "TRY_CAST(x AS BIGINT)");
     }
 
-    /// q061 shape: `((CAST(promotions AS DECIMAL(15,4)) / CAST(total AS
-    /// DECIMAL(15,4))) * 100)` — nested Cast operands inside a Binary tree.
     #[test]
     fn pretty_name_q061_nested_cast_division_times_literal() {
         let dec = DataType::Decimal {
@@ -12507,9 +11173,6 @@ mod tests {
         assert_eq!(expression_output_name(&expr), "avg(x)");
     }
 
-    /// win2-002 regression guard: Spark names the time-`window` /
-    /// `session_window` struct column by the BARE function name, not
-    /// `window(args)`. Everything else stays `fn(args)`.
     #[test]
     fn expression_output_name_time_window_stays_bare() {
         let w = func(
@@ -12524,8 +11187,6 @@ mod tests {
         assert_eq!(expression_output_name(&sw), "session_window");
     }
 
-    /// q002 shape: `round(a / b, 2)`, unaliased — nested Binary inside the
-    /// FunctionCall's arg list must render through `pretty_name` recursively.
     #[test]
     fn expression_output_name_unaliased_nested_round_uses_pretty_name() {
         let div = Expression::Binary(BinaryExpression {
@@ -12537,17 +11198,12 @@ mod tests {
         assert_eq!(expression_output_name(&expr), "round((s1 / s2), 2)");
     }
 
-    /// Regression guard: an ALIASED FunctionCall must still be named by its
-    /// alias, not `pretty_name` — the `Alias` arm short-circuits before the
-    /// `FunctionCall` arm is ever reached.
     #[test]
     fn expression_output_name_aliased_function_call_keeps_alias() {
         let expr = alias_expr(func("sum", vec![unresolved_col("salary")]), "total");
         assert_eq!(expression_output_name(&expr), "total");
     }
 
-    /// Regression guard: a passthrough column keeps naming by its bare column
-    /// name (unaffected by the FunctionCall rename).
     #[test]
     fn expression_output_name_passthrough_column_unchanged() {
         assert_eq!(
@@ -12556,8 +11212,6 @@ mod tests {
         );
     }
 
-    /// Regression guard: a top-level literal still names `"col"` (Spark's
-    /// literal-projection convention), NOT its `pretty_name` value rendering.
     #[test]
     fn expression_output_name_literal_unchanged() {
         assert_eq!(expression_output_name(&int_lit(1)), "col");
@@ -12566,9 +11220,6 @@ mod tests {
     #[test]
     fn sel_008_shaped_project_names_unaliased_computed_columns() {
         let bt = base_types_with_emp_dept();
-        // SELECT id, dept_id + 1, salary / 1000 FROM emp — mirrors sel-008's
-        // shape (an id passthrough plus two unaliased computed projections),
-        // using columns present in `emp_schema`.
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![
@@ -12590,15 +11241,6 @@ mod tests {
         assert_eq!(names, vec!["id", "(dept_id + 1)", "(salary / 1000)"]);
     }
 
-    // ── Alias-aware qualified column resolution over joins (jn-006) ───────
-    //
-    // The pin-table cases (both sides typed, correct nullability per join
-    // kind, passthrough descent, nested-join range-vs-side-schema) live in
-    // `analyzer_fixtures.rs` and are exercised via INV4/INV5. These direct
-    // tests cover the error paths and precedence rules that the fixture
-    // registry deliberately excludes (see its module doc).
-
-    /// `table` under an explicit alias (an `AliasedRelation` wrapper).
     fn aliased(table: &str, alias: &str) -> CommonAst {
         CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
@@ -12610,9 +11252,6 @@ mod tests {
 
     #[test]
     fn unqualified_duplicate_name_over_join_is_ambiguous() {
-        // `dept_id` exists on both sides of `emp e CROSS JOIN dept d` — an
-        // UNQUALIFIED reference must still raise `AmbiguousColumn`, exactly
-        // as before this pass (tier (c) is unchanged).
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -12629,9 +11268,6 @@ mod tests {
 
     #[test]
     fn qualifier_binds_relation_but_field_absent_is_unknown_column() {
-        // `d` unambiguously binds to `dept`, but `dept` has no `id` column —
-        // a Spark-emulated `UnknownColumn{qualifier: Some("d")}`, not an
-        // opaque DuckDB bind error and not a silent fallback to emp's `id`.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -12654,17 +11290,6 @@ mod tests {
 
     #[test]
     fn self_join_referenced_by_shadowed_table_name_is_unresolved() {
-        // `emp AS e1 JOIN emp AS e2`, referenced by the bare TABLE NAME
-        // `emp` (not either alias).
-        //
-        // Spark parity, probed against Spark 4.1.1 via
-        // `differential.dataframe_corpus.build_inputs`: Spark raises
-        // `UNRESOLVED_COLUMN.WITH_SUGGESTION` here, NOT `AMBIGUOUS_REFERENCE`
-        // — once a relation is aliased the base table name is shadowed
-        // outright, so `emp` never reaches ambiguity-checking. τ used to
-        // deviate (`TableScan` carried its own `alias` and bound BOTH names,
-        // so `emp` bound two ranges → `AmbiguousColumn`); deleting that field
-        // closed the deviation.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -12690,11 +11315,6 @@ mod tests {
 
     #[test]
     fn qualifier_binds_both_sides_of_join_is_ambiguous() {
-        // ADR-023 3b-i, jn-024 shape: the SAME user alias `x` on BOTH sides
-        // of a join (`emp AS x JOIN dept AS x`) — `x` binds 2+ ranges, so a
-        // qualified reference to it must raise `AmbiguousColumn` rather than
-        // resolve via the legacy first-match fallback. Matches Spark 4.1.1's
-        // `AMBIGUOUS_REFERENCE` for this shape (probed empirically).
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -12720,13 +11340,6 @@ mod tests {
 
     #[test]
     fn struct_qualifier_wins_over_colliding_relation_alias() {
-        // `emp` has a top-level STRUCT column named `address`; alias the
-        // `emp` scan itself as `address` too, so the qualifier `address` is
-        // BOTH a relation alias (whole-schema range) AND a struct column
-        // name. Tier (d) — struct-column qualifier — must still win: the
-        // reference resolves as `address.city` (a struct field), not as
-        // relation-alias lookup for a top-level `city` column (which does
-        // not exist and would raise `UnknownColumn` if alias precedence won).
         let bt = base_types_for(&[("emp", analyzer_fixtures::emp_schema())]);
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -12744,13 +11357,6 @@ mod tests {
 
     #[test]
     fn join_condition_qualifier_stamps_correct_side_field() {
-        // `e1.id = e2.manager_id` inside a self-join's `ON` condition:
-        // `ResolveContext::for_join_condition` must stamp each side against
-        // its OWN range, not the merged schema's first match (both refs
-        // share candidate names — `id`/`manager_id` — that also exist,
-        // differently typed/nulled, on the other side is not the case here,
-        // but the alias-qualified condition path must still resolve each
-        // side correctly rather than through the synthetic `__td_j*` path).
         let bt = base_types_for(&[("emp", analyzer_fixtures::emp_schema())]);
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -12783,12 +11389,6 @@ mod tests {
 
     #[test]
     fn using_join_qualifier_resolution_stays_on_legacy_path_no_panic() {
-        // USING joins reorder/dedup the output schema, breaking the
-        // contiguous-range invariant `collect_qualifier_bindings` relies on
-        // — it deliberately STOPs there (no bindings collected), so
-        // qualified refs keep resolving via the legacy, pre-fix path.
-        // Exercise the STOP arm end-to-end so it isn't dead code and
-        // doesn't regress to a panic.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Join {
@@ -12808,11 +11408,6 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
     }
 
-    // ── Pass 9 (pr-007) — Lateral Column Alias (LCA) ───────────────────────
-
-    /// Whether `expr` (or any descendant) contains an `UnresolvedColumn`
-    /// case-insensitively named `name`. Shared by the chain/nested tests to
-    /// assert an earlier alias name has been fully inlined away.
     fn contains_unresolved_ref(expr: &Expression, name: &str) -> bool {
         match expr {
             Expression::UnresolvedColumn(u) => eq_fold(&u.name, name),
@@ -12822,7 +11417,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_single_ref_resolves_and_types() {
-        // pr-007: SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp
         let bt = base_types_for(&[("emp", emp_schema())]);
         let raised = alias_expr(
             Expression::Binary(BinaryExpression {
@@ -12852,8 +11446,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_chain_inlines_in_one_pass() {
-        // a = salary + 1; b = a + 1 (refs `a`); c = b + 1 (refs `b`) — a
-        // three-item chain must fully inline in a single left-to-right pass.
         let schema = ResolvedSchema::minted(emp_schema());
         let a = alias_expr(
             Expression::Binary(BinaryExpression {
@@ -12898,11 +11490,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_input_column_wins_over_alias() {
-        // `emp_schema` has a real `dept_id` input column. An item aliased AS
-        // `dept_id` collides with it, so it must NOT be recorded as a
-        // lateral source; a later bare `dept_id` ref must stay untouched
-        // (falls through to ordinary resolution against the INPUT column,
-        // not the alias expression).
         let schema = ResolvedSchema::minted(emp_schema());
         let shadow = alias_expr(unresolved_col("id"), "dept_id");
         let later = unresolved_col("dept_id");
@@ -12916,8 +11503,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_ambiguous_when_referenced() {
-        // Two earlier items both alias to `x`; a third item references `x`
-        // — Spark's AMBIGUOUS_LATERAL_COLUMN_ALIAS (count = 2).
         let schema = ResolvedSchema::minted(emp_schema());
         let x1 = alias_expr(unresolved_col("salary"), "x");
         let x2 = alias_expr(unresolved_col("id"), "x");
@@ -12934,8 +11519,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_duplicate_name_without_reference_is_not_an_error() {
-        // Two same-named aliases with NO later reference is ordinary, legal
-        // SQL (duplicate output column names) — must not error.
         let schema = ResolvedSchema::minted(emp_schema());
         let x1 = alias_expr(unresolved_col("salary"), "x");
         let x2 = alias_expr(unresolved_col("id"), "x");
@@ -12955,10 +11538,7 @@ mod tests {
             }),
             "raised",
         );
-        // Lateral ref inside a FunctionCall arg: `abs(raised)`.
         let via_call = alias_expr(func("abs", vec![unresolved_col("raised")]), "abs_raised");
-        // Lateral ref inside a CASE branch: `CASE WHEN raised > 0 THEN raised
-        // ELSE salary END`.
         let case_expr = Expression::CaseWhen(CaseWhenExpression {
             branches: vec![(
                 Expression::Binary(BinaryExpression {
@@ -12991,11 +11571,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_forward_reference_still_unknown_column() {
-        // Item 1 references `delta`, which is only DEFINED by item 2 — no
-        // look-ahead: item 1's `delta` ref is left untouched (table is empty
-        // when item 1 is processed), falls through to ordinary resolution,
-        // and surfaces the correct `UnknownColumn` (proven end-to-end via
-        // `analyze()`, not merely the pre-pass in isolation).
         let bt = base_types_for(&[("emp", emp_schema())]);
         let first = alias_expr(unresolved_col("delta"), "early");
         let second = alias_expr(unresolved_col("salary"), "delta");
@@ -13015,9 +11590,6 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_does_not_reach_into_lambda_body() {
-        // `SELECT 1 AS x, transform(arr, x -> x + 1) AS transformed FROM t`
-        // — the lambda's OWN bound parameter `x` must NOT be substituted by
-        // the outer lateral alias `x`.
         let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "arr",
             DataType::Array(Box::new(DataType::Integer), true),
@@ -13059,10 +11631,6 @@ mod tests {
         }
     }
 
-    // ── LATERAL VIEW analyzer tests (cx-007/cx-008/cx-009) ──────────────
-
-    /// Build an emp schema with a `tags` column of type `ARRAY<STRING>` for
-    /// LATERAL VIEW tests.
     fn emp_tags_schema() -> StructType {
         StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -13071,8 +11639,6 @@ mod tests {
         ])
     }
 
-    /// Build a `CommonOp::LateralView` wrapping a TableScan("emp") with the
-    /// given generator columns under table alias `t`.
     fn lateral_view_plan(columns: Vec<(String, Expression)>) -> CommonAst {
         CommonAst::new(CommonOp::LateralView {
             input: Box::new(aliased("emp", "e")),
@@ -13106,7 +11672,6 @@ mod tests {
                 .collect(),
         );
         let typed = analyze(plan, &bt).expect("analyze");
-        // Output schema = input fields (id, name, tags) + generated (tag).
         assert_eq!(typed.resolved_schema.len(), 4);
         assert_eq!(typed.resolved_schema.fields[0].name, "id");
         assert_eq!(typed.resolved_schema.fields[1].name, "name");
@@ -13117,7 +11682,6 @@ mod tests {
 
     #[test]
     fn lateral_view_qualifier_binding_t_tag_resolves() {
-        // Project[t.tag] over LateralView — `t.tag` must resolve.
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(lateral_view_plan(vec![(
                 "tag".to_owned(),
@@ -13136,7 +11700,6 @@ mod tests {
 
     #[test]
     fn lateral_view_qualifier_binding_e_id_resolves() {
-        // Project[e.id] over LateralView — input-side qualifier must resolve.
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(lateral_view_plan(vec![(
                 "tag".to_owned(),
@@ -13155,7 +11718,6 @@ mod tests {
 
     #[test]
     fn lateral_view_qualifier_t_nope_is_unknown_column() {
-        // `t.nope` — column not in the generated range → UnknownColumn.
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(lateral_view_plan(vec![(
                 "tag".to_owned(),
@@ -13180,9 +11742,6 @@ mod tests {
 
     #[test]
     fn lateral_view_qualifier_e_tag_is_unknown_column() {
-        // `e.tag` — `tag` is NOT in the input (emp) range → UnknownColumn.
-        // This proves the bespoke qualifier binding arm is active (the legacy
-        // name-only fallback would wrongly resolve `tag` by name).
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(lateral_view_plan(vec![(
                 "tag".to_owned(),
@@ -13207,8 +11766,6 @@ mod tests {
 
     #[test]
     fn lateral_view_outer_always_nullable() {
-        // explode_outer always produces nullable output regardless of
-        // the array's containsNull flag.
         let non_null_array_schema = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::not_null("tags", DataType::Array(Box::new(DataType::String), false)),
@@ -13224,7 +11781,6 @@ mod tests {
                 .collect(),
         );
         let typed = analyze(plan, &bt).expect("analyze");
-        // explode_outer always produces nullable output.
         assert!(typed.resolved_schema.fields[2].nullable);
     }
 
@@ -13258,7 +11814,6 @@ mod tests {
                 .collect(),
         );
         let typed = analyze(plan, &bt).expect("analyze");
-        // pos is the 4th field (index 3), val is the 5th (index 4).
         assert_eq!(typed.resolved_schema.fields[3].name, "pos");
         assert!(
             !typed.resolved_schema.fields[3].nullable,
@@ -13266,14 +11821,10 @@ mod tests {
         );
         assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::Integer);
         assert_eq!(typed.resolved_schema.fields[4].name, "tag");
-        // posexplode_val nullable depends on containsNull of the array.
         assert!(typed.resolved_schema.fields[4].nullable);
         assert_eq!(typed.resolved_schema.fields[4].data_type, DataType::String);
     }
 
-    // ── Pass-17: LATERAL derived-table join ─────────────────────────────
-
-    /// Build a `lateral_join` AST node.
     fn lateral_join(
         left: CommonAst,
         right: CommonAst,
@@ -13293,19 +11844,13 @@ mod tests {
         })
     }
 
-    /// tbl-005 shape: `emp e JOIN LATERAL (SELECT avg(e2.salary) AS dept_avg
-    /// FROM emp e2 WHERE e2.dept_id <=> e.dept_id) t`.
-    /// Simplified to: `emp e CROSS JOIN LATERAL (SELECT e.name AS dept_avg) t`
-    /// — the right subquery references the left's column via OuterScope.
     #[test]
     fn lateral_join_analyzes_with_outer_scope_from_left_sibling() {
         let bt = base_types_with_emp_dept();
-        // Left: `emp` aliased as `e`.
         let left = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(scan("emp")),
             alias: "e".to_owned(),
         });
-        // Right: a subquery that references e.name from the left side.
         let right_inner = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("dept")),
             projections: vec![Expression::Alias(
@@ -13325,11 +11870,9 @@ mod tests {
             projections: vec![qcol("e", "name"), qcol("t", "dept_avg")],
         });
         let typed = analyze(plan, &bt).expect("lateral join must analyze");
-        // Output schema: [name, dept_avg].
         assert_eq!(typed.resolved_schema.fields.len(), 2);
         assert_eq!(typed.resolved_schema.fields[0].name, "name");
         assert_eq!(typed.resolved_schema.fields[1].name, "dept_avg");
-        // The join should be rewritten to Cross (Inner + no ON + lateral).
         match &typed.op {
             TypedOp::Project { input, .. } => match &input.op {
                 TypedOp::Join {
@@ -13361,10 +11904,6 @@ mod tests {
             right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + natural must error");
-        // Review A1: observed against live Spark 4.1.1 — the real class is
-        // INCOMPATIBLE_JOIN_TYPES. The prose token this site used to carry
-        // ("UNSUPPORTED_FEATURE") was wrong; no UNSUPPORTED_FEATURE subclass
-        // for a natural join exists anywhere in Spark's 1244 conditions.
         assert_eq!(
             err.spark_class(),
             Some("INCOMPATIBLE_JOIN_TYPES"),
@@ -13389,9 +11928,6 @@ mod tests {
             right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + USING must error");
-        // Review A1: observed against live Spark 4.1.1 — the real class is the
-        // UNSUPPORTED_FEATURE.LATERAL_JOIN_USING *subclass*; this site's prose
-        // token carried only the bare base class.
         assert_eq!(
             err.spark_class(),
             Some("UNSUPPORTED_FEATURE.LATERAL_JOIN_USING"),
@@ -13425,21 +11961,10 @@ mod tests {
         );
     }
 
-    /// One-level-only witness: a lateral join nested inside a genuinely
-    /// CORRELATED subquery context (EXISTS over `dept d`) that supplies a
-    /// non-None inherited `outer`. The lateral's right child references
-    /// `d.dept_name` from the inherited outer. If the lateral branch
-    /// COMPOSED (rather than replaced) outer scopes, `d.dept_name` would
-    /// resolve via the leaked inherited outer. Must fail with UnknownColumn
-    /// because the lateral REPLACES the inherited outer with only its
-    /// immediate left sibling (`e`).
     #[test]
     fn lateral_join_one_level_only_grandparent_ref_fails() {
         use crate::transpiler_v2::expression::{ExistsSubquery, SubqueryPlan};
         let bt = base_types_with_emp_dept();
-        // The lateral join that will live inside the EXISTS subquery:
-        // `emp e JOIN LATERAL (SELECT d.dept_name AS x) t`
-        // The right subquery references `d.dept_name` from the outer scope.
         let lateral_left = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(scan("emp")),
             alias: "e".to_owned(),
@@ -13458,12 +11983,6 @@ mod tests {
             alias: "t".to_owned(),
         });
         let lateral_node = lateral_join(lateral_left, lateral_right, JoinType::Inner, None);
-        // Wrap the lateral join in an EXISTS subquery expression.
-        // The EXISTS is the filter condition of `SELECT * FROM dept d WHERE EXISTS(...)`.
-        // `analyze_subquery_plan` will analyze the inner plan with
-        // `outer = Some(OuterScope { schema: &dept_d_schema, scopes: ... })`,
-        // so a non-None outer IS available. If the lateral composed instead of
-        // replaced, `d.dept_name` would resolve via the leaked outer.
         let exists_subq = Expression::ExistsSubquery(ExistsSubquery {
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::Project {
                 input: Box::new(lateral_node),
@@ -13483,16 +12002,12 @@ mod tests {
         });
         let err = analyze(outer_plan, &bt).expect_err("grandparent ref must fail");
         let msg = format!("{err:?}");
-        // The lateral's right child sees only `e` (its left sibling), not `d`
-        // from the inherited outer. `d.dept_name` must be UnknownColumn.
         assert!(
             msg.contains("UnknownColumn") || msg.contains("unknown column"),
             "expected UnknownColumn for d.dept_name leaked from inherited outer, got: {msg}"
         );
     }
 
-    /// Regression: a non-lateral Inner join with no ON/USING still triggers the
-    /// existing boundary error (it was not converted to Cross).
     #[test]
     fn non_lateral_inner_join_no_on_still_boundary_errors() {
         let bt = base_types_with_emp_dept();
@@ -13504,14 +12019,10 @@ mod tests {
             projections: vec![unresolved_col("name")],
         });
         let typed = analyze(plan, &bt).expect("non-lateral analyze OK");
-        // dispatch_op should error (boundary: non-cross join without ON/USING).
         let result = crate::transpiler_v2::emission::dispatch_op(&typed.op, &typed.resolved_schema);
         assert!(result.is_err(), "non-lateral clauseless Inner must error");
     }
 
-    // ── Pass 18: RecursiveCte analyzer tests ──────────────────────────────
-
-    /// emp schema with `manager_id` for recursive CTE tests (cte-010).
     fn emp_schema_with_manager() -> StructType {
         StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -13521,7 +12032,6 @@ mod tests {
         ])
     }
 
-    /// Build a `RecursiveCte` AST node directly (bypasses the parser).
     fn recursive_cte(
         name: &str,
         column_names: Vec<&str>,
@@ -13540,16 +12050,10 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_009_simple_sequence() {
-        // cte-009: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1
-        // FROM seq WHERE n < 5) SELECT * FROM seq`.
-        // Anchor: `SELECT 1` → Project over SingleRow with INT literal.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
         });
-        // Recursive term: `SELECT n + 1 FROM seq WHERE n < 5`.
-        // In SQL, WHERE filters before SELECT projects:
-        // Project { input: Filter { input: scan("seq"), cond }, projections }
         let recursive_term = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(scan("seq")),
@@ -13565,7 +12069,6 @@ mod tests {
                 right: Box::new(int_lit(1)),
             })],
         });
-        // Wrap in the CTE reference: AliasedRelation { RecursiveCte, "seq" }
         let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
         let outer = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -13577,24 +12080,13 @@ mod tests {
 
         let bt = BaseTypes::empty();
         let typed = analyze(outer, &bt).expect("analyze cte-009");
-        // resolved_schema should be the anchor's renamed schema: n:Integer.
         assert_eq!(field_names(&typed), vec!["n"]);
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
-        // Nullability is always true for recursive-CTE output, regardless of
-        // the anchor's own (non-nullable) literal — matches Spark's reference
-        // behavior verified against the 4.1.1 pin.
         assert!(typed.resolved_schema.fields[0].nullable);
     }
 
     #[test]
     fn analyze_recursive_cte_010_join_form() {
-        // cte-010: `WITH RECURSIVE chain(id, name, manager_id, lvl) AS (
-        //   SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL
-        //   UNION ALL
-        //   SELECT e.id, e.name, e.manager_id, c.lvl + 1
-        //   FROM emp e JOIN chain c ON e.manager_id = c.id
-        // ) SELECT * FROM chain`.
-        // In SQL, WHERE filters before SELECT projects.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(scan("emp")),
@@ -13610,7 +12102,6 @@ mod tests {
                 int_lit(0),
             ],
         });
-        // Recursive term: join emp e with chain c.
         let emp_aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(scan("emp")),
             alias: "e".to_owned(),
@@ -13654,31 +12145,18 @@ mod tests {
             projections: vec![Expression::Star(StarExpression { qualifier: None })],
         });
 
-        // emp_schema_with_manager has id:Long, name:String, manager_id:Integer
-        // (nullable), salary:Double. We need emp in base_types for the anchor's
-        // scan AND the recursive term's `FROM emp e`. chain resolves via the
-        // injected entry.
         let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
         let typed = analyze(outer, &bt).expect("analyze cte-010");
 
         assert_eq!(field_names(&typed), vec!["id", "name", "manager_id", "lvl"]);
-        // id comes from emp.id (Long NOT NULL).
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
-        // lvl: anchor is int_lit(0) → Integer.
         assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::Integer);
-        // id: both legs source from the real `emp` table's NOT NULL id — no
-        // self-reference touches this column, so nullability stays false
-        // (verified against the 4.1.1 reference: Reference nullable=false).
         assert!(!typed.resolved_schema.fields[0].nullable);
-        // lvl: the recursive leg's `c.lvl + 1` reads the self-reference
-        // (`chain c`), which is always typed nullable — OR-folded with the
-        // anchor's non-nullable `0` literal, the output is nullable.
         assert!(typed.resolved_schema.fields[3].nullable);
     }
 
     #[test]
     fn analyze_recursive_cte_union_without_all_rejected() {
-        // UNION (without ALL) → Spark-emulated UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
@@ -13697,9 +12175,6 @@ mod tests {
         });
         let bt = BaseTypes::empty();
         let err = analyze(outer, &bt).expect_err("should reject UNION without ALL");
-        // Review A1: the class is carried in the typed `class` field, NOT as
-        // prose in the message — the oracle's `^\s*\[([A-Z][A-Z0-9_.]*)\]`
-        // regex can only recover it from the leading bracketed token.
         assert_eq!(
             err.spark_class(),
             Some("UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE"),
@@ -13710,7 +12185,6 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_column_list_arity_mismatch() {
-        // column_names has 2 entries but anchor produces 1 column.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
@@ -13738,12 +12212,10 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_anchor_recursive_arity_mismatch() {
-        // Anchor produces 1 column but recursive term produces 2.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
         });
-        // Recursive term produces 2 columns.
         let recursive_term = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("seq")),
             projections: vec![unresolved_col("n"), int_lit(99)],
@@ -13767,12 +12239,6 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_shadowing_base_types_entry() {
-        // BaseTypes already has an entry for "seq" (a catalog table with a
-        // STRING column). The CTE injection must shadow it — the recursive
-        // term must resolve `n` via the INJECTED schema (Integer from anchor),
-        // not the pre-existing catalog entry. If injection-wins is broken, the
-        // recursive term's `n + 1` would attempt Integer + Integer on a String
-        // column (from catalog) and produce a wrong type or fail.
         let catalog_seq_schema = StructType::new(vec![
             StructField::nullable("n", DataType::String), // different type!
         ]);
@@ -13782,9 +12248,6 @@ mod tests {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
         });
-        // The recursive term's `n + 1` can only succeed as Integer + Integer.
-        // If the catalog's String schema leaks through (injection-wins broken),
-        // `n` resolves as String and the Add expression types differently.
         let recursive_term = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("seq")),
             projections: vec![Expression::Binary(BinaryExpression {
@@ -13803,11 +12266,7 @@ mod tests {
         });
 
         let typed = analyze(outer, &bt).expect("analyze should succeed (CTE shadows catalog)");
-        // n should be Integer (from anchor), NOT String (from catalog).
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
-        // Verify the recursive term resolved `n` as Integer (injection-wins
-        // proof): drill into RecursiveCte → recursive_term → its input
-        // TableScan resolves to the Integer schema, not the catalog String.
         let cte_op = match &typed.op {
             TypedOp::Project { input, .. } => match &input.op {
                 TypedOp::AliasedRelation { input, .. } => &input.op,
@@ -13817,8 +12276,6 @@ mod tests {
         };
         match cte_op {
             TypedOp::RecursiveCte { recursive_term, .. } => {
-                // The recursive term's input (under Project) is a TableScan
-                // whose resolved_schema must be the INJECTED Integer schema.
                 let inner_input = match &recursive_term.op {
                     TypedOp::Project { input, .. } => input,
                     other => panic!("expected Project in recursive term, got {other:?}"),
@@ -13836,16 +12293,10 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_case_mismatch_self_ref_resolves() {
-        // Regression: `WITH RECURSIVE Seq(n) AS (... FROM Seq ...)` — the CTE
-        // name is lowercased to "seq" for BaseTypes injection, but the
-        // self-reference TableScan preserves source case "Seq". Without the
-        // case-insensitive injection fix, BaseTypes::lookup("Seq") misses and
-        // produces a spurious UnknownTable error.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
         });
-        // Self-reference uses source-case "Seq" (not "seq").
         let recursive_term = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(scan("Seq")),
@@ -13861,7 +12312,6 @@ mod tests {
                 right: Box::new(int_lit(1)),
             })],
         });
-        // CTE name is lowercase "seq" (from lowering).
         let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
         let outer = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -13879,10 +12329,6 @@ mod tests {
 
     #[test]
     fn analyze_recursive_cte_uppercase_self_ref_shadows_catalog() {
-        // Regression (silent-wrong-results variant): a catalog table "Seq"
-        // exists with a STRING column. The CTE injection under lowercase "seq"
-        // misses the case-sensitive lookup for "Seq", which would fall through
-        // to the catalog entry and bind with the wrong schema.
         let catalog_schema = StructType::new(vec![StructField::nullable("n", DataType::String)]);
         let bt = base_types_for(&[("Seq", catalog_schema)]);
 
@@ -13890,7 +12336,6 @@ mod tests {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![int_lit(1)],
         });
-        // Self-reference uses "Seq" (matching the catalog entry's case).
         let recursive_term = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("Seq")),
             projections: vec![Expression::Binary(BinaryExpression {
@@ -13910,15 +12355,11 @@ mod tests {
 
         let typed =
             analyze(outer, &bt).expect("CTE injection must shadow the catalog entry for 'Seq'");
-        // Must be Integer (CTE anchor), not String (catalog).
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
     }
 
     #[test]
     fn analyze_recursive_cte_010_c_lvl_resolves_integer() {
-        // Specifically verify that `c.lvl` inside the recursive term's JOIN
-        // condition resolves with the correct type (Integer), proving the
-        // self-reference binds through the injected BaseTypes entry.
         let anchor = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(scan("emp")),
@@ -13983,7 +12424,6 @@ mod tests {
         let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
         let typed = analyze(outer, &bt).expect("analyze cte-010 join form");
 
-        // lvl field type must be Integer (anchor's int_lit(0)).
         let lvl_field = typed
             .resolved_schema
             .field_by_name("lvl")
@@ -13995,9 +12435,6 @@ mod tests {
         );
     }
 
-    // ── plan_id-scoped resolution above joins ──────────────────────────
-
-    /// Unqualified unresolved column WITH a plan_id tag.
     fn plan_id_col(name: &str, pid: i64) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.to_owned(),
@@ -14006,7 +12443,6 @@ mod tests {
         })
     }
 
-    /// `Join` with plan_id sets but no USING columns.
     fn join_with_plan_ids(
         left: CommonAst,
         right: CommonAst,
@@ -14030,12 +12466,6 @@ mod tests {
 
     #[test]
     fn plan_id_disambiguates_self_join_project_above() {
-        // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)` with a Project
-        // above selecting `id` tagged with plan_id=2 — must resolve to the
-        // RIGHT side's `id`, not raise AmbiguousColumn. Phase 3b: the
-        // resolved ColumnReference is bare (qualifier `None`) identifying
-        // position 4 (the right side's `id`) — emission binds it by that
-        // identity instead of via a stamped join-side qualifier.
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("id", 1)),
@@ -14058,7 +12488,6 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].name, "id");
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
-        // Verify the resolved projection is bare and identity-bound.
         if let TypedOp::Project { input, projections } = &typed.op {
             match &projections[0] {
                 Expression::ColumnReference(c) => {
@@ -14077,9 +12506,6 @@ mod tests {
 
     #[test]
     fn plan_id_disambiguates_filter_above_join() {
-        // Filter above a self-join: `WHERE salary > 5` with plan_id=1 must
-        // resolve to the LEFT side without ambiguity error. Phase 3b: bare
-        // qualifier, identifying position 3 (the left side's `salary`).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("salary", 1)),
@@ -14103,10 +12529,7 @@ mod tests {
             }),
         });
         let typed = analyze(filter, &bt).expect("plan_id should disambiguate filter above join");
-        // Output schema is the full join (8 fields: 4 left + 4 right).
         assert_eq!(typed.resolved_schema.fields.len(), 8);
-        // Verify the resolved condition's left operand is bare and
-        // identity-bound.
         if let TypedOp::Filter {
             input,
             condition: Expression::Binary(b),
@@ -14127,10 +12550,6 @@ mod tests {
 
     #[test]
     fn plan_id_binds_both_sides_of_same_join_is_ambiguous() {
-        // ADR-023 3b-i, join-023 shape: the un-realiased self-join
-        // `df.join(df, ...)` — the SAME plan_id (1) tagged on BOTH the left
-        // AND right side of the SAME join. A reference carrying that plan_id
-        // must raise `AmbiguousColumnReference`, not silently bind the left side.
         let bt = base_types_with_emp_dept();
         let joined = join_with_plan_ids(
             scan("emp"),
@@ -14155,14 +12574,6 @@ mod tests {
 
     #[test]
     fn condition_binds_both_sides_of_same_join_is_ambiguous_column_reference() {
-        // Phase 3a: the un-realiased self-join `df.join(df, ...)` — the SAME
-        // plan_id (1) tagged on BOTH sides of the SAME join, referenced from
-        // the join's OWN condition (not above it, unlike the
-        // `plan_id_binds_both_sides_of_same_join_is_ambiguous` test above).
-        // `ResolveContext::for_join_condition`'s own-intersection seeding
-        // must raise `AmbiguousColumnReference` here too — the unification
-        // point (`resolve_column`'s plan_id-ambiguous arm) is shared with the
-        // above-join path.
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -14188,20 +12599,6 @@ mod tests {
 
     #[test]
     fn for_join_condition_binds_own_plan_ids_not_just_children_scope() {
-        // Anti-regression sentinel (Phase 3a, updated 3b): `left`/`right`
-        // here are bare `TableScan`s, whose own `RelScope` (per
-        // `RelScope::of`) carries NO `plan_ids` at all — only a `Join`
-        // node's OWN arm populates that field. `ResolveContext::for_join_
-        // condition` MUST bind those same own plan_ids into its scope
-        // itself, or a plan_id-tagged condition ref against a bare-scan
-        // child would fall through to legacy name resolution and never
-        // resolve by attribute identity the way this test asserts. Phase 3b:
-        // the bind is bare (no synthetic qualifier stamp) — identifying
-        // position 0 vs. 6 is the positional witness that both sides bound
-        // through their OWN plan_ids, not a fallback.
-        //
-        // Left schema: 6 fields, `dept_id` first (merged position 0). Right
-        // schema: 1 field, `dept_id` (merged position 6 = left's length).
         let left_schema = StructType::new(vec![
             StructField::not_null("dept_id", DataType::Integer),
             StructField::not_null("f1", DataType::Integer),
@@ -14236,10 +12633,6 @@ mod tests {
 
     #[test]
     fn plan_id_three_way_nested_join() {
-        // Three-way join: (emp(pid=1) JOIN emp(pid=2)) JOIN dept(pid=3)
-        // with a Project above selecting `dept_id` tagged with plan_id=3
-        // (the right side of the OUTER join) — must resolve to dept's
-        // `dept_id`, not emp's `dept_id`.
         let bt = base_types_with_emp_dept();
         let inner_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("id", 1)),
@@ -14274,20 +12667,11 @@ mod tests {
         let typed = analyze(project, &bt).expect("plan_id 3 should resolve to dept side");
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
-        // dept's dept_id is Integer (not_null); emp's dept_id is also
-        // Integer but nullable. The dept-side field is NOT NULL.
         assert!(!typed.resolved_schema.fields[0].nullable);
     }
 
     #[test]
     fn plan_id_unique_column_omits_qualifier() {
-        // When the column name is UNIQUE across both sides of a join,
-        // the qualifier must NOT be stamped — __td_jl/__td_jr are only
-        // in scope under alias-transparent rendering (Project-over-Join).
-        // Other shapes (Filter-over-Join → __td_filter, etc.) would
-        // break if the qualifier were present. Verify that `value`
-        // (unique to the left side emp) and `dept_name` (unique to the
-        // right side dept) resolve without qualifiers.
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("dept_id", 1)),
@@ -14302,7 +12686,6 @@ mod tests {
             vec![1],
             vec![2],
         );
-        // Filter above the join: references unique columns by plan_id.
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(joined),
             condition: Expression::Binary(BinaryExpression {
@@ -14331,10 +12714,6 @@ mod tests {
 
     #[test]
     fn plan_id_unknown_falls_back_to_legacy() {
-        // A plan_id that does not appear in any join's plan_id sets
-        // should fall through to the legacy name-only resolution.
-        // With a simple (non-join) scan, `id` with plan_id=99 resolves
-        // normally because there is exactly one `id` field.
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -14347,10 +12726,6 @@ mod tests {
 
     #[test]
     fn plan_id_under_plain_non_join_input_unaffected() {
-        // A plan_id-tagged ref under a non-join input (no join in tree)
-        // must resolve via the legacy path as long as the column is
-        // unambiguous. This verifies we do not error on plan_id when
-        // no join is present.
         let bt = base_types_with_emp_dept();
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(scan("emp")),
@@ -14363,14 +12738,6 @@ mod tests {
         let typed = analyze(filter, &bt).expect("plan_id with no join should resolve normally");
         assert_eq!(typed.resolved_schema.fields.len(), 4);
     }
-
-    // ── F13 — user-typed reserved qualifier must not panic ─────────────────
-    // `__td_jl`/`__td_jr` are analyzer-internal join-side markers, only ever
-    // scoped inside a join condition via
-    // `ResolveContext::for_join_condition`. A user typing them directly
-    // (outside a join condition, so `ctx.scoped_range` misses) must get a
-    // clean `UnknownColumn` — Spark itself raises `UNRESOLVED_COLUMN` for
-    // `col("__td_jl.x")` — never a panic.
 
     #[test]
     fn user_typed_td_jl_qualifier_is_unknown_column_not_panic() {
@@ -14387,8 +12754,6 @@ mod tests {
                 right: Box::new(int_lit(0)),
             }),
         });
-        // A returned Err (rather than a panic) is itself the regression
-        // proof for F13.
         let err = analyze(ast, &bt).expect_err("user-typed __td_jl qualifier must be rejected");
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
@@ -14424,15 +12789,6 @@ mod tests {
         }
     }
 
-    // ── Design 023 increment 1 — ORDER BY / aggregate-restatement resolution ──
-    // (analyzer.rs Sort arm; see `analyze_sort` / `rebind_sort_key` /
-    // `semantic_eq`). Covers Cluster A of `.agent-output/022-diagnostic-sql-
-    // corpus-reds.md`: a Sort key that restates a SELECT-list aggregate or
-    // expression, or references a base column the SELECT renamed, must bind
-    // back onto the matching child output rather than fail `UnknownColumn`.
-
-    /// Ascending, nulls-last sort key — the default shape needed by these
-    /// tests (direction/null-ordering are untouched by the fallback).
     fn asc_key(expr: Expression) -> SortOrder {
         SortOrder {
             expr: Box::new(expr),
@@ -14443,17 +12799,6 @@ mod tests {
 
     #[test]
     fn sort_aggregate_restatement_binds_onto_n8_wrapped_entry() {
-        // `SELECT dept_id, sum(salary) FROM emp GROUP BY dept_id
-        //  ORDER BY sum(salary)` — the ORDER BY key restates the unaliased
-        // aggregate. N8 already wrapped the unaliased `aggregates[1]` entry
-        // as `Alias(sum(salary), "sum(salary)")` during the Aggregate arm's
-        // own analysis (before the Sort is even reached). Step 1 (resolve
-        // against the Aggregate's OUTPUT) fails (`salary` is not an output
-        // column); the fallback re-resolves `sum(salary)` against the
-        // Aggregate's INPUT, matches `aggregates[1]` by `semantic_eq`
-        // (alias-stripped), and rewrites the key to a bare
-        // `ColumnReference("sum(salary)")` bound onto that already-named
-        // entry — read-only (N8: `bind_slot` never pins an alias itself).
         let bt = base_types_with_emp_dept();
         let sum_salary = || func("sum", vec![unresolved_col("salary")]);
         let agg = aggregate(
@@ -14496,12 +12841,6 @@ mod tests {
 
     #[test]
     fn sort_over_project_binds_renamed_column_alias_stripped() {
-        // `SELECT id AS customer_id FROM emp ORDER BY id` — no aggregate at
-        // all (q084 shape). `id` is not a Project output column (only
-        // `customer_id` is); the fallback resolves `id` against the
-        // Project's input, matches the (already-aliased) projection by
-        // `semantic_eq` (alias-stripped), and rewrites the key onto the
-        // existing alias without re-wrapping it.
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -14532,14 +12871,6 @@ mod tests {
 
     #[test]
     fn sort_over_project_binds_whole_expr_onto_n8_wrapped_entry() {
-        // `SELECT substr(name, 1, 3) FROM emp ORDER BY substr(name, 1, 3)`
-        // (q062/q079/q099 shape) — the ORDER BY key restates the whole
-        // unaliased projected expression verbatim. N8 already wrapped the
-        // unaliased projection as `Alias(substr(...), "substr(name, 1, 3)")`
-        // during the Project arm's own analysis. Falls back, resolves
-        // against the Project's input, matches by whole-expression
-        // `semantic_eq` (alias-stripped), and binds onto that already-named
-        // entry — read-only (N8: `bind_slot` never pins an alias itself).
         let bt = base_types_with_emp_dept();
         let substr_name = || {
             func(
@@ -14577,14 +12908,6 @@ mod tests {
 
     #[test]
     fn sort_count_star_over_global_aggregate_resolves_q096_shape() {
-        // tpcds-q096 shape: `SELECT count(*) FROM emp ORDER BY count(*)` —
-        // a GLOBAL aggregate (no GROUP BY). Step 1 succeeds (the Sort's
-        // input schema has exactly one column, `count(1)`, and the key
-        // resolves to it structurally) but the resolved key still contains
-        // an aggregate `FunctionCall` over an `Aggregate` child — fallback
-        // trigger (ii) — so it must be rebound to the child's own SELECT
-        // list rather than left as a restated aggregate call (which used to
-        // die at DuckDB's binder: "count(1) must appear in GROUP BY").
         let bt = base_types_with_emp_dept();
         let count_star = || {
             func(
@@ -14625,11 +12948,6 @@ mod tests {
 
     #[test]
     fn sort_by_existing_alias_is_unchanged_direct_path() {
-        // `SELECT sum(salary) AS total FROM emp GROUP BY dept_id ORDER BY
-        // total` — the ORDER BY key is already a plain reference to a
-        // SELECT alias, so step 1 succeeds directly against the Aggregate's
-        // OUTPUT and the key is not an aggregate `FunctionCall` itself
-        // (it's a bare column reference) — the fallback must never engage.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             emp_scan(),
@@ -14653,8 +12971,6 @@ mod tests {
             Expression::ColumnReference(c) => assert_eq!(c.name, "total"),
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
-        // The aggregate list is untouched — no rewrite ever happens on the
-        // direct path.
         match &input.op {
             TypedOp::Aggregate { aggregates, .. } => match &aggregates[1] {
                 Expression::Alias(a) => assert_eq!(a.alias, "total"),
@@ -14666,10 +12982,6 @@ mod tests {
 
     #[test]
     fn sort_by_plain_output_column_is_unchanged_direct_path() {
-        // `SELECT id, name FROM emp ORDER BY id` — a plain Project (no
-        // aggregate anywhere), ordering by a column that IS present in the
-        // Project's own output. Step 1 succeeds and the key has no
-        // aggregate `FunctionCall`, so the fallback never engages.
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -14696,12 +13008,6 @@ mod tests {
 
     #[test]
     fn sort_over_deduplicate_does_not_engage_fallback() {
-        // `Deduplicate` is neither `TypedOp::Aggregate` nor `TypedOp::Project`
-        // — `rebind_sort_key` must refuse to push resolution through it
-        // (matching Spark's own refusal to resolve a Sort key against
-        // anything but an Aggregate/Project child), surfacing the ORIGINAL
-        // `UnknownColumn` unchanged rather than silently binding to an
-        // unrelated column.
         let bt = base_types_with_emp_dept();
         let dedup = CommonAst::new(CommonOp::Deduplicate {
             input: Box::new(emp_scan()),
@@ -14725,9 +13031,6 @@ mod tests {
 
     #[test]
     fn sort_key_genuinely_unresolvable_still_errors_unknown_column() {
-        // No column of that name exists anywhere in the tree — the fallback
-        // must not conjure a match; the original `UnknownColumn` from step 1
-        // propagates unchanged.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             emp_scan(),
@@ -14755,13 +13058,6 @@ mod tests {
 
     #[test]
     fn sort_over_join_same_name_collision_binds_correct_output_column() {
-        // `SELECT e.dept_id AS a, d.dept_id AS b FROM emp e JOIN dept d ON
-        // e.dept_id = d.dept_id ORDER BY d.dept_id` — review HIGH fix
-        // regression guard. Both `emp` and `dept` carry a `dept_id` column;
-        // qualifier-stripped alone, `e.dept_id` and `d.dept_id` canonicalize
-        // identically, so the fallback MUST use the retained `expr_id` —
-        // both sides resolve against the identical join schema — to bind
-        // `ORDER BY d.dept_id` onto `b`, never onto `a`.
         let bt = base_types_with_emp_dept();
         let joined = join(
             aliased_scan("emp", "e"),
@@ -14802,27 +13098,8 @@ mod tests {
         }
     }
 
-    // ── Design 023 increment 2 — subtree promotion + trim Project ────────────
-    // (analyzer.rs `promote_subtree`; Sort arm in `analyze_node`). Covers the
-    // shapes increment 1's whole-key match leaves red: a hidden GROUP BY key
-    // never restated in SELECT (tpcds-q098), a Project input column never
-    // projected in any form (tpcds-q078), and the genuine "neither grouped
-    // nor aggregated" Spark error case.
-
     #[test]
     fn sort_promotes_missing_grouping_key_and_trims_q098_shape() {
-        // `SELECT name, sum(salary) FROM emp GROUP BY dept_id, name
-        //  ORDER BY dept_id` (tpcds-q098 shape) — `name` is folded/restated
-        // (N7: `aggregates` IS the complete output list) so the Aggregate's
-        // own schema is exactly `[name, sum(salary)]`; `dept_id` is a SECOND
-        // grouping key never restated anywhere in SELECT. Step 1 fails
-        // (`dept_id` is not an output field); increment 1's whole-key match
-        // also fails (no aggregate entry structurally equals `dept_id`);
-        // increment 2 promotes it — it structurally matches the
-        // Aggregate's OWN `grouping` list — by appending a new hidden
-        // `dept_id` entry to `aggregates` (and a matching field to the
-        // schema), then the Sort arm wraps the result in a trim `Project`
-        // restoring the original 2-column output.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             emp_scan(),
@@ -14881,7 +13158,6 @@ mod tests {
                 sort_ast.op
             );
         };
-        // The Sort's OWN schema is the EXTENDED (3-column) shape.
         assert_eq!(sort_ast.resolved_schema.len(), 3);
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
@@ -14910,21 +13186,6 @@ mod tests {
 
     #[test]
     fn sort_over_grouped_aggregate_whole_matches_folded_grouping_expression() {
-        // N7 new-arm case: a DataFrame-shaped Aggregate (`grouped_aggregate`)
-        // whose grouping key is a genuine EXPRESSION (`dept_id >= 40`, not a
-        // bare column) — `df.groupBy(F.col("dept_id") >= 40).agg(F.avg("salary"))`
-        // `ORDER BY` that same grouping expression restated verbatim.
-        //
-        // Contrast with `sort_promotes_missing_grouping_key_and_trims_q098_shape`
-        // above: there, the grouping key was ABSENT from `aggregates` (a
-        // pre-N7-shaped direct `CommonOp::Aggregate` construction), so the
-        // fallback had to PROMOTE a hidden entry and wrap a trim Project.
-        // Here, `grouped_aggregate` already folds the grouping expression
-        // into `aggregates[0]` at construction time (N7), so the whole-key
-        // match (increment 1) succeeds directly — no promoted hidden output,
-        // no trim Project: the Sort's Aggregate child schema is UNCHANGED
-        // (still 2 fields — the extended schema len equals the original),
-        // and the rewritten key binds onto position 0.
         let bt = base_types_with_emp_dept();
         let senior = || {
             Expression::Binary(BinaryExpression {
@@ -14949,7 +13210,6 @@ mod tests {
         let typed =
             analyze(ast, &bt).expect("grouping expression restatement must whole-match directly");
 
-        // NO trim Project — the Sort remains the top node.
         let TypedOp::Sort { input, order, .. } = &typed.op else {
             panic!(
                 "expected Sort with no trim Project wrapper, got {:?}",
@@ -14981,13 +13241,6 @@ mod tests {
 
     #[test]
     fn sort_promotes_project_hidden_column_and_trims_q078_shape() {
-        // `SELECT id, name FROM emp ORDER BY salary` (tpcds-q078 shape) —
-        // `salary` is present in the Project's INPUT but not projected in
-        // ANY form (not even renamed). Increment 1's whole-key match fails
-        // (no projection entry structurally equals `salary`); increment 2
-        // promotes it by pushing the bare `ColumnReference` itself onto
-        // `projections`, then the Sort arm wraps the result in a trim
-        // `Project` restoring the original 2-column output.
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -15047,14 +13300,6 @@ mod tests {
 
     #[test]
     fn sort_over_aggregate_non_grouping_non_aggregate_leftover_still_errors_unknown_column() {
-        // `SELECT dept_id FROM emp GROUP BY dept_id ORDER BY salary` —
-        // `salary` resolves against the Aggregate's own INPUT but is
-        // neither an aggregate-function argument nor a grouping expression
-        // anywhere; increment 2 must NOT invent a match for it. Confirmed
-        // against a live Spark 4.1.1 session that this shape raises
-        // `UNRESOLVED_COLUMN.WITH_SUGGESTION` — the SAME `UnknownColumn`
-        // class an ordinary unresolvable reference gets, NOT a distinct
-        // `MISSING_AGGREGATION`-style error.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             emp_scan(),
@@ -15080,12 +13325,6 @@ mod tests {
 
     #[test]
     fn sort_over_deduplicate_wrapping_aggregate_does_not_reach_through_to_grouping_key() {
-        // `Deduplicate` over an `Aggregate` whose OWN grouping key WOULD
-        // satisfy increment 2's subtree promotion if the fallback could
-        // reach through it — proving the barrier holds even when the
-        // nested shape is otherwise a perfect match, not merely when the
-        // column is bogus everywhere (see
-        // `sort_over_deduplicate_does_not_engage_fallback`).
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             emp_scan(),
@@ -15112,13 +13351,6 @@ mod tests {
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
     }
-
-    // ── N4: binary-coercion materialization — `resolve_and_stamp` wiring ──
-    // `materialize_binary_coercions` itself is unit-tested directly in
-    // `expression.rs`; these exercise the `Expression::Binary` /
-    // `Expression::Cast(c) if c.implicit` arms wired into `resolve_and_stamp`
-    // — idempotency (fixpoint on re-resolution), naming transparency, and
-    // `semantic_eq` transparency.
 
     #[test]
     fn resolve_and_stamp_div_widen_materialization_is_idempotent() {
@@ -15272,10 +13504,6 @@ mod tests {
         );
     }
 
-    /// Review-pinned negative guard: a USER-written cast (`implicit: false`)
-    /// must NOT be stripped by `semantic_eq`'s canonicalization — only N4's
-    /// materialized casts are transparent. Guards against a future
-    /// accidental widening of the strip condition.
     #[test]
     fn semantic_eq_does_not_strip_user_written_cast() {
         let bare = UnresolvedColumn::bare("i");
@@ -15321,19 +13549,8 @@ mod tests {
         );
     }
 
-    // ── N8: Project/Aggregate/Pivot output-list entries are `NamedExpression`s ──
-    // (analyzer.rs `ensure_named`, wired into the `Project` / `Aggregate` /
-    // `Pivot` analysis arms; `bind_slot` made read-only). Mirrors Spark's
-    // `UnresolvedAlias` → `Alias` resolution: every non-`Star`, non-bare-ref
-    // output-list entry carries its schema name on the tree itself.
-
     #[test]
     fn project_computed_entry_wrapped_named_schema_unchanged() {
-        // `SELECT id, dept_id + 1 FROM emp` — N8 wraps the unaliased Binary
-        // entry in `Alias(_, "(dept_id + 1)")`, the exact name
-        // `expression_output_name` would have produced pre-N8. The wrap must
-        // not perturb the computed schema field at all — same name/type/
-        // nullable as resolving the RAW expression directly would produce.
         let bt = base_types_with_emp_dept();
         let computed = || {
             Expression::Binary(BinaryExpression {
@@ -15342,8 +13559,6 @@ mod tests {
                 right: Box::new(int_lit(1)),
             })
         };
-        // Pre-N8 baseline: the field a direct (unwrapped) resolve-and-stamp
-        // of `computed()` would stamp, independent of the Project arm's wrap.
         let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
         let ctx = ResolveContext::of_input(&scanned, &bt, None);
         let baseline_resolved = resolve_and_stamp(computed(), &ctx).expect("baseline resolves");
@@ -15369,12 +13584,6 @@ mod tests {
 
     #[test]
     fn aggregate_folded_grouping_clone_wrapped_grouping_copy_stays_bare() {
-        // `df.groupBy(F.col("dept_id") + 1).agg(F.avg("salary"))` — N7 folds
-        // the grouping expression into `aggregates[0]` at construction time
-        // (`grouped_aggregate`), cloning the SAME expression into both lists.
-        // N8 wraps the `aggregates` copy (an output-list entry, unaliased)
-        // but must leave the `grouping` copy bare — it is the internal GROUP
-        // BY key list, not an output list.
         let bt = base_types_with_emp_dept();
         let bump = || {
             Expression::Binary(BinaryExpression {
@@ -15416,11 +13625,6 @@ mod tests {
 
     #[test]
     fn ensure_named_idempotent_over_alias_bare_ref_and_star() {
-        // N8: `ensure_named` must be a no-op over shapes that are already
-        // `NamedExpression`s — an existing `Alias` (idempotent, never
-        // double-wrapped), a bare (possibly qualified) `ColumnReference`
-        // (Spark parity: a passthrough column has no `UnresolvedAlias` to
-        // resolve), and `Star` (expands later; never itself named).
         let aliased = Expression::Alias(AliasExpression {
             expr: Box::new(unresolved_col("id")),
             alias: "renamed".to_owned(),
@@ -15442,10 +13646,6 @@ mod tests {
 
     #[test]
     fn ensure_named_implicit_cast_aliased_with_inner_pretty_name() {
-        // N4: an `implicit` Cast is analyzer-materialized (never itself part
-        // of what Spark would name); N8 must alias it using the INNER
-        // expression's pretty name, transparently through the wrapper —
-        // never a `CAST(...)`-shaped name.
         let inner = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
             left: Box::new(unresolved_col("age")),
@@ -15477,19 +13677,6 @@ mod tests {
 
     #[test]
     fn sort_rebind_binds_wrapped_entry_and_leaves_bare_entry_unmutated() {
-        // N8's `bind_slot` is READ-ONLY: it never re-aliases an existing
-        // `aggregates` entry to "pin" the sort key's binding, because every
-        // `aggregates` entry is ALREADY a `NamedExpression` by construction
-        // (the Aggregate arm's own N8 wrap runs before the Sort is ever
-        // analyzed).
-        // `SELECT dept_id, avg(salary) FROM emp e GROUP BY dept_id
-        //  ORDER BY e.dept_id, avg(salary)` — two ORDER BY keys:
-        //   - `e.dept_id` (qualified) whole-key-matches the BARE `dept_id`
-        //     restatement (`aggregates[0]`) — must remain a bare
-        //     `ColumnReference` (not wrapped) after the Sort's own analysis.
-        //   - unaliased `avg(salary)` whole-key-matches the entry N8 ALREADY
-        //     wrapped as `Alias(avg(salary), "avg(salary)")` during the
-        //     Aggregate arm's own analysis — `bind_slot` merely reads it.
         let bt = base_types_with_emp_dept();
         let avg_salary = || func("avg", vec![unresolved_col("salary")]);
         let agg = aggregate(
@@ -15540,19 +13727,8 @@ mod tests {
         }
     }
 
-    /// N8 invariant checker: every `Project`/`Aggregate`/`Pivot`(`grouping`)
-    /// output-list entry must be a `NamedExpression` — a bare
-    /// `ColumnReference`, a `Star`, or an `Alias` whose `alias` matches the
-    /// corresponding schema field's name — recursing into each node's own
-    /// child. Deliberately NOT exhaustive over every `TypedOp` variant (a
-    /// targeted regression guard over representative plans below, not a
-    /// generic tree walker); an unlisted variant is a no-op leaf here.
     fn assert_n8_output_list_invariant(ti: &TypedAst) {
         fn assert_entries(entries: &[Expression], schema: &ResolvedSchema, ctx: &str) {
-            // A `Star` entry expands to a variable number of schema fields —
-            // this checker only enforces the per-entry SHAPE invariant for a
-            // node containing one, skipping the 1:1 positional name check
-            // (none of the representative plans below carry a `Star`).
             let has_star = entries.iter().any(|e| matches!(e, Expression::Star(_)));
             for e in entries {
                 match e {
@@ -15596,8 +13772,6 @@ mod tests {
             TypedOp::Pivot {
                 input, grouping, ..
             } => {
-                // `grouping` is only a PREFIX of the output schema (the
-                // pivot-value columns follow) — check against that prefix.
                 let prefix =
                     ResolvedSchema::new(ti.resolved_schema.fields[..grouping.len()].to_vec());
                 assert_entries(grouping, &prefix, "Pivot grouping");
@@ -15612,7 +13786,6 @@ mod tests {
     fn n8_invariant_holds_over_representative_plans() {
         let bt = base_types_with_emp_dept();
 
-        // LCA (Lateral Column Alias): every entry already aliased.
         let raised = alias_expr(
             Expression::Binary(BinaryExpression {
                 op: BinaryOp::Mul,
@@ -15635,7 +13808,6 @@ mod tests {
         });
         assert_n8_output_list_invariant(&analyze(lca_ast, &bt).expect("LCA analyzes"));
 
-        // `inline(...)` expansion (Pass 90).
         let inline_ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![
@@ -15645,7 +13817,6 @@ mod tests {
         });
         assert_n8_output_list_invariant(&analyze(inline_ast, &bt).expect("inline expands"));
 
-        // `json_tuple(...)` expansion (Pass 91).
         let json_bt = base_types_with_raw();
         let json_ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("raw")),
@@ -15656,7 +13827,6 @@ mod tests {
         });
         assert_n8_output_list_invariant(&analyze(json_ast, &json_bt).expect("json_tuple expands"));
 
-        // `stack(...)` multi-alias expansion (piv-006, Pass 60).
         let stack_call = func(
             "stack_multi_alias",
             vec![
@@ -15670,9 +13840,6 @@ mod tests {
         });
         assert_n8_output_list_invariant(&analyze(stack_ast, &bt).expect("stack expands"));
 
-        // Promote-hidden-entry (design 023 increment 2, tpcds-q098 shape):
-        // a Sort promoting a hidden grouping key wraps the Aggregate in a
-        // trim Project.
         let promote_agg = aggregate(
             emp_scan(),
             vec![unresolved_col("dept_id"), unresolved_col("name")],
@@ -15691,7 +13858,6 @@ mod tests {
             &analyze(promote_ast, &bt).expect("hidden grouping key promotes"),
         );
 
-        // Pivot, explicit (computed) grouping.
         let pivot_ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(emp_scan()),
             grouping: PivotGrouping::Explicit(vec![Expression::Binary(BinaryExpression {
@@ -15708,16 +13874,8 @@ mod tests {
         );
     }
 
-    // ── N9 INCREMENT 1 — attribute-identity carriage contracts ──────────
-    // (g) (`Attribute`/`ResolvedSchema` `PartialEq` excludes `expr_id`) lives
-    // in `schema.rs`'s own test module, next to the types it exercises.
-    // These six pin the analyzer-side MINT-vs-COPY/passthrough contracts.
-
     #[test]
     fn passthrough_filter_over_scan_preserves_input_attribute_ids() {
-        // (a) A pure passthrough operator (Filter, via `passthrough_schema_arm`)
-        // must carry its input's attribute ids through UNCHANGED — same ids,
-        // same order, zero re-minting.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Filter {
             input: Box::new(emp_scan()),
@@ -15747,10 +13905,6 @@ mod tests {
 
     #[test]
     fn project_bare_ref_copies_id_alias_computed_entry_mints_fresh_id() {
-        // (b) A bare, unaliased `ColumnReference` projection entry COPIES its
-        // source attribute's id (same logical column, merely re-listed); an
-        // `Alias`/computed entry MINTS a fresh one (a genuinely new column) —
-        // see `output_attribute`'s doc comment for the exact rule.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -15785,11 +13939,6 @@ mod tests {
 
     #[test]
     fn inner_join_output_schema_concatenates_both_sides_ids_in_order() {
-        // (c) A plain (non-USING, non-SEMI/ANTI) join's output schema is
-        // `ResolvedSchema::merge(left, right)` — left's ids then right's ids,
-        // in order, through `analyze_join`'s real machinery (not just the
-        // low-level `ResolvedSchema::merge` unit, which `schema.rs` already
-        // covers directly).
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -15827,21 +13976,6 @@ mod tests {
 
     #[test]
     fn sort_hidden_promotion_q078_shape_preserves_ids_through_restamp_and_trim_project() {
-        // (d) THE ABORT-LANDMINE REGRESSION TEST. Same AST shape as
-        // `sort_promotes_project_hidden_column_and_trims_q078_shape`:
-        // `SELECT id, name FROM emp ORDER BY salary` — `salary` is promoted
-        // (design-023 increment 2, the pre-existing Pass-27 hidden-output
-        // mechanism — not an N9 increment) into the Project's own projections, growing its
-        // schema from 2 to 3 columns; `analyze_sort` then unconditionally
-        // re-stamps `ti` via `mem::replace` + `TypedAst::new` (INV2 scope
-        // re-derivation), and a trim `Project` restores the original
-        // 2-column shape on top.
-        //
-        // The landmine: `mem::replace`-and-reconstruct is exactly the shape
-        // of code that could accidentally re-derive (re-mint) a schema
-        // instead of moving it verbatim. This test proves it does NOT:
-        // the pre-existing `id`/`name` ids survive both the re-stamp AND
-        // the trim-Project's own COPY, unchanged end to end.
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_scan()),
@@ -15873,8 +14007,6 @@ mod tests {
                 sort_ast.op
             );
         };
-        // The extended (3-column) Project's own input (the TableScan) is the
-        // ultimate donor of `id`/`name`'s ids, via bare-ref COPY.
         let TypedOp::Project {
             input: scan_ast, ..
         } = &proj_ast.op
@@ -15892,35 +14024,15 @@ mod tests {
             .expect("emp scan has name")
             .expr_id;
 
-        // The extended Project's OWN 3-column schema still carries the
-        // scan's ids for its first two, un-promoted columns.
         assert_eq!(proj_ast.resolved_schema.fields[0].expr_id, scan_id);
         assert_eq!(proj_ast.resolved_schema.fields[1].expr_id, scan_name);
 
-        // `analyze_sort`'s `mem::replace` re-stamp only re-derives `scope` —
-        // the Sort node's OWN schema (same 3-column extended shape) must
-        // carry the EXACT SAME ids, unchanged by the re-stamp.
         assert_eq!(sort_ast.resolved_schema.fields[0].expr_id, scan_id);
         assert_eq!(sort_ast.resolved_schema.fields[1].expr_id, scan_name);
 
-        // The trim Project's own (outer, 2-column) schema — built from bare
-        // `ColumnReference`s pointing at the extended schema's first two
-        // positions — COPIES those same ids: the trim-Project's prefix
-        // carries the SAME ids as the extended schema's prefix.
         assert_eq!(typed.resolved_schema.fields[0].expr_id, scan_id);
         assert_eq!(typed.resolved_schema.fields[1].expr_id, scan_name);
 
-        // N9 increment 3 (NEW test item 1): the SAME growth-through-restamp
-        // path must carry `source_quals` BY VALUE, not just `expr_id`. The
-        // bare `emp` scan (unaliased) seeds `{"emp"}` for every column;
-        // `analyze_sort` no longer rebuilds `ti.resolved_schema` at all (the
-        // unconditional re-stamp is gone, replaced by a `debug_assert_eq!`
-        // proof), so the Sort's OWN schema is bit-for-bit the SAME Vec the
-        // Project analysis produced — including the promoted `salary` entry,
-        // which is `promote_subtree`'s `SortChild::Project` bare-
-        // `ColumnReference` COPY branch (clones straight from
-        // `input_schema`, same precedent as `output_attribute`), so it
-        // carries the scan's real lineage forward too, not an empty mint.
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
         assert_eq!(
             quals_of(&sort_ast.resolved_schema),
@@ -15934,18 +14046,10 @@ mod tests {
         );
     }
 
-    // ── N9 increment 3 — direct `output_attribute` unit tests ────────────
-    // (items 2/3 of the increment's test list): the COPY branch's qualifier
-    // insertion and the MINT branch's empty lineage, pinned directly rather
-    // than only indirectly through a full `analyze()` walk.
-
     #[test]
     fn output_attribute_copy_branch_inserts_reference_qualifier() {
         let bt = base_types_with_emp_dept();
         let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
-        // A resolved, identity-bound reference to "dept_id" (index 2 in
-        // emp's schema — id, name, dept_id, salary) carrying an explicit
-        // qualifier "e", as `resolve_column` would stamp for `e.dept_id`.
         let field = scanned
             .resolved_schema
             .field_by_name("dept_id")
@@ -15958,9 +14062,6 @@ mod tests {
             expr_id: Some(field.expr_id),
         });
         let attr = output_attribute(&cr, &scanned.resolved_schema);
-        // The bare scan already seeds `{"emp"}` (table name, no alias); the
-        // COPY branch additionally INSERTS the reference's own stamped
-        // qualifier alongside it.
         let expected: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
         assert_eq!(attr.source_quals, expected);
         assert_eq!(
@@ -15973,9 +14074,6 @@ mod tests {
     fn output_attribute_mint_branch_has_empty_quals() {
         let bt = base_types_with_emp_dept();
         let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
-        // A computed expression (not a bare passthrough ColumnReference)
-        // takes the MINT branch — a freshly created column inherits no
-        // lineage at all, matching F8/filt-019.
         let computed = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
             left: Box::new(unresolved_col("dept_id")),
@@ -15989,11 +14087,6 @@ mod tests {
 
     #[test]
     fn source_quals_using_join_right_only_donor_still_unions_both_sides_quals() {
-        // ADR-023 3e-i, RIGHT-donor shape: a RIGHT USING join donates the
-        // KEY's value/id from the RIGHT side (`build_using_prefix`'s
-        // `(JoinType::Right, _, Some(rf)) => rf.clone()` arm) — but the
-        // key's LINEAGE must still be the UNION of both sides (a USING key
-        // is referenceable via either alias), not just the donor side's.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -16022,22 +14115,6 @@ mod tests {
 
     #[test]
     fn sort_promotes_missing_grouping_key_mints_empty_lineage_not_inherited() {
-        // N9 increment 3, N7-traceability follow-up (test item 5): sibling
-        // of `sort_promotes_missing_grouping_key_and_trims_q098_shape`. The
-        // promoted `dept_id` entry IS structurally a bare passthrough
-        // `ColumnReference` into the (aliased, tracked) input — a source
-        // that DOES carry real lineage (`{"emp", "e"}`) — yet
-        // `promote_subtree`'s `SortChild::Aggregate` arm (`promote_hidden_
-        // alias`) unconditionally MINTS a fresh `Attribute` for every
-        // newly-promoted entry (never clone-derives from `input_schema`,
-        // unlike `output_attribute`'s COPY branch or the `SortChild::Project`
-        // arm's bare-ref COPY). Current behavior: the promoted grouping
-        // key's lineage is EMPTY, exactly as if it had been a freshly
-        // created column — NOT inherited from its source, even though it
-        // structurally passes the source through unmodified. This is the
-        // "created, not copied" outcome; documented here as current behavior
-        // rather than changed, since widening the Aggregate arm to COPY is
-        // out of this increment's scope.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             aliased_scan("emp", "e"),
@@ -16072,7 +14149,6 @@ mod tests {
         let TypedOp::Aggregate { .. } = &agg_ast.op else {
             panic!("expected Aggregate under the Sort, got {:?}", agg_ast.op);
         };
-        // The promoted `dept_id` is the THIRD (hidden) schema field.
         assert_eq!(agg_ast.resolved_schema.len(), 3);
         assert_eq!(agg_ast.resolved_schema.fields[2].name, "dept_id");
         assert!(
@@ -16084,11 +14160,6 @@ mod tests {
 
     #[test]
     fn push_setop_casts_preserves_childs_own_id_not_the_widened_donor_id() {
-        // (e) `push_setop_casts` overwrites a `Project` child's schema
-        // name/type/nullable POSITIONALLY from the widened schema, but must
-        // KEEP the child's OWN id — copying the widened (child-0-derived)
-        // schema's id into every other child would silently reassign that
-        // child's column identity to child 0's.
         let input = TypedAst::new(
             TypedOp::TableScan {
                 table: "dept".to_owned(),
@@ -16117,20 +14188,13 @@ mod tests {
 
         push_setop_casts(&mut child, &widened_schema);
 
-        // Name/type overwritten positionally from the widened schema...
         assert_eq!(child.resolved_schema.fields[0].data_type, DataType::Long);
-        // ...but the id is UNCHANGED — still this child's OWN id, never the
-        // widened (donor) schema's id.
         assert_eq!(child.resolved_schema.fields[0].expr_id, child_id);
         assert_ne!(child.resolved_schema.fields[0].expr_id, widened_id);
     }
 
     #[test]
     fn widen_by_position_output_schema_carries_child_zero_ids() {
-        // (f) The widened schema `analyze_set_op` stamps as the `SetOp`
-        // node's OWN `resolved_schema` carries child 0's ids — child 0 is
-        // the identity donor at every column position (see `widen_by_position`'s
-        // doc comment).
         let left = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
@@ -16152,16 +14216,8 @@ mod tests {
         );
     }
 
-    // ── N9 INCREMENT 2 — references carry identity; semantic_eq uses it ──
-
     #[test]
     fn semantic_eq_rejects_same_name_different_join_side_ids() {
-        // Wrong-column witness: two `ColumnReference`s named "x", canonicalizing
-        // to the IDENTICAL qualifier-stripped/case-folded shape (e.g. `t1.x`
-        // and `t2.x` after a self-join), but bound to DIFFERENT `expr_id`s —
-        // the process-global identity distinguishing which side each actually
-        // resolved to. `semantic_eq` must not conflate them just because their
-        // canonical shapes are structurally `==`.
         let id_a = ExprId::fresh();
         let id_b = ExprId::fresh();
         assert_ne!(id_a, id_b);
@@ -16188,14 +14244,6 @@ mod tests {
 
     #[test]
     fn rebind_over_aggregate_binds_correct_duplicate_name_slot_by_id() {
-        // agg-026-like shape: a self-join (`emp e JOIN emp d`) restates
-        // `dept_id` from BOTH sides in the SAME `aggregates` list — two
-        // entries that are literally named "dept_id" and canonicalize
-        // IDENTICALLY, distinguished only by `expr_id` — this is a
-        // duplicate-name REGRESSION guard, not the id-is-strictly-necessary
-        // witness above. `ORDER BY d.dept_id`'s rebind must bind onto the
-        // `d`-side entry, not silently fall through to the first same-named
-        // `e`-side entry.
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -16209,7 +14257,6 @@ mod tests {
             Some(cond),
         );
         let child_input = analyze(joined_ast, &bt).expect("self-join analyzes");
-        // emp_schema: id, name, dept_id, salary — e's dept_id at 2, d's at 6.
         let e_field = child_input.resolved_schema.fields[2].clone();
         let d_field = child_input.resolved_schema.fields[6].clone();
         assert_eq!(e_field.name, "dept_id");
@@ -16258,22 +14305,11 @@ mod tests {
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
-        // No duplicate append: still exactly the two original entries.
         assert_eq!(aggregates.len(), 2);
     }
 
     #[test]
     fn self_join_left_right_resolved_schema_ids_are_disjoint() {
-        // N10-lite STAGE 2 disjointness pin (join-009 shape:
-        // `emp.alias("e").join(emp.alias("m"), ...)`) — a self-join over the
-        // SAME underlying table via two DISTINCT aliases. Stage 2's key
-        // swap (`requalify_column_ref` binding by `expr_id` instead of the
-        // stamped ordinal) is sound only if a join's left and right sides
-        // can NEVER share an `expr_id`: each `AliasedRelation`/`TableScan`
-        // leaf mints a FRESH id per ADR-024, so two independently scanned
-        // sides of one join must carry wholly disjoint id sets even when
-        // they scan the identical table. If this pin ever fails, stage 2's
-        // key swap is unsound and must abort (see the task's abort path).
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -16312,14 +14348,6 @@ mod tests {
 
     #[test]
     fn second_order_by_key_binds_by_id_to_already_promoted_entry_no_duplicate_append() {
-        // `SELECT dept_id FROM emp GROUP BY dept_id ORDER BY avg(salary),
-        //  avg(salary)` — the FIRST `avg(salary)` key is not in the
-        // Aggregate's own SELECT list, so increment 2 promotes it into
-        // `aggregates` as a fresh hidden output column. The SECOND,
-        // syntactically identical key re-resolves `salary` against the
-        // SAME child input (deterministically the SAME `expr_id`), and must
-        // bind (via `ids_compatible`) onto that SAME appended entry rather
-        // than promoting a second, duplicate hidden column.
         let bt = base_types_with_emp_dept();
         let avg_salary = || func("avg", vec![unresolved_col("salary")]);
         let agg = aggregate(
@@ -16358,8 +14386,6 @@ mod tests {
         let TypedOp::Aggregate { aggregates, .. } = &agg_ast.op else {
             panic!("expected Aggregate under the Sort, got {:?}", agg_ast.op);
         };
-        // Exactly ONE hidden column was appended (dept_id + one avg(salary)),
-        // not two — the second key deduped onto the first's promotion.
         assert_eq!(
             aggregates.len(),
             2,
@@ -16382,12 +14408,6 @@ mod tests {
 
     #[test]
     fn tier_g_correlated_outer_ref_stamps_outer_expr_id() {
-        // D2: tier-(g) correlated outer references now stamp the MATCHED
-        // OUTER attribute's `expr_id` (see `resolve_column`'s tier-(g) arm /
-        // `resolve_in_outer`) — the counterpart of N9 increment 2's freeze,
-        // which this test used to pin as `expr_id: None`. Assert the
-        // stamped id equals the outer plan's resolved `salary` attribute's
-        // id, read directly off the outer plan's own resolved schema.
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
@@ -16425,8 +14445,6 @@ mod tests {
             .field_by_name("salary")
             .expect("outer plan (alias `e` over `emp`) must resolve a `salary` attribute")
             .expr_id;
-        // A bare scalar subquery projection gets auto-aliased (`AS expr`) by
-        // the Project arm — unwrap it to reach the ScalarSubquery itself.
         let unaliased = match &projections[0] {
             Expression::Alias(a) => a.expr.as_ref(),
             other => other,
@@ -16465,10 +14483,6 @@ mod tests {
 
     #[test]
     fn canonicalize_for_semantic_eq_preserves_expr_id() {
-        // Anti-regression for `canonicalize_for_semantic_eq`'s
-        // `ColumnReference` arm: if a future edit re-normalizes `expr_id`
-        // back to `None` there, `ids_compatible` silently degrades to
-        // always-`true` for every comparison — this must catch that.
         let id = ExprId::fresh();
         let c = Expression::ColumnReference(ColumnReference {
             name: "X".to_owned(),
@@ -16491,14 +14505,6 @@ mod tests {
         }
     }
 
-    // ── name_fold (finding 3, case-folding unification) analyzer parity ──
-
-    /// Schema `{É}`: `select("é")` resolves AND `drop("é")` drops the SAME
-    /// attribute — both `Project`'s unresolved-column lookup and
-    /// `DropColumns`'s key-fold must agree with `eq_fold`/`fold_key`
-    /// (`name_fold`), closing the finding-3 split where `drop` (Unicode
-    /// fold) and `select` (ASCII-only fold) used to disagree on this exact
-    /// column.
     #[test]
     fn unicode_column_select_and_drop_agree_via_name_fold() {
         let bt = base_types_for(&[(
@@ -16512,12 +14518,6 @@ mod tests {
         });
         let typed = analyze(select_ast, &bt).expect("select(\"é\") should resolve `É`");
         assert_eq!(typed.resolved_schema.len(), 1);
-        // `resolve_column`/`expression_output_name` carry the AS-TYPED name
-        // on an unaliased `ColumnReference` (pre-existing, unrelated to this
-        // case-fold unification — every `resolve_column` arm stamps
-        // `name: u.name`), not the schema's declared casing. The identity
-        // proof this test cares about is that `drop("é")` below removes the
-        // SAME physical attribute `select("é")` resolved here.
         assert_eq!(typed.resolved_schema.fields[0].name, "é");
 
         let drop_ast = CommonAst::new(CommonOp::DropColumns {

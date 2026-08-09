@@ -16,11 +16,8 @@ use tonic::transport::Server;
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServiceServer;
 use crate::service::ThunderduckService;
 
-// Include proto-generated code.
 pub mod proto {
     pub mod spark {
-        // Generated prost types mirror the upstream .proto message shapes
-        // verbatim; we don't control their enum variant sizes.
         #[allow(clippy::large_enum_variant)]
         pub mod connect {
             tonic::include_proto!("spark.connect");
@@ -72,8 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Reject any THUNDERDUCK_COMPAT_MODE=relaxed at startup so users discover the
-    // change loudly; "strict" and "auto" are accepted as deprecated no-ops.
+    // Reject the removed relaxed compatibility mode at startup.
     match std::env::var("THUNDERDUCK_COMPAT_MODE")
         .unwrap_or_default()
         .to_lowercase()

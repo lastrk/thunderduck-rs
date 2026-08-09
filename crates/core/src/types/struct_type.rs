@@ -93,8 +93,7 @@ mod tests {
         assert!(s.field_by_name("missing").is_none());
     }
 
-    /// Non-ASCII fold agreement (item 2 / E3): `field_by_name` now folds via
-    /// `name_fold::eq_fold` (JDK `equalsIgnoreCase`-shaped), not
+    /// Non-ASCII names use the same JDK-shaped fold as analyzer lookups, not
     /// `eq_ignore_ascii_case` — so accented and Kelvin-sign field names
     /// resolve the same way the analyzer's user-identifier lookups do.
     #[test]
@@ -103,9 +102,7 @@ mod tests {
             StructField::nullable("É", DataType::String),
             StructField::nullable("\u{212A}", DataType::String), // KELVIN SIGN
         ]);
-        // "É"/"é" — an ASCII-only fold would miss this; JDK-shaped eq_fold matches.
         assert!(s.field_by_name("é").is_some());
-        // KELVIN SIGN vs plain "k" — from name_fold's DIVERGENCE_TABLE.
         assert!(s.field_by_name("k").is_some());
     }
 }

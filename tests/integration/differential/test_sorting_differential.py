@@ -22,9 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # Null Ordering Tests
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -112,9 +110,7 @@ class TestNullOrdering:
         assert_dataframes_equal(ref, td, "string_nulls_first")
 
 
-# =============================================================================
 # Multi-Column Sorting Tests
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -200,9 +196,7 @@ class TestMultiColumnSorting:
         assert_dataframes_equal(ref, td, "three_column_sort")
 
 
-# =============================================================================
 # Edge Cases
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -284,9 +278,7 @@ class TestSortingEdgeCases:
         assert_dataframes_equal(ref, td, "sort_single_row")
 
 
-# =============================================================================
 # ORDER BY hidden-output resolution (design 023) — review-found regressions
-# =============================================================================
 
 
 @pytest.mark.differential

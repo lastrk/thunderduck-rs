@@ -9,28 +9,22 @@
 
 require thdck_spark_funcs
 
-# -----------------------------------------------------------------------------
-# Return type and seed semantics
-# -----------------------------------------------------------------------------
 
 query I
 SELECT typeof(spark_xxhash64(1::INTEGER));
 ----
 BIGINT
 
-# Zero args returns the initial seed (42L)
 query I
 SELECT spark_xxhash64();
 ----
 42
 
-# A single NULL leaves the seed unchanged
 query I
 SELECT spark_xxhash64(NULL::INTEGER);
 ----
 42
 
-# Multiple NULLs of various types — all skipped
 query I
 SELECT spark_xxhash64(NULL::BIGINT, NULL::VARCHAR, NULL::DOUBLE);
 ----
@@ -44,19 +38,13 @@ SELECT spark_xxhash64(1::INTEGER, NULL::INTEGER, 2::INTEGER) = spark_xxhash64(1:
 ----
 true
 
-# -----------------------------------------------------------------------------
-# Spark documentation golden — primary parity oracle
 # https://spark.apache.org/docs/latest/api/sql/index.html#xxhash64
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_xxhash64('Spark', [123]::INTEGER[], 2::INTEGER);
 ----
 5602566077635097486
 
-# -----------------------------------------------------------------------------
-# Per-type goldens
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_xxhash64(TRUE);
@@ -68,15 +56,12 @@ SELECT spark_xxhash64(FALSE);
 ----
 3614696996920510707
 
-# bool true folds as int32 1 — same as INTEGER 1 / TINYINT 1 / SMALLINT 1
 query II
 SELECT spark_xxhash64(TRUE) = spark_xxhash64(1::INTEGER),
        spark_xxhash64(1::INTEGER) = spark_xxhash64(1::TINYINT);
 ----
 true	true
 
-# bool false folds as int32 0 — same as INTEGER 0 / FLOAT 0.0 (raw bits 0) /
-# DATE 1970-01-01 (days=0)
 query III
 SELECT spark_xxhash64(FALSE) = spark_xxhash64(0::INTEGER),
        spark_xxhash64(0::INTEGER) = spark_xxhash64(0.0::FLOAT),
@@ -99,7 +84,6 @@ SELECT spark_xxhash64((-1)::INTEGER);
 ----
 2017008487422258757
 
-# Sign-extension: SMALLINT -1 == INTEGER -1
 query I
 SELECT spark_xxhash64((-1)::SMALLINT) = spark_xxhash64((-1)::INTEGER);
 ----
@@ -115,7 +99,8 @@ SELECT spark_xxhash64((-1)::BIGINT);
 ----
 3858142552250413010
 
-# NaN canonicalization: any NaN -> 0x7FC00000 (FLOAT) / 0x7FF8000000000000 (DOUBLE)
+# NaNs use Java's canonical FLOAT (0x7FC00000) and DOUBLE (0x7FF8000000000000)
+# bit patterns before entering the byte/integer hash path.
 query I
 SELECT spark_xxhash64('nan'::FLOAT);
 ----
@@ -131,7 +116,6 @@ SELECT spark_xxhash64(1.5::DOUBLE);
 ----
 7738255526519901366
 
-# Strings: empty + boundary lengths (32 / 33 cross the XXH64 stripe loop)
 query I
 SELECT spark_xxhash64('');
 ----
@@ -157,7 +141,6 @@ SELECT spark_xxhash64('abcdefghijklmnopqrstuvwxyz0123456');
 ----
 1134088583240772182
 
-# Timestamp epoch (micros = 0) — same fold as BIGINT 0
 query I
 SELECT spark_xxhash64(TIMESTAMP '1970-01-01 00:00:00') = spark_xxhash64(0::BIGINT);
 ----
@@ -168,7 +151,8 @@ SELECT spark_xxhash64(TIMESTAMP '1970-01-01 00:00:00');
 ----
 -5252525462095825812
 
-# Decimal: precision <= 18 (long path) vs precision > 18 (BigInteger bytes path)
+# DECIMAL precision <=18 hashes the unscaled long; wider DECIMAL hashes
+# BigInteger.toByteArray(unscaledValue).
 query I
 SELECT spark_xxhash64(123.45::DECIMAL(5,2));
 ----
@@ -179,9 +163,6 @@ SELECT spark_xxhash64(123456789012345.6789::DECIMAL(38,4));
 ----
 6291565527293009989
 
-# -----------------------------------------------------------------------------
-# Nested types
-# -----------------------------------------------------------------------------
 
 # Spark invariant: array(1, 2) folds the same as columns (1, 2).
 query I
@@ -200,7 +181,6 @@ SELECT spark_xxhash64([1, NULL, 2]::INTEGER[]) = spark_xxhash64([1, 2]::INTEGER[
 ----
 true
 
-# Empty list and NULL list both contribute nothing
 query I
 SELECT spark_xxhash64([]::INTEGER[]);
 ----
@@ -211,31 +191,24 @@ SELECT spark_xxhash64(NULL::INTEGER[]);
 ----
 42
 
-# STRUCT: field names not hashed, only values; null fields skipped
 query I
 SELECT spark_xxhash64({'a': 1::INTEGER, 'b': 'hello'});
 ----
 -2644647410986480234
 
-# MAP
 query I
 SELECT spark_xxhash64(MAP {1::INTEGER: 'a', 2::INTEGER: 'b'});
 ----
 8744364272684979380
 
-# -----------------------------------------------------------------------------
-# Multi-column seed chaining
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_xxhash64(1::INTEGER, 2::BIGINT, 'hello');
 ----
 5198346398884226828
 
-# -----------------------------------------------------------------------------
-# Vectorized batch (per-row independence)
-# -----------------------------------------------------------------------------
 
+# Each output row starts from seed 42 and folds only its own selected input row.
 query II
 SELECT i, spark_xxhash64(i::BIGINT) FROM range(3) t(i);
 ----
@@ -243,9 +216,7 @@ SELECT i, spark_xxhash64(i::BIGINT) FROM range(3) t(i);
 1	-7001672635703045582
 2	-3341702809300393011
 
-# -----------------------------------------------------------------------------
 # Unsupported types throw at bind time
-# -----------------------------------------------------------------------------
 
 statement error
 SELECT spark_xxhash64(1::UTINYINT);

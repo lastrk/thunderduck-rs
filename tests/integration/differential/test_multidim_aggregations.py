@@ -23,9 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# ============================================================================
-# Test Data Fixtures
-# ============================================================================
 
 @pytest.fixture(scope="class")
 def sales_data(spark_reference, spark_thunderduck):
@@ -106,9 +103,7 @@ def quarterly_data(spark_reference, spark_thunderduck):
     return df_ref, df_td
 
 
-# ============================================================================
 # Pivot Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -228,9 +223,7 @@ class TestPivotFunctions:
         assert_dataframes_equal(result_ref, result_td, "pivot_multiple_groupby")
 
 
-# ============================================================================
 # Unpivot Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -314,9 +307,7 @@ class TestUnpivotFunctions:
         assert_dataframes_equal(result_ref, result_td, "melt_alias")
 
 
-# ============================================================================
 # Cube Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -434,9 +425,7 @@ class TestCubeFunctions:
         assert_dataframes_equal(result_ref, result_td, "cube_with_grouping_id")
 
 
-# ============================================================================
 # Rollup Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -582,9 +571,7 @@ class TestRollupFunctions:
         assert_dataframes_equal(result_ref, result_td, "rollup_with_filter")
 
 
-# ============================================================================
 # Combined/Advanced Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions

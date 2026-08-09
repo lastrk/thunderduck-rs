@@ -565,7 +565,7 @@ QUERY_IMPLEMENTATIONS = {
     22: build_q22,
 }
 
-# Legacy per-test float tolerance (None = assert_dataframes_equal default).
+# Per-test float tolerance (None = assert_dataframes_equal default).
 EPSILONS = {
     1: 0.01,
     2: 0.01,

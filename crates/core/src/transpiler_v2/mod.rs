@@ -9,8 +9,8 @@
 //! turns a [`TypedAst`] into a DuckDB SQL string. Every [`CommonOp`] variant
 //! is wired end-to-end (leaves, Project/Filter/Sort/Limit, Aggregate incl.
 //! Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA family, Pivot /
-//! Crosstab, Stat family, TableFunction, ...) except `Unnest`, whose emission
-//! arm still returns a Thunderduck-boundary `EmissionError` per ADR-022;
+//! Crosstab, Stat family, TableFunction, ...) except `Unnest`, which the
+//! analyzer rejects as a Thunderduck-boundary `PuntedOperator` per ADR-022;
 //! shapes τ has not implemented surface the same way.
 
 pub mod analyzer;

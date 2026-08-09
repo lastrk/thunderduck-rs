@@ -15,8 +15,7 @@
 //! # What lives here
 //!
 //! - [`dispatch_op`] — the single top-level operator dispatcher: it renders
-//!   [`build_unit`]'s [`SqlUnit`] and increments the [`EMIT_TAP`] counter
-//!   once per `Ok` (§5.3).
+//!   [`build_unit`]'s [`SqlUnit`] once per `Ok`.
 //! - [`build_unit`] — one hand-written match arm per [`TypedOp`] variant.
 //!   Block-composable operators build/merge a `sql_block::SelectBlock`
 //!   (merge when the clause ordinal and alias-visibility preconditions
@@ -36,8 +35,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use super::analyzer::{
     na_fill_value_for, with_columns_plan, Schema, TypedAst, TypedOp, TD_JOIN_LEFT, TD_JOIN_RIGHT,
@@ -57,35 +54,13 @@ use crate::types::pyspark_parity::uniquify;
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
-// ── INV2 companion (§5.3) ────────────────────────────────────────────────────
-
-/// Monotonic counter — incremented once per successful SQL string returned by
-/// [`dispatch_op`]. τ's emission substrate activates INV2 via
-/// `invariants::inv2_dispatch_is_only_sql_writer`.
-pub(crate) static EMIT_TAP: AtomicU64 = AtomicU64::new(0);
-
-/// Serializes tests that read / reset [`EMIT_TAP`] (parallel-test flake guard).
-///
-/// Referenced by `invariants::inv2_dispatch_is_only_sql_writer` and by
-/// `emission::tests`; the release build has no consumer, hence
-/// `#[allow(dead_code)]`. This is the INV2 (EMIT_TAP companion) tap
-/// serializer — see rearchitect ADR-009 (Approach A dispatch shape) and
-/// `crates/core/src/transpiler_v2/invariants.rs::inv2_emit_tap_present`.
-#[allow(dead_code)] // INV2 companion (rearchitect ADR-009 test tap); release build has no consumer.
-pub(crate) static EMIT_TAP_MUTEX: Mutex<()> = Mutex::new(());
-
 // ── Dispatch (Approach A — hand-written match) ───────────────────────────────
 
-/// Top-level dispatch. **INV2 companion:** this function is the ONLY writer to
-/// [`EMIT_TAP`]. Every `Ok` return path increments [`EMIT_TAP`] exactly once.
+/// Top-level dispatch.
 ///
 /// One hand-written match arm per [`TypedOp`] variant. No table interpreter.
 pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
-    let result = build_unit(op, schema).map(|unit| unit.to_sql());
-    if result.is_ok() {
-        EMIT_TAP.fetch_add(1, Ordering::Relaxed);
-    }
-    result
+    build_unit(op, schema).map(|unit| unit.to_sql())
 }
 
 /// Build the [`SqlUnit`] for `op`: an open [`SelectBlock`] for the
@@ -197,7 +172,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             cols,
             replacements,
         } => build_na_replace(input, cols, replacements),
-        // Statement-shaped operators (plus the defensive `Unnest` reject) still
+        // Statement-shaped operators still
         // render to an opaque `Raw` unit. Named explicitly, not caught by `_`,
         // so THIS match is where a new `TypedOp` variant is a compile error.
         TypedOp::SingleRow
@@ -208,8 +183,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
         | TypedOp::Pivot { .. }
         | TypedOp::Sample { .. }
         | TypedOp::SampleBy { .. }
-        | TypedOp::RecursiveCte { .. }
-        | TypedOp::Unnest { .. } => legacy_render(op, schema).map(SqlUnit::Raw),
+        | TypedOp::RecursiveCte { .. } => legacy_render(op, schema).map(SqlUnit::Raw),
     }
 }
 
@@ -1669,13 +1643,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             recursive_term,
         } => render_recursive_cte(name, anchor, recursive_term, schema),
 
-        // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
-        TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
-            kind: UnsupportedKind::Op,
-            name: "Unnest".to_owned(),
-            reason: "unnest emission (not implemented in τ)".to_owned(),
-        }),
-
         // Converted to the SELECT-block builder — reaching a legacy arm for
         // these is a `build_unit` dispatch bug.
         _ => unreachable!("block-composable operator routed to legacy_render: {op:?}"),
@@ -2970,10 +2937,6 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                 _ => extract_struct_field(&child_sql, &ev.extraction, schema),
             }
         }
-        Expression::RowConstructor(_) => bail_boundary_expr!(
-            "RowConstructor",
-            "complex-type emission (not implemented in τ)",
-        ),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
     }
 }
@@ -3226,7 +3189,7 @@ fn substitute_index_var(body: &Expression, index_var: &str) -> Expression {
 ///
 /// Traversal is structural via [`Expression::map_children`], so every
 /// composite variant recurses (the previous hand walker's catch-all silently
-/// skipped `MapLiteral`, `StructLiteral`, `RowConstructor`, `UpdateFields` —
+/// skipped `MapLiteral`, `StructLiteral`, `UpdateFields` —
 /// leaving lambda variables unsubstituted there). Subqueries and `Window`
 /// stay opaque; see the explicit arms.
 fn substitute_lambda_var(
@@ -7136,10 +7099,6 @@ mod tests {
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
     use crate::types::StructField;
 
-    fn tap_guard() -> std::sync::MutexGuard<'static, ()> {
-        EMIT_TAP_MUTEX.lock().expect("EMIT_TAP_MUTEX poisoned")
-    }
-
     fn empty_schema() -> Schema {
         Schema::empty()
     }
@@ -7154,7 +7113,7 @@ mod tests {
     }
 
     // ── timestampadd / timestampdiff emission (intv-006) ───────────────────
-    // Pure helpers — no schema, no EMIT_TAP; safe from the tap-mutex cascade.
+    // Pure helpers — no schema or analyzer state.
 
     #[test]
     fn timestampadd_interval_sql_maps_units() {
@@ -7330,7 +7289,6 @@ mod tests {
 
     #[test]
     fn ceil_1arg_long_is_bigint_nan_guard() {
-        let _g = tap_guard();
         // Integer input → Long → the NaN-guarded BIGINT shape (math-003 pin).
         let sql = render_fn("ceil", vec![int_lit(5)]);
         assert_eq!(
@@ -7343,7 +7301,6 @@ mod tests {
 
     #[test]
     fn ceil_1arg_decimal_casts_to_scale0_decimal() {
-        let _g = tap_guard();
         let sql = render_fn("ceil", vec![decimal_lit("1.25", 10, 2)]);
         assert!(sql.ends_with("AS DECIMAL(9, 0))"), "got: {sql}");
         assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
@@ -7351,7 +7308,6 @@ mod tests {
 
     #[test]
     fn floor_2arg_scaled_decimal() {
-        let _g = tap_guard();
         // 2-arg over double → decimal(18,2), synthesized as fn((a)*100)/100.
         let sql = render_fn("ceil", vec![double_lit(1.5), int_lit(2)]);
         assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
@@ -7361,7 +7317,6 @@ mod tests {
 
     #[test]
     fn ceil_2arg_negative_scale_is_boundary() {
-        let _g = tap_guard();
         let f = fcall("ceil", vec![decimal_lit("1.25", 10, 2), int_lit(-1)]);
         let err = render_function_call(&f, &empty_schema()).expect_err("negative scale");
         assert!(matches!(
@@ -7386,7 +7341,6 @@ mod tests {
 
     #[test]
     fn scalar_subquery_renders_parenthesized_select() {
-        let _g = tap_guard();
         use super::super::expression::ScalarSubquery;
         let expr = Expression::ScalarSubquery(ScalarSubquery {
             subquery: analyzed_select_id_from_emp(),
@@ -7399,7 +7353,6 @@ mod tests {
 
     #[test]
     fn in_subquery_renders_lhs_in_select() {
-        let _g = tap_guard();
         use super::super::expression::InSubquery;
         let expr = Expression::InSubquery(InSubquery {
             expr: Box::new(int_lit(1)),
@@ -7421,7 +7374,6 @@ mod tests {
     /// `e2` and breaking `e2.dept_id`.
     #[test]
     fn correlated_scalar_subquery_inner_filter_merges_into_one_block() {
-        let _g = tap_guard();
         use super::super::expression::ScalarSubquery;
         // Inner: SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id = e.dept_id
         let inner = CommonAst::new(CommonOp::Aggregate {
@@ -7483,7 +7435,6 @@ mod tests {
     /// zero delta on the shape tier 2 does not target.
     #[test]
     fn wrap_over_unique_names_is_unchanged() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7515,7 +7466,6 @@ mod tests {
     /// stranding qualified over the buried `a` alias.
     #[test]
     fn wrap_over_duplicate_names_reprojects_uniquely() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(CommonAst::new(CommonOp::Join {
@@ -7577,7 +7527,6 @@ mod tests {
     /// (unique name), so it renders bare over the wrap.
     #[test]
     fn filter_above_limit_drops_alias_qualifier_at_resolution() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7608,7 +7557,6 @@ mod tests {
     /// there is no emission-side strip.
     #[test]
     fn filter_above_distinct_drops_alias_qualifier_at_resolution() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Deduplicate {
                 input: Box::new(CommonAst::new(CommonOp::Project {
@@ -7634,7 +7582,6 @@ mod tests {
 
     #[test]
     fn sort_above_limit_drops_alias_qualifier_at_resolution() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Sort {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7657,7 +7604,6 @@ mod tests {
 
     #[test]
     fn project_above_limit_strips_stranded_alias_qualifier() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7687,7 +7633,6 @@ mod tests {
     /// (which covers the WHOLE input relation) expands to the bare `*`.
     #[test]
     fn qualified_star_over_limit_wrap_expands_to_bare_star() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7722,7 +7667,6 @@ mod tests {
     /// on the wrap path) must not perturb this merge-path rendering.
     #[test]
     fn qualified_star_that_merges_keeps_alias() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(aliased_scan("emp", "e")),
             projections: vec![Expression::Star(StarExpression {
@@ -7741,7 +7685,6 @@ mod tests {
 
     #[test]
     fn with_columns_above_limit_strips_stranded_alias_qualifier() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::WithColumns {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -7769,7 +7712,6 @@ mod tests {
     /// correctly instead of failing loudly.
     #[test]
     fn ambiguous_output_name_wrap_reprojects_to_unique_position() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(CommonAst::new(CommonOp::Join {
@@ -7820,7 +7762,6 @@ mod tests {
     /// The wrap/strip logic no longer exists.
     #[test]
     fn unexposed_qualifier_survives_wrap_verbatim() {
-        let _g = tap_guard();
         let scan = typed_table_scan("emp", Some("e"), emp_schema());
         let limit = TypedAst::new(
             TypedOp::Limit {
@@ -7864,7 +7805,6 @@ mod tests {
     /// reach: there is no qualified reference left for that pass to see.
     #[test]
     fn struct_qualifier_survives_wrap_verbatim() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Limit {
                 input: Box::new(scan("addr")),
@@ -7897,7 +7837,6 @@ mod tests {
 
     #[test]
     fn not_in_subquery_renders_lhs_not_in_select() {
-        let _g = tap_guard();
         use super::super::expression::InSubquery;
         let expr = Expression::InSubquery(InSubquery {
             expr: Box::new(int_lit(1)),
@@ -7910,7 +7849,6 @@ mod tests {
 
     #[test]
     fn exists_subquery_renders_exists_select() {
-        let _g = tap_guard();
         use super::super::expression::ExistsSubquery;
         let expr = Expression::ExistsSubquery(ExistsSubquery {
             subquery: analyzed_select_id_from_emp(),
@@ -7922,7 +7860,6 @@ mod tests {
 
     #[test]
     fn not_exists_subquery_renders_not_exists_select() {
-        let _g = tap_guard();
         use super::super::expression::ExistsSubquery;
         let expr = Expression::ExistsSubquery(ExistsSubquery {
             subquery: analyzed_select_id_from_emp(),
@@ -7934,7 +7871,6 @@ mod tests {
 
     #[test]
     fn unanalyzed_subquery_is_defensive_boundary_error() {
-        let _g = tap_guard();
         use super::super::expression::ScalarSubquery;
         let expr = Expression::ScalarSubquery(ScalarSubquery {
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
@@ -7953,7 +7889,6 @@ mod tests {
 
     #[test]
     fn dispatch_op_single_row_emits_subquery_safe_select() {
-        let _g = tap_guard();
         let ast = CommonAst::new(CommonOp::SingleRow);
         let typed = analyze(ast, &BaseTypes::empty()).expect("analyze SingleRow");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch SingleRow");
@@ -7968,7 +7903,6 @@ mod tests {
 
     #[test]
     fn dispatch_op_table_scan_emits_select_star_from_table() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = scan("emp");
         let typed = analyze(ast, &bt).expect("analyze TableScan");
@@ -7978,7 +7912,6 @@ mod tests {
 
     #[test]
     fn dispatch_op_table_scan_with_alias_emits_alias() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
@@ -8007,7 +7940,6 @@ mod tests {
 
     #[test]
     fn dispatch_range_one_arg_synthesizes_start_zero_step_one() {
-        let _g = tap_guard();
         // `range(5)` → start=0, step=1 (both synthesized as typed BIGINT).
         assert_eq!(
             emit_range(vec![int_lit(5)]),
@@ -8017,7 +7949,6 @@ mod tests {
 
     #[test]
     fn dispatch_range_two_args_synthesizes_step_one() {
-        let _g = tap_guard();
         assert_eq!(
             emit_range(vec![int_lit(2), int_lit(5)]),
             "SELECT id FROM range(2, 5, CAST(1 AS BIGINT)) AS __td_range(id)"
@@ -8026,7 +7957,6 @@ mod tests {
 
     #[test]
     fn dispatch_range_three_args_uses_explicit_step() {
-        let _g = tap_guard();
         assert_eq!(
             emit_range(vec![int_lit(2), int_lit(10), int_lit(2)]),
             "SELECT id FROM range(2, 10, 2) AS __td_range(id)"
@@ -8035,7 +7965,6 @@ mod tests {
 
     #[test]
     fn dispatch_range_four_args_drops_num_partitions() {
-        let _g = tap_guard();
         // The 4th `numPartitions` arg is a single-node no-op — dropped.
         assert_eq!(
             emit_range(vec![int_lit(2), int_lit(10), int_lit(2), int_lit(4)]),
@@ -8045,7 +7974,6 @@ mod tests {
 
     #[test]
     fn dispatch_project_over_range_binds_id_column() {
-        let _g = tap_guard();
         // Full `SELECT id FROM range(5)` — the range TVF is a FROM-item leaf
         // block whose DEFAULT projection performs the `id` bind; a merging
         // Project overwrites it and MUST still see the renamed column
@@ -8078,7 +8006,6 @@ mod tests {
     /// `range` column name instead of Spark's `id`.
     #[test]
     fn bare_range_dispatch_keeps_id_default_projection() {
-        let _g = tap_guard();
         let ast = CommonAst::new(CommonOp::TableFunction {
             name: "range".to_owned(),
             args: vec![int_lit(3)],
@@ -8109,7 +8036,6 @@ mod tests {
     /// contains `UNNEST` and emits the column as `col`.
     #[test]
     fn dispatch_explode_tvf_emits_unnest_as_col() {
-        let _g = tap_guard();
         let arr = Expression::FunctionCall(FunctionCall {
             name: "array".to_owned(),
             args: vec![int_lit(1), int_lit(2), int_lit(3)],
@@ -8122,7 +8048,6 @@ mod tests {
     /// Pass 13 — explode_outer as TVF wraps with the CASE/NULL sentinel.
     #[test]
     fn dispatch_explode_outer_tvf_emits_case_wrapper() {
-        let _g = tap_guard();
         let arr = Expression::FunctionCall(FunctionCall {
             name: "array".to_owned(),
             args: vec![int_lit(1), int_lit(2)],
@@ -8177,7 +8102,6 @@ mod tests {
 
     #[test]
     fn render_project_simple_select() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -8198,7 +8122,6 @@ mod tests {
 
     #[test]
     fn render_project_qualified_ref_binds_over_table_scan() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -8265,7 +8188,6 @@ mod tests {
 
     #[test]
     fn from_scope_bare_relation_side() {
-        let _g = tap_guard();
         let typed = analyze(scan("emp"), &base_types_with_emp()).expect("analyze bare emp scan");
         let item = FromItem::Relation {
             base: "emp".to_owned(),
@@ -8282,7 +8204,6 @@ mod tests {
 
     #[test]
     fn from_scope_derived_wrapped_side() {
-        let _g = tap_guard();
         let plan = aliased_scan("emp", "e");
         let bt = BaseTypes::build_from_plan(&plan, |name| match name {
             "emp" => Some(emp_schema()),
@@ -8307,7 +8228,6 @@ mod tests {
 
     #[test]
     fn from_scope_inlined_nested_join_side() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
             right: Box::new(aliased_scan("dept", "d")),
@@ -8347,7 +8267,6 @@ mod tests {
 
     #[test]
     fn from_scope_dup_exposed_side_covers_but_is_ambiguous() {
-        let _g = tap_guard();
         let plan = aliased_scan("emp", "t");
         let bt = BaseTypes::build_from_plan(&plan, |name| match name {
             "emp" => Some(emp_schema()),
@@ -8379,7 +8298,6 @@ mod tests {
 
     #[test]
     fn render_project_star_over_using_join_emits_hoisted_slot_list() {
-        let _g = tap_guard();
         // jn-008 downstream: `SELECT * FROM emp NATURAL JOIN dept` desugars to a
         // USING(dept_id) join. resolved_schema hoists dept_id to the front, but
         // DuckDB's `*` over USING keeps it in its natural (left) position. The
@@ -8420,7 +8338,6 @@ mod tests {
 
     #[test]
     fn drop_over_using_join_renders_hoisted_slots() {
-        let _g = tap_guard();
         // F1 regression pin (review findings #1): `emp.join(dept,
         // on='dept_id').drop('dept_name')` must keep the join builder's
         // USING-key-first hoisted slot list — a bare `* EXCLUDE (dept_name)`
@@ -8457,7 +8374,6 @@ mod tests {
 
     #[test]
     fn drop_above_occupied_block_keeps_exclude() {
-        let _g = tap_guard();
         // Over an already-occupied block (Select cannot merge downstream of
         // Limit's LimitOffset ordinal), DropColumns wraps in `__td_sub` and
         // must keep today's `* EXCLUDE (...)` shape — the wrapped child
@@ -8481,7 +8397,6 @@ mod tests {
 
     #[test]
     fn multi_slot_star_over_using_join_expands_hoisted_slots() {
-        let _g = tap_guard();
         // F4 regression pin: a bare `*` mixed into a multi-slot projection
         // list must expand to the join builder's hoisted slot list, not
         // render a raw `*` token that shadows the USING-key-first order
@@ -8523,7 +8438,6 @@ mod tests {
 
     #[test]
     fn using_join_side_wrap_preserves_hoisted_slots() {
-        let _g = tap_guard();
         // F2 regression pin (review findings #2): the RIGHT side of an
         // outer ON join is itself a USING join (`dept JOIN emp2 USING
         // (dept_id)`). The right side never inlines (`may_inline_nested_join`
@@ -8582,7 +8496,6 @@ mod tests {
 
     #[test]
     fn alias_ref_above_using_parent_inlines_and_binds() {
-        let _g = tap_guard();
         // join-021 (F5 regression pin): a plain-ON nested join (`emp e JOIN
         // dept d ON e.dept_id = d.dept_id`) is the LEFT side of an outer
         // USING(dept_id) join against `emp2`. Before F5, the USING parent's
@@ -8667,7 +8580,6 @@ mod tests {
 
     #[test]
     fn using_parent_hoisted_slots_qualify_by_covering_alias() {
-        let _g = tap_guard();
         // Retargeted (ADR-023 Phase 2.1) to a non-duplicated USING key: the
         // outer parent USES `USING (id)` rather than `USING (dept_id)`.
         // `id` is unique to `emp` within the nested side's flattened
@@ -8730,7 +8642,6 @@ mod tests {
 
     #[test]
     fn using_parent_hoisted_slots_dup_key_still_wraps() {
-        let _g = tap_guard();
         // The OLD shape `using_parent_hoisted_slots_qualify_by_covering_alias`
         // used to exercise: outer `USING (dept_id)` parent over the LEFT
         // nested ON-join `emp e JOIN dept d ON e.dept_id = d.dept_id`.
@@ -8784,7 +8695,6 @@ mod tests {
 
     #[test]
     fn using_parent_over_transitive_dup_key_ancestor_still_wraps() {
-        let _g = tap_guard();
         // Phase 2.1 transitive-case witness: THREE levels — a USING parent
         // (outer) whose left is a plain ON-join (middle), whose OWN left is
         // a further-nested dup-key ON-join (innermost: `e.dept_id =
@@ -8871,7 +8781,6 @@ mod tests {
 
     #[test]
     fn using_parent_with_uncoverable_side_still_wraps() {
-        let _g = tap_guard();
         // Residual gap (plan 007, tracked not fixed here): when the nested
         // join's OWN children re-scope (each a `Project` over a scan, whose
         // `RelScope` is empty per `RelScope::of`), the nested join's own
@@ -8930,7 +8839,6 @@ mod tests {
 
     #[test]
     fn using_parent_with_synthetic_scoped_side_stays_wrapped() {
-        let _g = tap_guard();
         // Post-collapse (ADR-023 Phase 2): the nested join's OWN condition
         // (plan_id-tagged `dept_id` refs across `emp`/`dept`) is its own
         // demand only — no ancestor references either of ITS sides. The
@@ -9009,7 +8917,6 @@ mod tests {
 
     #[test]
     fn render_project_over_join_hoists_user_aliases() {
-        let _g = tap_guard();
         // SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
         let join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -9044,7 +8951,6 @@ mod tests {
 
     #[test]
     fn render_project_over_filter_over_join_inlines_to_single_select() {
-        let _g = tap_guard();
         // SELECT e.name, d.dept_name FROM emp e, dept d WHERE e.dept_id = d.dept_id
         // lowers to Project → Filter → CrossJoin.
         let join = CommonAst::new(CommonOp::Join {
@@ -9084,7 +8990,6 @@ mod tests {
 
     #[test]
     fn render_project_over_filter_over_aliased_relation_inlines() {
-        let _g = tap_guard();
         // Correlated EXISTS body: `SELECT * FROM emp e WHERE e.dept_id = ...`
         // lowers to Project → Filter → AliasedRelation. The alias `e` must
         // become the FROM table name so the WHERE's `e.dept_id` binds.
@@ -9110,7 +9015,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_filter_over_aliased_relation_inlines() {
-        let _g = tap_guard();
         // Correlated scalar subquery body: `SELECT max(e.salary) FROM emp e
         // WHERE e.dept_id = ...` lowers to Aggregate → Filter →
         // AliasedRelation. Alias `e` must be the FROM name so both the
@@ -9163,7 +9067,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_join_hoists_user_aliases_no_td_agg_or_td_jl() {
-        let _g = tap_guard();
         // jn-015: SELECT d.dept_name, avg(e.salary) AS avg_sal FROM emp e
         //   JOIN dept d ON e.dept_id = d.dept_id GROUP BY d.dept_name
         let join = CommonAst::new(CommonOp::Join {
@@ -9212,7 +9115,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_aliased_relation_with_having_no_td_agg() {
-        let _g = tap_guard();
         // sq-015: SELECT e.dept_id, count(*) AS n FROM emp e GROUP BY
         //   e.dept_id HAVING count(*) > 1
         let plan = CommonAst::new(CommonOp::Aggregate {
@@ -9254,7 +9156,6 @@ mod tests {
     /// / `build_sort`.
     #[test]
     fn aggregate_over_limit_drops_alias_qualifier_at_resolution() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
@@ -9290,7 +9191,6 @@ mod tests {
     /// `__td_sub`).
     #[test]
     fn aggregate_over_aliased_relation_merges_keeps_alias() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(aliased_scan("emp", "e")),
             grouping: vec![qcol("e", "dept_id")],
@@ -9321,7 +9221,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_filter_over_join_chains_from_and_where_before_group_by() {
-        let _g = tap_guard();
         // SELECT d.dept_name, avg(e.salary) FROM emp e, dept d
         //   WHERE e.dept_id = d.dept_id GROUP BY d.dept_name
         // (comma-join lowers to Aggregate → Filter → Join.)
@@ -9379,7 +9278,6 @@ mod tests {
 
     #[test]
     fn render_project_over_nested_join_flattens_three_way_chain() {
-        let _g = tap_guard();
         // jn-013: SELECT e.name, d.dept_name FROM emp e JOIN dept d
         //   ON e.dept_id = d.dept_id JOIN emp2 m ON d.dept_id = m.dept_id
         let inner_join = CommonAst::new(CommonOp::Join {
@@ -9428,7 +9326,6 @@ mod tests {
 
     #[test]
     fn render_project_over_nested_join_duplicate_alias_refuses_flatten() {
-        let _g = tap_guard();
         // Reviewer pass-6 Medium: a nested join whose flattened chain would
         // reuse a user alias must NOT flatten, or DuckDB rejects the FROM with
         // "Duplicate alias". Here the inner join's left is `emp m` and the
@@ -9492,7 +9389,6 @@ mod tests {
 
     #[test]
     fn render_join_from_dataframe_plan_id_contract_flattens_and_binds_positionally() {
-        let _g = tap_guard();
         // DataFrame join-of-join, plan_id-tagged outer condition:
         // `df.join(df2).join(df3, ...)`. Post-collapse (ADR-023 Phase 2):
         // a join's own condition never force-wraps its sides (the demand-flag
@@ -9580,7 +9476,6 @@ mod tests {
 
     #[test]
     fn within_side_duplicate_name_binds_the_correct_leftmost_occurrence() {
-        let _g = tap_guard();
         // Boundary/double-bind witness: `dept_id` is duplicated WITHIN the
         // nested join's OWN flattened schema (`emp.dept_id` at local index
         // 2, `dept.dept_id` at local index 4) — not just against the
@@ -9656,7 +9551,6 @@ mod tests {
 
     #[test]
     fn condition_over_uncoverable_inlined_side_wraps_fresh_and_retries() {
-        let _g = tap_guard();
         // SideNeedsAlias retry witness: the nested join's own children are
         // `Project`s (whose `RelScope` is empty per `RelScope::of`), so the
         // nested join itself has NO alias coverage — exactly the
@@ -9752,7 +9646,6 @@ mod tests {
 
     #[test]
     fn adr023_phase1_unique_name_plan_id_condition_inlines_both_sides() {
-        let _g = tap_guard();
         // ADR-023 Phase 1: `id` (emp-only) and `dept_name` (dept-only) are
         // each unique in the merged emp⋈dept condition schema, so the
         // resolved condition drops its synthetic qualifier and neither join
@@ -9802,7 +9695,6 @@ mod tests {
 
     #[test]
     fn asymmetric_schema_left_heavier_binds_correct_side() {
-        let _g = tap_guard();
         // ADR-023 Phase 2, H8 hiding places 1+2 (merged-vs-local ordinal
         // confusion; ordinal/name drift): LEFT (`emp`, 4 cols: id, name,
         // dept_id, salary) is WIDER than RIGHT (`dept`, 2 cols: dept_id,
@@ -9853,7 +9745,6 @@ mod tests {
 
     #[test]
     fn asymmetric_schema_right_heavier_binds_correct_side() {
-        let _g = tap_guard();
         // Companion to `asymmetric_schema_left_heavier_binds_correct_side`
         // with the widths SWAPPED (RIGHT, `emp`, 4 cols, now wider than
         // LEFT, `dept`, 2 cols) — guards against a hardcoded "left is
@@ -9902,7 +9793,6 @@ mod tests {
 
     #[test]
     fn render_join_side_plan_id_condition_overrides_aliased_relation_hoist() {
-        let _g = tap_guard();
         // `df.alias("e").join(df2.alias("d"), ...)` with a plan_id-tagged
         // (not user-qualified) condition. Post-collapse (ADR-023 Phase 2):
         // a join's own condition never force-wraps its sides (the demand-flag
@@ -9961,7 +9851,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_join_using_inlines_from_no_td_agg() {
-        let _g = tap_guard();
         // USING-under-aggregate regression pin: a direct (non-nested) USING
         // join under Aggregate still inlines through
         // `render_alias_transparent_from` (no `__td_agg`); USING's own
@@ -10008,7 +9897,6 @@ mod tests {
 
     #[test]
     fn render_todf_over_aggregate_with_qualified_agg_arg_renames_positionally() {
-        let _g = tap_guard();
         // `SELECT b, count(*) AS n FROM (SELECT e.dept_id, count(d.dept_id)
         //   FROM emp e LEFT OUTER JOIN dept d ON e.dept_id = d.dept_id
         //   GROUP BY e.dept_id) AS t (a, b) GROUP BY b` (tbl-013).
@@ -10100,7 +9988,6 @@ mod tests {
 
     #[test]
     fn render_project_over_nested_semi_join_side_breaks_chain_flatten() {
-        let _g = tap_guard();
         // SEMI/ANTI-break regression pin: an inner SEMI JOIN, as the left
         // side of an outer join, must not flatten into the outer join's
         // chained FROM (CLAUDE.md gotcha 4) — `join_chain_flattenable`
@@ -10153,7 +10040,6 @@ mod tests {
 
     #[test]
     fn contract_collision_wraps_left_keeps_right_name() {
-        let _g = tap_guard();
         // join-022 unit mirror, COLLAPSED under ADR-023 Phase 2. `inner =
         // emp.join(emp2, emp.dept_id == emp2.dept_id)`: the plan_id-tagged
         // condition never force-wraps the inner join's sides (the demand-flag
@@ -10276,7 +10162,6 @@ mod tests {
 
     #[test]
     fn free_collision_renames_right_wrap() {
-        let _g = tap_guard();
         // Same shape as `contract_collision_wraps_left_keeps_right_name` but
         // WITHOUT the ancestor filter. Post-collapse (ADR-023 Phase 2): the
         // inner join's own condition is never a wrap demand, so `emp`/`emp2`
@@ -10399,7 +10284,6 @@ mod tests {
 
     #[test]
     fn d1_ancestor_filter_merges_with_bare_ordinal_bound_to_covering_alias() {
-        let _g = tap_guard();
         // D1: an ancestor Filter referencing emp2's OWN plan_id lands on a
         // bare `dept_id` ordinal duplicated in the join's merged schema
         // (`emp.dept_id` / `emp2.dept_id`); `emp2` is the unique, uniquely-
@@ -10430,7 +10314,6 @@ mod tests {
 
     #[test]
     fn d1_ancestor_project_merges_with_bare_ordinals_bound_to_covering_aliases() {
-        let _g = tap_guard();
         // D1: an ancestor Project referencing emp's `id` (duplicated with
         // emp2's `id`) and emp2's `dept_id` (duplicated with emp's) both
         // merge, each rewritten to its own unique covering alias.
@@ -10454,7 +10337,6 @@ mod tests {
 
     #[test]
     fn d1_ancestor_aggregate_merges_grouping_key_bound_to_covering_alias() {
-        let _g = tap_guard();
         // D1: an ancestor Aggregate's GROUP BY key is a bare duplicate-name
         // ordinal (emp's `dept_id`) that merges through the fused
         // requalify_visible rewrite, same as filter/project.
@@ -10483,7 +10365,6 @@ mod tests {
 
     #[test]
     fn d1_ancestor_sort_merges_key_bound_to_covering_alias() {
-        let _g = tap_guard();
         // D1: an ancestor Sort's ORDER BY key is a bare duplicate-name
         // ordinal (emp2's `dept_id`) over a select-free (pure-FROM) block —
         // merges via `requalify_visible`, same as the other three builders.
@@ -10505,7 +10386,6 @@ mod tests {
 
     #[test]
     fn sort_bare_dup_name_ordinal_key_wraps_and_uniquifies() {
-        let _g = tap_guard();
         // Family B (tpcds-q039a/q039b/q064 shape): the SELECT list projects
         // the SAME output name (`dept_id`) from BOTH join sides — a genuine
         // duplicate, like the self-join CTE's two `w_warehouse_sk`/`cnt`
@@ -10555,7 +10435,6 @@ mod tests {
 
     #[test]
     fn sort_bare_unique_name_ordinal_key_still_merges() {
-        let _g = tap_guard();
         // Guard against over-wrapping: the SAME shape as the test above, but
         // the Project selects only ONE occurrence of each name (`id` from
         // `emp`, `dept_id` from `emp2`) so the Project's own output schema
@@ -10600,7 +10479,6 @@ mod tests {
 
     #[test]
     fn sort_trim_project_orders_by_key_inside_derived_table_q078_shape() {
-        let _g = tap_guard();
         // `SELECT id, name FROM emp ORDER BY salary` (tpcds-q078 shape) —
         // `salary` is promoted into the Sort's child, and the ORDER BY must
         // stay on the inner derived table; the outer trim renders only the
@@ -10664,7 +10542,6 @@ mod tests {
 
     #[test]
     fn sort_trim_project_keeps_order_by_shadow_safe_ord014_shape() {
-        let _g = tap_guard();
         // `SELECT salary AS id FROM emp ORDER BY emp.id` (ord-014 shape) —
         // the visible output alias `id` collides with the hidden sort key's
         // ORIGINAL name (`emp.id`). Hoisting the ORDER BY onto the outer
@@ -10718,7 +10595,6 @@ mod tests {
 
     #[test]
     fn d7_homonym_alias_rejects_merge_and_wrap_binds_uniquified_name() {
-        let _g = tap_guard();
         // D7 / rule (i): `emp` and `emp2` are BOTH user-aliased "m"
         // (`AliasedRelation` drops the table name, so `m` is each side's
         // ONLY analyzer-scope alias entry) — a homonym-alias hazard the
@@ -10784,7 +10660,6 @@ mod tests {
 
     #[test]
     fn internally_duplicate_span_rejects_merge_rule_iii() {
-        let _g = tap_guard();
         // Rule (iii): `dup_tbl` has TWO fields both named `dept_id` within
         // its OWN span — even though it is the sole, uniquely-exposed
         // covering alias for the ancestor's ordinal (rules (i)/(ii) both
@@ -10860,7 +10735,6 @@ mod tests {
 
     #[test]
     fn reproject_qualifiers_ordinal_arm_binds_bare_dup_by_id() {
-        let _g = tap_guard();
         // Direct unit pin for the `reproject_qualifiers` bare-dup else-arm
         // (N10-lite): a bare duplicate-name ref rewrites to `uniquified[k]`
         // where `k` is found by the reference's `expr_id` — fixtures stamp
@@ -10937,7 +10811,6 @@ mod tests {
 
     #[test]
     fn reproject_qualifiers_same_id_two_slots_binds_first_occurrence() {
-        let _g = tap_guard();
         // agg-026 shape: a grouping key restated in the aggregate list folds
         // into TWO output slots that are the SAME projected-through column
         // — identical `expr_id` at both positions (a clone of one
@@ -10992,7 +10865,6 @@ mod tests {
 
     #[test]
     fn reproject_qualifiers_id_absent_from_schema_stays_untouched() {
-        let _g = tap_guard();
         // N10-lite: an `expr_id` that names no field in the boundary
         // schema (e.g. stamped against a DIFFERENT schema than the one
         // reached here) is left completely untouched — no silent
@@ -11051,7 +10923,6 @@ mod tests {
 
     #[test]
     fn plain_join_over_dup_name_side_renders_star() {
-        let _g = tap_guard();
         // join-022 round-1 corruption pin: a single-alias side whose OWN
         // resolved_schema has duplicate names (`id`, `dept_id` both appear
         // twice in `emp JOIN emp2`) sits as the RIGHT side of a plain-ON
@@ -11105,7 +10976,6 @@ mod tests {
 
     #[test]
     fn using_join_over_dup_name_side_is_boundary_error() {
-        let _g = tap_guard();
         // Change 3: a USING(dept_id) parent's RIGHT side is NEVER inlined
         // (`may_inline_nested_join` is hardcoded `false` for the right in
         // `build_join_side`), so a nested `emp JOIN emp2` there always wraps
@@ -11173,7 +11043,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_having_emits_group_by_having_not_outer_where() {
-        let _g = tap_guard();
         // `SELECT dept_id, count(*) FROM emp GROUP BY dept_id HAVING count(*) > 1`
         // — the HAVING predicate must fold into the aggregate SELECT as
         // `GROUP BY … HAVING`, never an outer `WHERE` wrapper (which DuckDB
@@ -11208,7 +11077,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_grouping_expr_also_projected_no_prepended_slot() {
-        let _g = tap_guard();
         // agg-007 shape: `SELECT dept_id >= 40 AS senior, avg(salary) AS s
         // FROM emp GROUP BY dept_id >= 40`. The grouping key structurally
         // equals the alias-stripped first aggregate → already folded → the
@@ -11265,7 +11133,6 @@ mod tests {
     /// the `grouped_aggregate_*` tests in `ast.rs`).
     #[test]
     fn aggregate_does_not_prepend_grouping_key() {
-        let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(scan("emp")),
             grouping: vec![ucol("dept_id")],
@@ -11294,7 +11161,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_all_empty_grouping_sets_emits_group_by() {
-        let _g = tap_guard();
         // `GROUP BY GROUPING SETS ((), ())`: the flat grouping list is empty
         // (no columns referenced) but `grouping_sets` holds two empty sets.
         // Each empty set is a distinct grand-total group, so Spark returns one
@@ -11323,7 +11189,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_having_composes_with_rollup() {
-        let _g = tap_guard();
         // ROLLUP grouping + HAVING → `GROUP BY ROLLUP(dept_id) HAVING …`.
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(scan("emp")),
@@ -11354,7 +11219,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_having_grouping_id_spliced_with_rollup() {
-        let _g = tap_guard();
         // gx-012: `... GROUP BY ROLLUP(dept_id) HAVING grouping_id() = 0`.
         // The HAVING predicate carries a no-arg `grouping_id()` which DuckDB
         // cannot parse; emission must splice the ambient grouping column into
@@ -11392,7 +11256,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_grouping_sets_emits_per_set_group_clause() {
-        let _g = tap_guard();
         // GROUPING SETS ((dept_id, name), (dept_id), ()) → flat grouping
         // [dept_id, name] with per-set membership [[0, 1], [0], []].
         let plan = CommonAst::new(CommonOp::Aggregate {
@@ -11421,7 +11284,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_grouping_sets_empty_metadata_preserves_boundary() {
-        let _g = tap_guard();
         // DataFrame `groupingSets` path leaves `grouping_sets` empty — emission
         // must surface the preserved Thunderduck-boundary error (ADR-022).
         let plan = CommonAst::new(CommonOp::Aggregate {
@@ -11580,7 +11442,6 @@ mod tests {
 
     #[test]
     fn render_aggregate_op_binary_witness_grouping_id_plus_one() {
-        let _g = tap_guard();
         // Regression example 1 (SQL front-end shape): `grouping_id() + 1` in
         // a ROLLUP aggregate. Pre-fix this reached DuckDB as a literal
         // zero-arg `grouping_id()` → `Parser Error: syntax error at or near
@@ -11622,7 +11483,6 @@ mod tests {
 
     #[test]
     fn render_project_alias_slot_wraps_cast() {
-        let _g = tap_guard();
         // int/int → Double under Spark; spark_return_cast wraps as
         // CAST(... AS DOUBLE); alias is preserved outside the CAST.
         let bt = base_types_with_emp();
@@ -11654,7 +11514,6 @@ mod tests {
 
     #[test]
     fn render_project_int_div_yields_double_cast() {
-        let _g = tap_guard();
         // int/int projection without alias — must still be CAST AS DOUBLE.
         let bt = base_types_with_emp();
         let div = Expression::Binary(BinaryExpression {
@@ -11678,7 +11537,6 @@ mod tests {
 
     #[test]
     fn render_filter_composes_where_clause() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Gt,
@@ -11713,7 +11571,6 @@ mod tests {
 
     #[test]
     fn render_sort_asc_desc_nulls_first_last() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let order = vec![
             SortOrder {
@@ -11753,7 +11610,6 @@ mod tests {
 
     #[test]
     fn render_sort_with_limit_and_offset() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(scan("emp")),
@@ -11781,7 +11637,6 @@ mod tests {
 
     #[test]
     fn render_limit_emits_limit_offset() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Limit {
             input: Box::new(scan("emp")),
@@ -11798,7 +11653,6 @@ mod tests {
 
     #[test]
     fn render_values_emits_values_alias() {
-        let _g = tap_guard();
         let row = vec![int_lit(1), int_lit(2)];
         let ast = CommonAst::new(CommonOp::Values {
             rows: vec![row],
@@ -11814,7 +11668,6 @@ mod tests {
 
     #[test]
     fn render_local_relation_emits_values_from_literals() {
-        let _g = tap_guard();
         let schema = StructType::new(vec![
             StructField::not_null("a", DataType::Integer),
             StructField::nullable("b", DataType::String),
@@ -11911,7 +11764,6 @@ mod tests {
 
     #[test]
     fn render_file_scan_parquet_emits_read_parquet() {
-        let _g = tap_guard();
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
         let ast = CommonAst::new(CommonOp::FileScan {
             format: FileFormat::Parquet,
@@ -11994,7 +11846,6 @@ mod tests {
 
     #[test]
     fn render_file_scan_delta_emits_select_star_from_delta_scan() {
-        let _g = tap_guard();
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
         let ast = CommonAst::new(CommonOp::FileScan {
             format: FileFormat::Delta,
@@ -12472,43 +12323,6 @@ mod tests {
         assert!(extension_targets().is_empty());
     }
 
-    // ── EMIT_TAP increments on Ok dispatch ───────────────────────────────
-
-    #[test]
-    fn emit_tap_increments_on_ok_dispatch() {
-        let _g = tap_guard();
-        let before = EMIT_TAP.load(Ordering::Relaxed);
-        let ast = CommonAst::new(CommonOp::SingleRow);
-        let _sql = generate(&ast, &BaseTypes::empty()).expect("generate");
-        let after = EMIT_TAP.load(Ordering::Relaxed);
-        assert_eq!(after - before, 1);
-    }
-
-    #[test]
-    fn emit_tap_does_not_increment_on_err_dispatch() {
-        let _g = tap_guard();
-        let before = EMIT_TAP.load(Ordering::Relaxed);
-        // Sample WITH REPLACEMENT is a permanent Thunderduck-boundary error
-        // (ADR-022 — DuckDB has no row-level sampling with replacement), so it
-        // is a stable erroring dispatch that won't bit-rot as coverage grows.
-        let bt = base_types_with_emp();
-        let ast = CommonAst::new(CommonOp::Sample {
-            input: Box::new(scan("emp")),
-            lower_bound: 0.0,
-            upper_bound: 0.5,
-            with_replacement: true,
-            seed: Some(11),
-        });
-        let result = generate(&ast, &bt);
-        assert!(
-            result.is_err(),
-            "sample-with-replacement must fail dispatch; if this becomes \
-             supported, pick another Thunderduck-boundary op for this test",
-        );
-        let after = EMIT_TAP.load(Ordering::Relaxed);
-        assert_eq!(after - before, 0);
-    }
-
     // ── Additional coverage: Interval literal ───────────────────────────
 
     #[test]
@@ -12952,7 +12766,6 @@ mod tests {
     /// PIVOT semantics (empty COUNT buckets → NULL, not 0). Pass 60 anchor.
     #[test]
     fn render_pivot_explicit_values_emits_conditional_aggregate_shape() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         // Build: emp.groupBy("dept_id").pivot("id", [1, 2]).agg(count(*) AS n)
         // Using existing emp cols to satisfy the analyzer.
@@ -13002,7 +12815,6 @@ mod tests {
     /// already return NULL for empty buckets).
     #[test]
     fn render_pivot_multi_agg_names_and_only_count_gets_nullif() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(scan("emp")),
@@ -13058,7 +12870,6 @@ mod tests {
     /// names the output column (`AS "one"`), it must not leak into the CASE.
     #[test]
     fn render_pivot_strips_alias_from_pivot_value_in_case() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(scan("emp")),
@@ -13094,7 +12905,6 @@ mod tests {
     /// anywhere except as an expression root.
     #[test]
     fn render_pivot_count_star_rewrites_to_count_one() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         // Build: emp.groupBy("dept_id").pivot("id", [1, 2]).agg(count(*) AS n)
         // Mirrors the existing explicit-values test but uses Star instead of
@@ -13148,7 +12958,6 @@ mod tests {
         //   UNPIVOT (SELECT <ids>,<values> FROM (<child>) AS __td_unpivot_src)
         //     ON <values> INTO NAME "metric" VALUE "value"
         // per τ's UNPIVOT emission contract (see `gen_unpivot` above).
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -13170,7 +12979,6 @@ mod tests {
 
     #[test]
     fn render_describe_wraps_child_in_cte_and_emits_union_all_rows() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Describe {
             input: Box::new(scan("emp")),
@@ -13198,7 +13006,6 @@ mod tests {
 
     #[test]
     fn render_summary_emits_percentile_via_quantile_disc_try_cast() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Summary {
             input: Box::new(scan("emp")),
@@ -13229,7 +13036,6 @@ mod tests {
 
     #[test]
     fn render_freq_items_single_col_wraps_child_in_materialized_cte_with_list_having() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::FreqItems {
             input: Box::new(scan("emp")),
@@ -13272,7 +13078,6 @@ mod tests {
 
     #[test]
     fn render_freq_items_multi_col_emits_one_correlated_subquery_per_col() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::FreqItems {
             input: Box::new(scan("emp")),
@@ -13308,7 +13113,6 @@ mod tests {
 
     #[test]
     fn render_sample_emits_tablesample_bernoulli_with_percent() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
             input: Box::new(scan("emp")),
@@ -13330,7 +13134,6 @@ mod tests {
 
     #[test]
     fn render_sample_with_seed_emits_repeatable_clause() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
             input: Box::new(scan("emp")),
@@ -13350,7 +13153,6 @@ mod tests {
     fn render_sample_with_replacement_returns_unsupported_op() {
         // ADR-022 Thunderduck-boundary: DuckDB has no row-level sampling
         // with replacement. Emission surfaces `UnsupportedOp`.
-        let _g = tap_guard();
         let typed_input = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
@@ -13363,7 +13165,6 @@ mod tests {
 
     #[test]
     fn render_sample_by_emits_per_stratum_or_chain_with_setseed_wrapper() {
-        let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::SampleBy {
             input: Box::new(scan("emp")),
@@ -13419,7 +13220,6 @@ mod tests {
 
     #[test]
     fn render_sample_by_empty_fractions_emits_where_false() {
-        let _g = tap_guard();
         let typed_input = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
@@ -16489,9 +16289,6 @@ mod tests {
     /// keeps the emission consistent with the by-position path.
     #[test]
     fn union_by_name_allow_missing_emits_padded_nulls_and_plain_union() {
-        // No tap_guard() — this test does not read EMIT_TAP; the shared
-        // mutex would otherwise cascade a poisoned lock from an unrelated
-        // pre-existing INV10 baseline failure in this suite.
         // LEFT `{a: Long, b: Long}` × RIGHT `{b: Long, c: Long}`
         let bt = BaseTypes::empty();
         let left = CommonAst::new(CommonOp::Values {
@@ -16758,7 +16555,6 @@ mod tests {
     // bare.
     #[test]
     fn render_na_fill_empty_cols_int_value_only_coalesces_numeric_columns() {
-        let _g = tap_guard();
         let mixed_schema = StructType::new(vec![
             StructField::nullable("s", DataType::String),
             StructField::nullable("l", DataType::Long),
@@ -16873,7 +16669,6 @@ mod tests {
 
     #[test]
     fn render_lateral_view_plain_explode() {
-        let _g = tap_guard();
         let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
         let lv = lateral_view_typed(
             vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
@@ -16902,7 +16697,6 @@ mod tests {
 
     #[test]
     fn render_lateral_view_outer_explode() {
-        let _g = tap_guard();
         let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
         let lv = lateral_view_typed(
             vec![(
@@ -16930,7 +16724,6 @@ mod tests {
 
     #[test]
     fn render_lateral_view_posexplode_single_inner_select() {
-        let _g = tap_guard();
         let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
         let lv = lateral_view_typed(
             vec![
@@ -16966,7 +16759,6 @@ mod tests {
 
     #[test]
     fn render_project_over_lateral_view_no_td_proj() {
-        let _g = tap_guard();
         let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
         let lv = lateral_view_typed(
             vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
@@ -17016,7 +16808,6 @@ mod tests {
 
     #[test]
     fn lateral_view_over_range_appends_generated_column() {
-        let _g = tap_guard();
         // F3 regression pin (review findings #3): `range(3)`'s FROM-item
         // leaf carries a default `id` bind (tbl-006); a merged LateralView
         // must widen that default list to include its own generated column
@@ -17059,7 +16850,6 @@ mod tests {
 
     #[test]
     fn lateral_view_over_table_scan_still_renders_star() {
-        let _g = tap_guard();
         // F3 no-op guard: a plain table-scan child has no default
         // projections (`None`), so extending must stay a no-op — the merged
         // block keeps rendering `SELECT *` (protects the cx-007..009 shape).
@@ -17081,7 +16871,6 @@ mod tests {
     /// `CROSS JOIN LATERAL` and NOT contain `__td_jl`.
     #[test]
     fn render_lateral_join_cross_emits_lateral_keyword_no_td_jl() {
-        let _g = tap_guard();
         // Build: `SELECT e.name, t.dept_avg FROM emp e
         //   CROSS JOIN LATERAL (SELECT avg(e2.salary) AS dept_avg
         //     FROM emp e2 WHERE e2.dept_id = e.dept_id) t`
@@ -17141,7 +16930,6 @@ mod tests {
     /// Lateral join with ON clause: must emit `INNER JOIN LATERAL ... ON`.
     #[test]
     fn render_lateral_join_with_on_emits_inner_join_lateral_on() {
-        let _g = tap_guard();
         let left = aliased_scan("emp", "e");
         let right_inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
@@ -17189,7 +16977,6 @@ mod tests {
     /// nested chain inlines flat.
     #[test]
     fn nested_lateral_join_side_never_inlines_into_outer_from() {
-        let _g = tap_guard();
         let nested = |lateral: bool| {
             CommonAst::new(CommonOp::Join {
                 left: Box::new(aliased_scan("emp", "e")),
@@ -17245,7 +17032,6 @@ mod tests {
     /// table-name-qualified correlated references inside the subquery resolve.
     #[test]
     fn render_lateral_join_bare_table_scan_left_exposes_table_name() {
-        let _g = tap_guard();
         // `FROM emp JOIN LATERAL (SELECT emp.name AS x) t` — no alias on emp.
         let left = scan("emp");
         let right_inner = CommonAst::new(CommonOp::Project {

@@ -581,13 +581,6 @@ pub struct ExtractValueExpression {
     pub extraction: Box<Expression>,
 }
 
-/// Row constructor `(a, b, c)` → Struct.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RowConstructorExpression {
-    pub elements: Vec<Expression>,
-    pub field_names: Vec<String>,
-}
-
 /// `withField` / `dropFields` on a struct.
 ///
 /// Each entry in [`Self::updates`] is either an add/replace (`Some(expr)`) or a
@@ -634,7 +627,6 @@ pub enum Expression {
     Interval(IntervalExpression),
     IsDistinctFrom(IsDistinctFromExpression),
     ExtractValue(ExtractValueExpression),
-    RowConstructor(RowConstructorExpression),
     UpdateFields(UpdateFieldsExpression),
 }
 
@@ -682,7 +674,6 @@ macro_rules! expression_children {
 
             Expression::FunctionCall(f) => Box::new(f.args.$iter()),
             Expression::ArrayLiteral(a) => Box::new(a.elements.$iter()),
-            Expression::RowConstructor(rc) => Box::new(rc.elements.$iter()),
 
             Expression::CaseWhen(cw) => Box::new(
                 cw.branches
@@ -800,22 +791,6 @@ impl Expression {
                 IntervalKind::Calendar => DataType::Interval,
             },
             Expression::ExtractValue(ev) => Self::extract_value_data_type(ev, schema),
-            Expression::RowConstructor(rc) => {
-                let fields: Vec<StructField> = rc
-                    .elements
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        let name = rc
-                            .field_names
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| format!("col{}", i + 1));
-                        StructField::new(name, e.data_type(schema), e.nullable(schema))
-                    })
-                    .collect();
-                DataType::Struct(StructType::new(fields))
-            }
             Expression::UpdateFields(u) => Self::update_fields_data_type(u, schema),
         }
     }
@@ -895,7 +870,6 @@ impl Expression {
             Expression::Interval(_) => false,
             Expression::IsDistinctFrom(_) => false,
             Expression::ExtractValue(ev) => Self::extract_value_nullable(ev, schema),
-            Expression::RowConstructor(rc) => rc.elements.iter().any(|e| e.nullable(schema)),
             Expression::UpdateFields(u) => {
                 u.struct_expr.nullable(schema)
                     || u.updates.iter().any(|(_, e)| match e {

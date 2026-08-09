@@ -253,12 +253,6 @@ inline AggregateFunctionSet CreateSparkTrySumFunctionSet() {
 	decimal_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(decimal_func);
 
-	auto add_int = [&](const LogicalType &in) {
-		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
-		    in, LogicalType::BIGINT);
-		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-		set.AddFunction(f);
-	};
 	// One OP works for all widths (input is cast to int64_t in Operation).
 	{
 		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int8_t, int64_t, SparkTrySumIntegerOperation>(
@@ -284,7 +278,6 @@ inline AggregateFunctionSet CreateSparkTrySumFunctionSet() {
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
-	(void)add_int;
 	return set;
 }
 
@@ -360,11 +353,6 @@ inline AggregateFunctionSet CreateSparkTryAvgFunctionSet() {
 	set.AddFunction(decimal_func);
 
 	// Integer + floating overloads -> DOUBLE.
-	auto add_double = [&](const LogicalType &in) {
-		// dispatched below per physical input type
-		(void)in;
-	};
-	(void)add_double;
 	{
 		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int8_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::TINYINT, LogicalType::DOUBLE);

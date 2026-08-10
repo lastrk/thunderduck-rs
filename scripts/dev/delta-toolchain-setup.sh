@@ -31,7 +31,7 @@ if [[ ! -x "$MM" ]]; then
   curl -Ls "https://micro.mamba.pm/api/micromamba/${MAMBA_ARCH}/latest" | tar -xj -C "$TC" bin/micromamba
 fi
 
-# Compiler binary name follows conda's host-triplet convention.
+# Conda names compiler binaries with a host triplet.
 existing_cxx() { ls "$ENV"/bin/*-linux-gnu-g++ 2>/dev/null | head -1; }
 
 if [[ -z "$(existing_cxx)" ]]; then

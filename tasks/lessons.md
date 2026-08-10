@@ -412,3 +412,10 @@ explicit `THUNDERDUCK_BINARY` is supplied.
 - **Land cross-cutting tooling independently.** Keep the SCIP isolation PR based
   on `main`, then cherry-pick the same commit into the active refactor branch;
   do not make generally useful tooling depend on the in-flight refactor stack.
+
+## 2026-08-09 — Resolve phase labels from the named plan
+
+- When a request names a plan file and phase, read that exact phase before
+  selecting a branch or implementation target. Nearby branch context can be
+  stale: here, an active plan-origin branch suggested Phase 2 work while the
+  named plan's Phase 3 was the generator-IR migration.

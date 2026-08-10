@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::generator::Generator;
 use super::name_fold::eq_fold;
 use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
@@ -34,7 +35,7 @@ pub(crate) fn int_literal_value(expr: &Expression) -> Option<i32> {
 ///
 /// Returns `None` for any non-literal or non-string expression. Used by the
 /// literal-keyed inference arms (`named_struct`, `to_number`, `from_json`,
-/// `from_csv`, `inline_field`) and the `ExtractValue` field-name lookups.
+/// `from_csv`) and the `ExtractValue` field-name lookups.
 pub(super) fn as_string_literal(e: &Expression) -> Option<&str> {
     match e {
         Expression::Literal(Literal {
@@ -44,8 +45,6 @@ pub(super) fn as_string_literal(e: &Expression) -> Option<&str> {
         _ => None,
     }
 }
-
-// ── Supporting sub-types ─────────────────────────────────────────────────────
 
 /// Binary arithmetic / comparison / logical / string / bitwise operators.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -233,29 +232,15 @@ pub struct ColumnReference {
     pub qualifier: Option<String>,
     pub data_type: DataType,
     pub nullable: bool,
-    /// N9 increment 2 / ADR-024: the [`super::schema::ExprId`] of the
-    /// [`super::schema::Attribute`] this reference resolved to — the
-    /// PRODUCING node's own output schema for a local reference (`ctx.schema`
-    /// at resolution time), or the ENCLOSING plan's output schema for a
-    /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
-    /// `resolve_in_outer` in `analyzer.rs`). Unlike `data_type`/`nullable`
-    /// (stamped on every `ColumnReference` by construction, E4/D3), this
-    /// field stays `Option` for representational uniformity (an
-    /// `UnresolvedColumn` truly has none), but Pass F2 (stages 1-3) closed
-    /// every production gap that used to leave a RESOLVED reference
-    /// id-less: qualified struct-field access — local (tier-(d) in
-    /// `resolve_column`) AND correlated-outer (`resolve_in_outer`'s struct
-    /// arm) alike — resolves to an `ExtractValue` chain
-    /// (`analyzer.rs`'s `build_struct_extract_chain`) whose root
-    /// `ColumnReference` is stamped with the struct COLUMN's own real
-    /// attribute id (the LOCAL or OUTER schema's, as appropriate); every
-    /// other resolution tier already stamped a real id before this pass.
-    /// There is no longer a production site that returns a fully-resolved
-    /// `ColumnReference` with `expr_id: None`.
+    /// The [`super::schema::ExprId`] of the [`super::schema::Attribute`] this
+    /// reference resolved to. Local references use the producing plan's
+    /// schema; correlated references use the enclosing plan's schema. The
+    /// root of a struct-field extraction carries the id of its struct column.
+    /// Resolved references carry an id; `None` is retained for representational
+    /// symmetry with unresolved inputs.
     ///
-    /// Derived resolution data recording *which* attribute the reference
-    /// bound to, not part of the reference's own logical identity — excluded
-    /// from `PartialEq` (see below).
+    /// This is derived binding data, not part of the reference's logical
+    /// identity, and is excluded from `PartialEq`.
     pub expr_id: Option<ExprId>,
 }
 
@@ -294,31 +279,15 @@ impl ColumnReference {
 }
 
 impl PartialEq for ColumnReference {
-    /// Excludes `expr_id`, `data_type`, and `nullable`: all three are derived
-    /// resolution facts recording *which* attribute a column resolved to and
-    /// *what the schema says about it*, not part of the reference's logical
-    /// identity (`name` + `qualifier`). Mirrors `TypedAst`'s scope-excluding
-    /// `Eq` — keeps every pre-existing equality-based test unchanged.
+    /// Excludes `expr_id`, `data_type`, and `nullable`: they are resolution
+    /// facts, not part of the reference's logical identity (`name` and
+    /// `qualifier`).
     ///
     /// **LOUD WARNING:** this means `==` on two `ColumnReference`s (or on any
     /// `Expression` tree containing one) CANNOT distinguish two references
     /// that share a name/qualifier but disagree on type or nullability. A
-    /// future test must not rely on `==`/`assert_eq!`/`assert_ne!` to detect
-    /// a type or nullability difference between two `ColumnReference`s —
-    /// compare `.data_type`/`.nullable` directly instead. Production
-    /// consequence: Pass F2 (stages 1-3) unified BOTH local qualified
-    /// struct-field access (tier-(d) in `resolve_column`) AND its correlated
-    /// OUTER twin (`resolve_in_outer`'s struct arm) onto an `ExtractValue`
-    /// chain whose root `ColumnReference` carries the struct COLUMN's own
-    /// real attribute id — so a same-named struct field reached through a
-    /// DIFFERENT root struct (local or outer) is now discriminated by
-    /// `ids_compatible` on the distinct root ids, not by this id-blind `eq`.
-    /// Every resolved `ColumnReference` now carries a real `expr_id` (see
-    /// this field's own doc above), so the widened same-type-collision gap
-    /// this warning used to describe for id-less struct-field refs no longer
-    /// has a live production instance — a hazard here is now the same
-    /// generic risk `ids_compatible` guards for every OTHER id-carrying
-    /// reference.
+    /// Compare `.data_type` and `.nullable` directly when testing resolved
+    /// schema facts.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.qualifier == other.qualifier
     }
@@ -329,7 +298,7 @@ impl PartialEq for ColumnReference {
 /// `plan_id` is first-class per §2.3 — it identifies the proto DataFrame /
 /// plan node the reference belongs to. τ's analyzer uses this field as a
 /// resolution hint on join-side disambiguation. SparkSQL entries set
-/// `plan_id = None` (Open Decision 12).
+/// SQL front-end references use `plan_id = None`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedColumn {
     pub name: String,
@@ -342,7 +311,7 @@ impl UnresolvedColumn {
     /// front-ends emit for an undotted identifier. NOT for dotted references:
     /// `v2_lowering`'s `Expr::CompoundIdentifier` arm keeps its own literal,
     /// since routing it here would drop the leading part instead of binding it
-    /// as the qualifier (corpus witness: cx-004).
+    /// as the qualifier.
     pub fn bare(name: impl Into<String>) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.into(),
@@ -399,8 +368,8 @@ pub struct CastExpression {
     pub to_type: DataType,
     /// `true` = TRY_CAST (nullable), `false` = CAST.
     pub try_cast: bool,
-    /// analyzer-materialized coercion (N4): transparent to output naming and
-    /// semantic_eq; never set by front-ends.
+    /// Analyzer-materialized coercion, transparent to output naming and
+    /// semantic equality; front-ends never set this flag.
     pub implicit: bool,
 }
 
@@ -581,13 +550,6 @@ pub struct ExtractValueExpression {
     pub extraction: Box<Expression>,
 }
 
-/// Row constructor `(a, b, c)` → Struct.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RowConstructorExpression {
-    pub elements: Vec<Expression>,
-    pub field_names: Vec<String>,
-}
-
 /// `withField` / `dropFields` on a struct.
 ///
 /// Each entry in [`Self::updates`] is either an add/replace (`Some(expr)`) or a
@@ -602,8 +564,6 @@ pub struct UpdateFieldsExpression {
     pub updates: Vec<(String, Option<Expression>)>,
 }
 
-// ── Expression enum (28 variants — Spark 4.1.1 parity) ───────────────────────
-
 /// τ's canonical expression tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
@@ -614,6 +574,7 @@ pub enum Expression {
     Binary(BinaryExpression),
     Unary(UnaryExpression),
     FunctionCall(FunctionCall),
+    Generator(Generator),
     Cast(CastExpression),
     CaseWhen(CaseWhenExpression),
     Window(WindowFunction),
@@ -634,7 +595,6 @@ pub enum Expression {
     Interval(IntervalExpression),
     IsDistinctFrom(IsDistinctFromExpression),
     ExtractValue(ExtractValueExpression),
-    RowConstructor(RowConstructorExpression),
     UpdateFields(UpdateFieldsExpression),
 }
 
@@ -681,8 +641,8 @@ macro_rules! expression_children {
             }
 
             Expression::FunctionCall(f) => Box::new(f.args.$iter()),
+            Expression::Generator(g) => Box::new(g.args.$iter()),
             Expression::ArrayLiteral(a) => Box::new(a.elements.$iter()),
-            Expression::RowConstructor(rc) => Box::new(rc.elements.$iter()),
 
             Expression::CaseWhen(cw) => Box::new(
                 cw.branches
@@ -743,6 +703,7 @@ impl Expression {
                 UnaryOp::Negate => u.operand.data_type(schema),
             },
             Expression::FunctionCall(f) => Self::function_call_data_type(f, schema),
+            Expression::Generator(_) => DataType::Unresolved,
             Expression::Cast(c) => c.to_type.clone(),
             Expression::CaseWhen(cw) => Self::case_when_data_type(cw, schema),
             Expression::Window(w) => Self::window_data_type(w, schema),
@@ -800,22 +761,6 @@ impl Expression {
                 IntervalKind::Calendar => DataType::Interval,
             },
             Expression::ExtractValue(ev) => Self::extract_value_data_type(ev, schema),
-            Expression::RowConstructor(rc) => {
-                let fields: Vec<StructField> = rc
-                    .elements
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        let name = rc
-                            .field_names
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| format!("col{}", i + 1));
-                        StructField::new(name, e.data_type(schema), e.nullable(schema))
-                    })
-                    .collect();
-                DataType::Struct(StructType::new(fields))
-            }
             Expression::UpdateFields(u) => Self::update_fields_data_type(u, schema),
         }
     }
@@ -840,6 +785,7 @@ impl Expression {
                 _ => u.operand.nullable(schema),
             },
             Expression::FunctionCall(f) => Self::function_call_nullable(f, schema),
+            Expression::Generator(_) => false,
             Expression::Cast(c) => {
                 if c.try_cast {
                     return true;
@@ -895,7 +841,6 @@ impl Expression {
             Expression::Interval(_) => false,
             Expression::IsDistinctFrom(_) => false,
             Expression::ExtractValue(ev) => Self::extract_value_nullable(ev, schema),
-            Expression::RowConstructor(rc) => rc.elements.iter().any(|e| e.nullable(schema)),
             Expression::UpdateFields(u) => {
                 u.struct_expr.nullable(schema)
                     || u.updates.iter().any(|(_, e)| match e {
@@ -906,19 +851,16 @@ impl Expression {
         }
     }
 
-    // ── Structural walker ───────────────────────────────────────────────────
-
     /// Iterate over the immediate child expressions of this node.
     ///
-    /// **τ walker convention (behavior-preserving):**
+    /// **τ walker convention:**
     /// - Subquery-body children (`InSubquery.expr`, `Lambda.body`) are
     ///   included so downstream `map_children` calls can walk them.
     /// - `WindowFunction.frame` boundary expressions are NOT included —
-    ///   they are always literal offsets in practice and τ's transform
-    ///   walkers historically did not recurse into them.
+    ///   they are literal offsets and are not transformed by this walker.
     /// - The `CommonAst` subquery bodies inside `InSubquery`,
     ///   `ExistsSubquery`, and `ScalarSubquery` are opaque to expression
-    ///   walkers by contract (future τ work owns subquery analysis).
+    ///   walkers by contract.
     ///
     /// Analyzer walkers that punt on entire variants (subquery / lambda /
     /// raw-sql / interval — see [`Self::map_children`] doc) should
@@ -991,15 +933,13 @@ impl Expression {
 
     /// The opacity set of the two RESOLUTION walkers (`resolve_and_stamp`,
     /// `substitute_lateral_aliases`): the shared core plus `UnresolvedRegex`,
-    /// which both pass through opaquely (Pass 85's `expand_regex_projections`
+    /// which both pass through opaquely (`expand_regex_projections`
     /// rewrites it before it reaches either walker; residuals surface via
     /// emission's defensive arm). One authority for the pair so the extra
     /// cannot drift between them.
     pub(crate) fn is_resolve_opaque(&self) -> bool {
         self.is_opaque_unit() || matches!(self, Expression::UnresolvedRegex(_))
     }
-
-    // ── Binary data-type derivation ──────────────────────────────────────────
 
     fn binary_data_type(b: &BinaryExpression, schema: &ResolvedSchema) -> DataType {
         if b.op.is_boolean_result() {
@@ -1020,8 +960,7 @@ impl Expression {
         if let Some(dt) = date_like_interval_result(&b.op, &l, &r) {
             return dt;
         }
-        // Timestamp − Timestamp → DayTimeInterval (Spark 4.1 parity —
-        // corpus intv-005). NTZ mixes coerce to DayTimeInterval too.
+        // Timestamp − Timestamp → DayTimeInterval (Spark 4.1 parity).
         if b.op == BinaryOp::Sub {
             match (&l, &r) {
                 (DataType::Timestamp, DataType::Timestamp)
@@ -1099,8 +1038,6 @@ impl Expression {
         Some((digits, 0))
     }
 
-    // ── FunctionCall data-type derivation ────────────────────────────────────
-
     fn function_call_data_type(f: &FunctionCall, schema: &ResolvedSchema) -> DataType {
         // Pre-pass for return types that need the argument EXPRESSIONS
         // themselves — literal schemas, literal scales, struct field naming.
@@ -1162,7 +1099,7 @@ impl Expression {
             // the element type of the corresponding input array. Field
             // names follow Spark's rules: alias > column-ref name > positional
             // integer string. Emission matches this shape exactly (see
-            // `emission.rs`, `"arrays_zip"` arm). Corpus anchor: `arr-012`.
+            // `emission.rs`, `"arrays_zip"` arm).
             "arrays_zip" if !f.args.is_empty() => {
                 // Derive per-arg field names — same rules as emission.
                 let names: Vec<String> = f
@@ -1196,8 +1133,7 @@ impl Expression {
             // `array`/`map`/`create_map` there too, once the resolver's
             // signature widened to `(DataType, bool)` pairs so it could read
             // per-arg nullability without needing the argument
-            // *expressions*). Differentials: `type-020`, `cx-002`,
-            // `test_map_from_arrays`.
+            // *expressions*).
             //
             // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
             // DECIMAL(p, s) derived from the format string. Emission parses
@@ -1207,7 +1143,6 @@ impl Expression {
             // recognized digit template, this falls through to the shared
             // resolver, which has no `to_number` arm — the result is
             // `Unresolved` (an honest ADR-022 boundary, not a String).
-            // Corpus anchor: `parse-004`.
             "to_number" | "try_to_number" if f.args.len() == 2 => {
                 if let Some(fmt) = as_string_literal(&f.args[1]) {
                     if let Some((precision, scale)) =
@@ -1222,8 +1157,7 @@ impl Expression {
             // DDL literal (from_csv: flat primitives only — Spark's own
             // surface). Mirror emission's DDL translation for type inference
             // so the projection schema matches Spark; only the DDL helper
-            // differs between the two. Corpus anchors: `json-003`,
-            // `json-004` (from_json); `json-007` (from_csv).
+            // differs between the two.
             name @ ("from_json" | "from_csv") if f.args.len() == 2 => {
                 if let Some(ddl) = as_string_literal(&f.args[1]) {
                     let st = if name == "from_json" {
@@ -1236,27 +1170,6 @@ impl Expression {
                     }
                 }
             }
-            // Pass 90 — synthetic per-field FunctionCall names produced by
-            // the analyzer's Project pre-pass for `F.inline` / `F.inline_outer`
-            // (see `analyzer::expand_inline_projections`). `args[0]` is the
-            // resolved `Array<Struct<...>>`; `args[1]` is a `Literal::String`
-            // carrying the target field name. Return type = struct field's
-            // type (case-insensitive lookup, matching Spark). Corpus: inl-001,
-            // inl-002.
-            "inline_field" | "inline_outer_field" if f.args.len() == 2 => {
-                if let Some(field_name) = as_string_literal(&f.args[1]) {
-                    if let DataType::Array(inner, _) = f.args[0].data_type(schema) {
-                        if let DataType::Struct(st) = *inner {
-                            for field in &st.fields {
-                                if eq_fold(&field.name, field_name) {
-                                    return field.data_type.clone();
-                                }
-                            }
-                        }
-                    }
-                }
-                return DataType::Unresolved;
-            }
             // Spark's 2-arg `ceil(x, t)` / `floor(x, t)` (`RoundCeil`/
             // `RoundFloor`) implicitly cast the child to Decimal and return a
             // scaled Decimal derived from the child type + literal target
@@ -1264,7 +1177,7 @@ impl Expression {
             // first arg's type and cannot read the scale literal, so derive it
             // here where the whole `FunctionCall` is available. A non-literal
             // scale is a Thunderduck boundary → `Unresolved`. 1-arg ceil/floor
-            // falls through to the shared resolver. Corpus: `num-003`.
+            // falls through to the shared resolver.
             "ceil" | "ceiling" | "floor" if f.args.len() == 2 => {
                 let input = f.args[0].data_type(schema);
                 match int_literal_value(&f.args[1]) {
@@ -1281,7 +1194,7 @@ impl Expression {
             // derive the Decimal branch here. A missing 2nd arg ⇒ scale 0; a
             // non-literal scale on a Decimal child is a Thunderduck boundary →
             // `Unresolved`. The Decimal branch is byte-identical to
-            // `ceil_floor_type(input, Some(scale))`. Corpus: `num-005`, `num-006`.
+            // `ceil_floor_type(input, Some(scale))`.
             "round" | "bround" if !f.args.is_empty() => {
                 let input = f.args[0].data_type(schema);
                 if !matches!(input, DataType::Decimal { .. }) {
@@ -1314,16 +1227,13 @@ impl Expression {
         TypeInferenceEngine::function_return_type(&f.name, &args)
     }
 
-    // ── FunctionCall nullability ─────────────────────────────────────────────
-
     /// Names in this list report `nullable = false` regardless of arg nullability.
     ///
     /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
     /// `debug_assert!` this; release builds trust the contract to avoid an
     /// unnecessary allocation.
     ///
-    /// Contains the count family (checklist §1.1) and the hash family
-    /// (checklist §1.2). Extending this list requires adding to the
+    /// Contains the count family and the hash family. Extending this list requires adding to the
     /// symmetric-omission tests (§8) as well.
     fn is_non_nullable_function_name_lower(name_lower: &str) -> bool {
         debug_assert!(
@@ -1331,15 +1241,13 @@ impl Expression {
             "is_non_nullable_function_name_lower requires pre-lowercased input; got `{name_lower}`",
         );
         // Non-nullable aggregates come from the AGG_SPECS table; the hash
-        // family (checklist §1.2) is the only non-aggregate addition.
+        // family is the only non-aggregate addition.
         TypeInferenceEngine::aggregate_is_non_nullable_lower(name_lower)
             || matches!(name_lower, "hash" | "murmur3" | "xxhash64")
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
-        // N5: `f.name` is already canonical lowercase; `lower` borrows it
-        // rather than cloning (post-N5, no re-derivation needed; the match
-        // below only reads it).
+        // `f.name` is already canonical lowercase; the match below only reads it.
         let lower: &str = f.name.as_str();
         if Self::is_non_nullable_function_name_lower(lower) {
             return false;
@@ -1361,14 +1269,12 @@ impl Expression {
                     then_nullable || else_nullable
                 }
             }
-            // ── Always non-nullable scalars — constant `false` regardless of
-            // arg nullability ────────────────────────────────────────────────
             // * `isnull` / `isnan` / `isnotnull` / `isnotnan` / `is_nan` /
             //   `isinf`, `concat_ws`, `typeof` / `spark_partition_id` /
             //   `monotonically_increasing_id`.
             // * `format_string` / `printf` — Spark returns non-nullable; NULL
             //   args render as the literal string "null" rather than
-            //   propagating NULL. Corpus witness: `str-015`.
+            //   propagating NULL.
             // * `array` / `make_array` / `create_map` / `map` /
             //   `named_struct` / `struct` — constructors are never NULL
             //   themselves (only elements / fields carry nullability).
@@ -1380,31 +1286,17 @@ impl Expression {
             //   τ's default `any(arg.nullable)` fallback would incorrectly
             //   propagate the timestamp arg's nullable into the struct
             //   itself; pin `false` here to match Spark's observable schema.
-            //   Corpus: `win2-002`.
-            // * `posexplode_pos` — the position column is a synthetic
-            //   0-indexed integer, never NULL. Non-nullable regardless of the
-            //   input array's nullability. Corpus: arr-017.
-            // * `map_explode_key` — synthetic per-column call (map-007; see
-            //   the v2 relation converter's alias-splitter). Spark's
-            //   `explode(map)` produces `(key, value)` rows where keys are
-            //   ALWAYS non-nullable (Spark's MAP invariant); a NULL map arg
-            //   emits zero rows, so a nullable outer map does not propagate
-            //   to the key column. (Values inherit the map's
-            //   `valueContainsNull` flag — see the data-dependent
-            //   `map_explode_val` arm below.)
             "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" | "concat_ws"
             | "format_string" | "printf" | "typeof" | "spark_partition_id"
             | "monotonically_increasing_id" | "array" | "make_array" | "create_map" | "map"
-            | "named_struct" | "struct" | "window" | "posexplode_pos" | "map_explode_key" => false,
-            // ── Always nullable scalars — constant `true` regardless of arg
-            // nullability ────────────────────────────────────────────────────
+            | "named_struct" | "struct" | "window" => false,
             // Spark scalars declared nullable regardless of arg nullability
             // (overflow / parse-fail / undefined-domain producers).
             "factorial" | "url_encode" | "url_decode" | "parse_url"
             | "to_number" | "try_to_number" | "to_date_ntz"
             // Spark's `from_unixtime(secs[, fmt])` declares nullable=True
             // even for a non-null seconds literal — the value can be NULL
-            // when the format is invalid. Corpus witness dt-014.
+            // when the format is invalid.
             | "from_unixtime"
             | "map_from_entries" | "try_add" | "try_subtract"
             | "try_multiply" | "try_divide" | "try_element_at"
@@ -1412,51 +1304,31 @@ impl Expression {
             // nullable=True even when the argument is a non-null `struct(...)`
             // constructor. PySpark's projection semantics: the result column
             // comes back nullable=True even though the Catalyst
-            // `CreateStruct` value is non-null. Corpus: `json-005`, `json-008`.
+            // `CreateStruct` value is non-null.
             // Note: `schema_of_json` is NOT in this list — Spark reports its
             // result as nullable=False when the JSON literal is a
-            // non-null literal (corpus witness: `json-006` requires
+            // non-null literal (`schema_of_json` requires
             // Reference=False), so it falls through to the default
             // `any(arg.nullable)` path which correctly yields false for
             // literal arguments.
             | "to_json" | "to_csv"
-            // `explode_outer(arr)` — always nullable: empty / NULL arrays
-            // emit exactly one row with a NULL value. Corpus: arr-016.
-            | "explode_outer"
-            // `inline_outer_field` — always nullable: the empty / NULL array
-            // sentinel row is all-NULL by construction. Mirrors
-            // `explode_outer` in this same list. Corpus: inl-002.
-            | "inline_outer_field"
-            // Pass 91 — synthetic `json_tuple_field(json, "<key>")` produced
-            // by the analyzer's Project pre-pass (`expand_json_tuple_projections`).
-            // Always nullable — Spark returns NULL for missing key OR JSON
-            // null value OR NULL `json_str`. Corpus: json-002.
-            | "json_tuple_field"
             // `json_object_keys(jsonStr)` — always nullable: Spark returns
             // NULL for a NULL, invalid-JSON, or non-object input (the
             // `CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT'
             // THEN json_keys(...) ELSE NULL END` emission wrapper), so the
             // result is nullable even over a non-nullable literal argument.
-            // Corpus: fn-024, fn-025, fn-026.
             | "json_object_keys"
             // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
             // array contains any NULL inner array. Even a non-nullable
             // literal outer array (`F.array(...)`) produces a nullable
-            // result per Spark's schema semantics. Corpus: `arr-013`.
+            // result per Spark's schema semantics.
             | "flatten" | "list_flatten"
-            // piv-006 — synthetic per-column call from
-            // `expand_stack_projections`. Spark's `Stack.elementSchema`
-            // pins every output column to `nullable = true` regardless
-            // of whether the individual row-values are non-null literals.
-            | "stack_col"
             // Spark's `ArrayAggregate.nullable` = `argument.nullable ||
             // finish.nullable`. In `bindInternal` the accumulator variable
             // is bound with `nullable = true` (hardcoded), so
             // `finish.nullable()` is always `true` — making the overall
             // result always nullable. Applies to `aggregate`, `reduce`,
             // and `list_reduce` HOFs.
-            // Corpus: lambda aggregate_sum / aggregate_product /
-            // aggregate_with_init / sql_aggregate / sql_aggregate_product.
             | "aggregate" | "reduce" | "list_reduce"
             // `ceil`/`ceiling`/`floor` (Spark's `Ceil`/`Floor`) declare
             // `nullable = true` unconditionally — the Double→Long widening
@@ -1476,95 +1348,23 @@ impl Expression {
             // NULL. Verified against Apache Spark 4.1.1.
             // Differential: TestMathFunctions::test_exp, test_log.
             | "exp" | "ln" | "log" | "log10" | "log2"
-            // GRAB item 5 (P5 probe, 2026-07-14): Spark's `UnaryMathExpression`
-            // family declares `nullable = true` unconditionally, same rule as
-            // `exp`/`ln`/`log`/`log10`/`log2` above (domain guards / NaN-to-NULL
-            // conversion mean even a non-nullable input can still produce
-            // NULL). Live-verified against Apache Spark 4.1.1: all 25 of these
-            // report `nullable=True` over a non-nullable `Double` input column
-            // (`sqrt cbrt sin cos tan asin acos atan sinh cosh tanh asinh
-            // acosh atanh expm1 log1p cot sec csc degrees radians rint signum
-            // sign exp` — `exp` already covered above; the remaining 24 added
-            // here). Corpus: math-018, math-019, math-020.
+            // Spark's remaining `UnaryMathExpression` functions also declare
+            // `nullable = true` unconditionally. Domain guards and NaN-to-NULL
+            // conversion mean a non-nullable input can still produce NULL.
             | "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
             | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "expm1" | "log1p" | "cot"
             | "sec" | "csc" | "degrees" | "radians" | "rint" | "signum" | "sign" => true,
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
             // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
             // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same
-            // branch-only nullability rule. Corpus witness: cnd-009.
+            // branch-only nullability rule.
             "nvl2" | "if" | "iif" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
-            // Generator functions (row-multiplying via UNNEST at emission).
-            // `explode(arr)` / `posexplode_val(arr)` — element nullability
-            // follows the array's `containsNull` flag AND the array arg's own
-            // nullability (a NULL array in `explode` produces zero rows).
-            // Corpus: arr-015, arr-017, type-012.
-            "explode" | "posexplode_val" => match f.args.first() {
-                Some(arg) => {
-                    let contains_null = matches!(
-                        arg.data_type(schema),
-                        DataType::Array(_, true) | DataType::Map { .. }
-                    );
-                    contains_null || arg.nullable(schema)
-                }
-                None => true,
-            },
-            // Pass 90 — synthetic per-field FunctionCalls for
-            // `F.inline` / `F.inline_outer` (analyzer's Project pre-pass —
-            // `expand_inline_projections`). Args: (arr, field_name_literal).
-            //
-            // `inline_field` — nullability follows Spark's `Inline`:
-            //   * struct field's own nullability (case-insensitive lookup),
-            //   * OR the array's `containsNull` flag,
-            //   * OR the array arg's nullability (a NULL array yields zero
-            //     rows for the inner variant, so array-nullability doesn't
-            //     truly propagate to the produced column; keep the
-            //     conservative disjunction — matches `explode`'s posexplode_val
-            //     arm above for parity).
-            // Corpus: inl-001.
-            "inline_field" => match (f.args.first(), f.args.get(1).and_then(as_string_literal)) {
-                (Some(arr), Some(field_name)) => {
-                    let arr_ty = arr.data_type(schema);
-                    let (contains_null, field_nullable) = match &arr_ty {
-                        DataType::Array(inner, cn) => match inner.as_ref() {
-                            DataType::Struct(st) => {
-                                let field_null = st
-                                    .fields
-                                    .iter()
-                                    .find(|f0| eq_fold(&f0.name, field_name))
-                                    .map(|f0| f0.nullable)
-                                    .unwrap_or(true);
-                                (*cn, field_null)
-                            }
-                            _ => (true, true),
-                        },
-                        _ => (true, true),
-                    };
-                    arr.nullable(schema) || contains_null || field_nullable
-                }
-                _ => true,
-            },
-            // Synthetic `map_explode_val(m)` (map-007) — values inherit the
-            // map's `valueContainsNull` flag. (Its `map_explode_key` sibling
-            // is pinned non-nullable in the constant-`false` list above.)
-            "map_explode_val" => match f.args.first() {
-                Some(arg) => matches!(
-                    arg.data_type(schema),
-                    DataType::Map {
-                        value_nullable: true,
-                        ..
-                    }
-                ),
-                None => true,
-            },
             _ => f.args.iter().any(|a| a.nullable(schema)),
         }
     }
-
-    // ── CaseWhen data-type unification ───────────────────────────────────────
 
     fn case_when_data_type(cw: &CaseWhenExpression, schema: &ResolvedSchema) -> DataType {
         let mut types_iter = cw
@@ -1588,8 +1388,6 @@ impl Expression {
             }
         })
     }
-
-    // ── Window data-type derivation ──────────────────────────────────────────
 
     fn window_data_type(w: &WindowFunction, schema: &ResolvedSchema) -> DataType {
         match w.func.as_ref() {
@@ -1625,8 +1423,6 @@ impl Expression {
         }
     }
 
-    // ── ExtractValue derivations ─────────────────────────────────────────────
-
     fn extract_value_data_type(ev: &ExtractValueExpression, schema: &ResolvedSchema) -> DataType {
         let base_type = ev.child.data_type(schema);
         let field_name = as_string_literal(ev.extraction.as_ref());
@@ -1655,7 +1451,7 @@ impl Expression {
             // failOnError=true:
             //   * a foldable, non-null CONSTANT index into a `CreateArray`
             //     literal child, in-bounds -> that element's nullability
-            //     (e.g. `array(1,2,3)[0]` -> non-null; corpus witness cx-001);
+            //     (e.g. `array(1,2,3)[0]` -> non-null);
             //   * a foldable constant index into ANY OTHER child (notably a
             //     column `col[i]`) -> true;
             //   * a non-constant index -> the array's `containsNull` flag.
@@ -1717,18 +1513,15 @@ impl Expression {
         }
     }
 
-    // ── UpdateFields derivation ──────────────────────────────────────────────
-
     fn update_fields_data_type(u: &UpdateFieldsExpression, schema: &ResolvedSchema) -> DataType {
         let base = u.struct_expr.data_type(schema);
         let DataType::Struct(mut st) = base else {
             return DataType::Unresolved;
         };
         // Delegate to the shared classifier so analyzer + emission cannot
-        // drift. `data_type()` is infallible — a missing drop target here
-        // silently leaves the struct unchanged. `resolve_and_stamp` runs
-        // `validate_update_fields_ops` earlier and rejects such inputs with
-        // an [`AnalyzerError::Other`] (Spark-emulated).
+        // drift. `data_type()` is infallible, and a missing drop target
+        // silently leaves the struct unchanged — which is exactly what Spark
+        // 4.1.1 does.
         apply_update_fields_ops(
             &mut st.fields,
             &u.updates,
@@ -1750,13 +1543,12 @@ impl Expression {
     }
 }
 
-// ── N4: binary-coercion materialization ─────────────────────────────────────
 //
 // `binary_data_type` (above) infers two Spark coercions that are implicit in
 // the *type* it returns but are never inserted into the *tree*: (1) a lone
 // integral Div operand widened to a synthetic decimal form for the
 // arithmetic formula, and (2) `Date ± Interval` staying `Date` (DuckDB
-// natively promotes it to `TIMESTAMP`). Emission used to re-derive both from
+// natively promotes it to `TIMESTAMP`). Emission derives both from
 // the tree's declared types at render time (a second, independently
 // maintained copy of this logic); N4 instead materializes them once, as the
 // analyzer resolves a `Binary` node, via [`materialize_binary_coercions`] —
@@ -1769,10 +1561,9 @@ impl Expression {
 /// YearMonthIntervalType` and `Date + CalendarIntervalType` stay `DATE`, but
 /// `Date + DayTimeIntervalType` — any field span containing a sub-day unit —
 /// widens to `TIMESTAMP` per Catalyst's `DateAddInterval`/type-coercion
-/// rules; live-probed against Spark 4.1.1 Connect, findings R1-6). This is
-/// the single home of that rule — `SEAM(R1-6)`, now closed: previously this
-/// function always kept `Date`, silently truncating the time-of-day for
-/// `DATE ± INTERVAL '25' HOUR`-shaped expressions.
+/// rules). This is the single home of that rule: preserving `Date` for
+/// `DATE ± INTERVAL '25' HOUR`-shaped expressions would silently truncate the
+/// time of day.
 ///
 /// τ's `DataType::DayTimeInterval` is field-less (see `types::data_type`), so
 /// it cannot distinguish `DayTimeIntervalType(DAY)` (day-only span, Spark:
@@ -1947,8 +1738,6 @@ pub(crate) fn materialize_binary_coercions(
     Expression::Binary(b)
 }
 
-// ── UpdateFields shared classifier ──────────────────────────────────────────
-
 /// Apply Spark `withField` / `dropFields` operations to a caller-owned field
 /// list, preserving Spark 4.1 semantics:
 ///
@@ -1959,7 +1748,8 @@ pub(crate) fn materialize_binary_coercions(
 /// * Drop matches existing fields **case-insensitively** ([`eq_fold`]).
 /// * A drop target that does not match any current field is **silently
 ///   ignored** here — callers that need Spark-emulated rejection must invoke
-///   [`validate_update_fields_ops`] first.
+///   Spark itself tolerates a missing drop target, so a silent ignore here
+///   is the correct Spark-parity behaviour, not a latent bug.
 ///
 /// The callbacks let the caller decide the payload type `T`:
 ///
@@ -2004,48 +1794,12 @@ pub(super) fn apply_update_fields_ops<T>(
     }
 }
 
-/// Validate a Spark `UpdateFields` op list against a base struct's declared
-/// field names. Returns the first drop target that does not resolve
-/// (case-insensitive), which the analyzer surfaces as a Spark-emulated error.
-///
-/// Ordering: `updates` are applied left to right, so a drop-then-add sequence
-/// on the same name is legal (the add would append). We walk a virtual
-/// projected field-name list and check drops against it.
-pub(super) fn validate_update_fields_ops(
-    base_field_names: &[String],
-    updates: &[(String, Option<Expression>)],
-) -> Result<(), String> {
-    let mut names: Vec<String> = base_field_names.to_vec();
-    for (name, op) in updates {
-        match op {
-            Some(_) => {
-                let existing = names.iter().position(|n| eq_fold(n, name));
-                if existing.is_none() {
-                    names.push(name.clone());
-                }
-                // In-place replace preserves the declared name — no
-                // change to the `names` vector.
-            }
-            None => {
-                let idx = names
-                    .iter()
-                    .position(|n| eq_fold(n, name))
-                    .ok_or_else(|| name.clone())?;
-                names.remove(idx);
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::type_inference::{
         aggregate_classifier_names, CORR_FAMILY_NAMES, HASH_FAMILY_NAMES,
     };
     use super::*;
-
-    // ── Shared expression constructors ──────────────────────────────────────
 
     fn int_lit(v: i32) -> Expression {
         Expression::Literal(Literal {
@@ -2084,8 +1838,6 @@ mod tests {
         })
     }
 
-    // ── Checklist §1.1 — `count_if` FunctionCall nullability ────────────────
-
     #[test]
     fn count_if_function_call_is_non_nullable() {
         let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
@@ -2096,7 +1848,7 @@ mod tests {
         assert!(!expr.nullable(&s));
     }
 
-    /// Sanity anchor — `count` over a nullable column must still be non-null.
+    /// `count` over a nullable column is non-nullable.
     #[test]
     fn count_of_nullable_column_is_non_nullable() {
         let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
@@ -2108,7 +1860,7 @@ mod tests {
     }
 
     /// Spark `If.nullable` excludes the predicate — a nullable predicate with
-    /// two non-null branches is non-nullable. Corpus witness: cnd-009.
+    /// two non-null branches is non-nullable.
     #[test]
     fn if_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
         let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
@@ -2176,8 +1928,6 @@ mod tests {
         );
         assert!(expr.nullable(&s));
     }
-
-    // ── Complex-type constructor inference (cx-001 / cx-002) ───────────────
 
     #[test]
     fn map_constructor_infers_key_and_value_types_from_args() {
@@ -2269,8 +2019,6 @@ mod tests {
         assert!(!ev.nullable(&ResolvedSchema::empty()));
     }
 
-    // ── Checklist §1.2 — hash family FunctionCall nullability ──────────────
-
     #[test]
     fn hash_and_xxhash64_are_non_nullable_regardless_of_args() {
         let s = ResolvedSchema::minted(StructType::new(vec![
@@ -2304,8 +2052,6 @@ mod tests {
         }
     }
 
-    // ── Symmetric-omission mechanical checks (§8) ───────────────────────────
-
     /// §8.2 — every name where `aggregate_is_non_nullable` is `true` must
     /// produce a `FunctionCall` that reports `nullable == false`.
     /// (Rewritten for the AGG_SPECS table: iterates the classifier column in
@@ -2333,7 +2079,7 @@ mod tests {
     /// `CreateNamedStruct`, whose `nullable = false`. τ must report the
     /// struct itself as non-nullable regardless of the timestamp arg's own
     /// nullability (only the inner `start` / `end` fields carry
-    /// per-field nullability). Corpus: `win2-002`.
+    /// per-field nullability).
     #[test]
     fn window_function_call_is_never_nullable() {
         // Nullable timestamp arg — struct itself must still be non-null.
@@ -2406,8 +2152,6 @@ mod tests {
             "`log(base, x)` must be nullable=true"
         );
     }
-
-    // ── Data-type derivations sanity ────────────────────────────────────────
 
     #[test]
     fn literal_data_type_and_nullability() {
@@ -2483,8 +2227,6 @@ mod tests {
         assert!(!expr.nullable(&s));
     }
 
-    // ── §7 UnresolvedColumn.plan_id ──────────────────────────────────────
-
     #[test]
     fn unresolved_column_carries_plan_id_field() {
         let u = UnresolvedColumn {
@@ -2494,8 +2236,6 @@ mod tests {
         };
         assert_eq!(u.plan_id, Some(42));
     }
-
-    // ── Pass 85 — UnresolvedRegex variant ────────────────────────────────
 
     #[test]
     fn unresolved_regex_variant_construction() {
@@ -2525,7 +2265,7 @@ mod tests {
 
     #[test]
     fn unresolved_column_plan_id_none_default() {
-        // Open Decision 12 anchor: SparkSQL front-end sets plan_id = None.
+        // SparkSQL front-end references have no plan id.
         let u = UnresolvedColumn {
             name: "id".to_owned(),
             qualifier: None,
@@ -2533,8 +2273,6 @@ mod tests {
         };
         assert!(u.plan_id.is_none());
     }
-
-    // ── §7 subquery variants carry a SubqueryPlan ────────────────────────
 
     #[test]
     fn in_subquery_carries_unanalyzed_plan() {
@@ -2604,8 +2342,6 @@ mod tests {
         assert_eq!(expr.data_type(&s), DataType::Long);
         assert!(expr.nullable(&s));
     }
-
-    // ── Struct-constructor fast-paths (§9 tests 7 & 8) ─────────────────────
 
     /// §9 test 7 — `struct(name, age)` reports
     /// `DataType::Struct{ name: String, age: Integer }`.
@@ -2687,8 +2423,6 @@ mod tests {
             other => panic!("expected DataType::Struct, got: {other:?}"),
         }
     }
-
-    // ── UpdateFields (Pass 61 — struct-005 / struct-006) ────────────────────
 
     fn address_struct_type() -> DataType {
         DataType::Struct(StructType::new(vec![
@@ -2795,7 +2529,7 @@ mod tests {
         }
     }
 
-    /// Review-fix C1: `withField("CITY", ...)` on a struct declaring `city`
+    /// Case-insensitive `withField` updates the existing field.
     /// replaces the existing slot (case-insensitive match) and preserves the
     /// original declared field name `"city"`, matching Spark 4.1.
     #[test]
@@ -2820,7 +2554,7 @@ mod tests {
         }
     }
 
-    /// Review-fix C2: analyzer's `update_fields_data_type` and emission's
+    /// The analyzer's `update_fields_data_type` and emission's
     /// `render_update_fields` must produce the *same* struct schema for a
     /// mixed-case op sequence. This test locks the analyzer view; the
     /// matching emission-side lock lives in `emission.rs`
@@ -2869,8 +2603,8 @@ mod tests {
         }
     }
 
-    /// Pass 70 anchor — `aggregate(arr, init, lambda)` must resolve to the
-    /// init/seed type, not to `Array<T>`. Corpus: `hof-003` returns String
+    /// `aggregate(arr, init, lambda)` resolves to the init/seed type, not to
+    /// `Array<T>`.
     /// because the seed `F.lit("")` is a String literal.
     #[test]
     fn aggregate_hof_returns_seed_type_not_array_type() {
@@ -2962,170 +2696,16 @@ mod tests {
         );
     }
 
-    // ── Pass 90 — inline_field / inline_outer_field type + nullability ──────
-
-    /// Schema holding a single `arr : Array<Struct<name STRING?, age INT?>>`
-    /// column — the canonical Pass-90 fixture.
-    fn inline_test_schema(arr_contains_null: bool) -> ResolvedSchema {
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::nullable("age", DataType::Integer),
-        ]));
-        ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(element), arr_contains_null),
-        )]))
-    }
-
-    fn inline_field_call(arr_col: &str, field: &str, outer: bool) -> Expression {
-        let name = if outer {
-            "inline_outer_field"
-        } else {
-            "inline_field"
-        };
-        fcall(name, vec![UnresolvedColumn::bare(arr_col), str_lit(field)])
-    }
-
-    /// `inline_field(arr, "name")` returns the struct field's own type.
-    #[test]
-    fn inline_field_data_type_is_struct_field_type() {
-        let s = inline_test_schema(true);
-        assert_eq!(
-            inline_field_call("arr", "name", false).data_type(&s),
-            DataType::String
-        );
-        assert_eq!(
-            inline_field_call("arr", "age", false).data_type(&s),
-            DataType::Integer
-        );
-    }
-
-    /// Field lookup is case-insensitive (Spark's `StructType.fieldNames` uses
-    /// case-insensitive resolution by default under ANSI mode).
-    #[test]
-    fn inline_field_data_type_case_insensitive_field_lookup() {
-        let s = inline_test_schema(true);
-        assert_eq!(
-            inline_field_call("arr", "NAME", false).data_type(&s),
-            DataType::String
-        );
-        assert_eq!(
-            inline_field_call("arr", "AgE", false).data_type(&s),
-            DataType::Integer
-        );
-    }
-
-    /// `inline_outer_field` is always nullable (sentinel row is all-NULL).
-    #[test]
-    fn inline_outer_field_is_always_nullable() {
-        // Every struct field non-nullable, containsNull=false, arr non-nullable.
-        // Even with every input dimension "not null", outer still yields
-        // nullable=true because the sentinel row is synthesized as all-NULL.
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::not_null("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element), false),
-        )]));
-        assert!(inline_field_call("arr", "name", true).nullable(&s));
-        assert!(inline_field_call("arr", "age", true).nullable(&s));
-    }
-
-    /// `inline_field` nullability is the disjunction of arr nullability,
-    /// arr's containsNull flag, and the struct field's own nullability.
-    #[test]
-    fn inline_field_nullable_propagates_from_arr() {
-        // Case 1: everything not-null → not nullable.
-        let element_notnull = DataType::Struct(StructType::new(vec![
-            StructField::not_null("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s1 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_notnull.clone()), false),
-        )]));
-        assert!(!inline_field_call("arr", "name", false).nullable(&s1));
-
-        // Case 2: containsNull=true → nullable.
-        let s2 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_notnull.clone()), true),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s2));
-
-        // Case 3: struct field itself nullable → nullable.
-        let element_field_null = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s3 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_field_null), false),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s3));
-        assert!(!inline_field_call("arr", "age", false).nullable(&s3));
-
-        // Case 4: arr nullable → nullable.
-        let s4 = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(element_notnull), false),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s4));
-    }
-
-    // ── Pass 91 — json_tuple_field type + nullability ────────────────────
-
-    fn json_tuple_field_call(json_col: &str, key: &str) -> Expression {
-        fcall(
-            "json_tuple_field",
-            vec![UnresolvedColumn::bare(json_col), str_lit(key)],
-        )
-    }
-
-    /// `json_tuple_field(json_str, "<key>")` is always STRING per Spark's
-    /// `JsonTuple.elementSchema`.
-    #[test]
-    fn json_tuple_field_data_type_is_string() {
-        // json_str typed as String, non-null — return type STRING regardless.
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "json_str",
-            DataType::String,
-        )]));
-        assert_eq!(
-            json_tuple_field_call("json_str", "a").data_type(&s),
-            DataType::String
-        );
-    }
-
-    /// `json_tuple_field` is always nullable — missing key OR JSON null OR
-    /// NULL `json_str` all yield NULL.
-    #[test]
-    fn json_tuple_field_is_always_nullable() {
-        // Even with a non-nullable `json_str`, the field lookup can miss →
-        // nullable=true.
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "json_str",
-            DataType::String,
-        )]));
-        assert!(json_tuple_field_call("json_str", "a").nullable(&s));
-    }
-
     /// `json_object_keys(jsonStr)` is always nullable — even over a
     /// non-nullable STRING literal argument — because the emission wrapper
     /// (`CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT' THEN
     /// json_keys(...) ELSE NULL END`) returns NULL for invalid-JSON and
     /// non-object input regardless of the argument's own nullability.
-    /// Golden-oracle corpus: fn-024/fn-025/fn-026 (strict
-    /// `ignore_nullable=False` schema comparison caught this gap).
     #[test]
     fn json_object_keys_is_always_nullable_even_over_non_nullable_literal() {
         let s = ResolvedSchema::empty();
         assert!(fcall("json_object_keys", vec![str_lit("{\"a\":1}")]).nullable(&s));
     }
-
-    // ── OPP-L — Expression::map_children / children walker ────────────────
 
     /// Constructs a nested expression exercising the shapes actual analyzer
     /// walkers care about — `Alias > FunctionCall > Binary > CaseWhen >
@@ -3218,9 +2798,6 @@ mod tests {
         // Exactly three children: func, one partition_by, one order_by.expr.
         assert_eq!(children.len(), 3);
     }
-
-    // ── round/bround/mod/pmod multi-arg type-inference pre-pass ──────────────
-    // (`function_call_data_type`; corpus num-005 round/bround, num-012 mod/pmod)
 
     fn dec(precision: u8, scale: u8) -> DataType {
         DataType::Decimal { precision, scale }
@@ -3358,8 +2935,7 @@ mod tests {
         assert_eq!(mod_li.data_type(&schema), DataType::Long);
     }
 
-    // ── Decimal ⊗ integral arithmetic (Spark `DecimalPrecision`) ─────────────
-    // Pass 15: exactly one side Decimal + the other integral must cast the
+    // Decimal arithmetic with one integral operand casts the integral side to
     // integral side to a decimal form and apply the arithmetic formula,
     // rather than falling through to `promote_numeric`'s union-widening.
 
@@ -3557,9 +3133,6 @@ mod tests {
             assert!(!expr.nullable(&schema));
         }
     }
-
-    // ── N4: binary-coercion materialization ──────────────────────────────────
-    // `materialize_binary_coercions` — Div-widening + Date±Interval rules.
 
     fn calendar_interval() -> Expression {
         Expression::Interval(IntervalExpression {

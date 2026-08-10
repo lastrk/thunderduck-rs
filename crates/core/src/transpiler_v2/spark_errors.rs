@@ -10,10 +10,7 @@
 //! plug in via one enum variant + one `throw_expr()` arm — no third
 //! near-duplicate helper.
 //!
-//! **Pass 11 (OPP-J).** The const message strings live here now — adjacent
-//! to the enum + helpers that consume them. `emission.rs` test-side
-//! assertions (`sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD)` etc.) import
-//! them via `use super::spark_errors::{...}`.
+//! Message fragments live beside the enum and helpers that consume them.
 
 use super::emission::escape_sql_string;
 
@@ -152,8 +149,6 @@ impl SparkError {
     /// backticks, which are safe inside single-quoted SQL literals — only
     /// apostrophes need `''` escaping).
     ///
-    /// Emitted shapes are byte-identical to Passes 94/95's original
-    /// `ansi_zero_guard` / `array_index_error_expr` helpers.
     pub(crate) fn throw_expr(&self) -> String {
         match self {
             Self::DivideByZero | Self::RemainderByZero => {
@@ -239,10 +234,7 @@ pub(crate) fn ansi_throw_if(cond_sql: &str, err: SparkError, inner_sql: &str) ->
 mod tests {
     use super::*;
 
-    /// DivideByZero throw fragment is byte-identical to the original
-    /// `ansi_zero_guard` inner call — `error('[DIVIDE_BY_ZERO] ...')` with
-    /// apostrophe-escaping applied even though the current message has none
-    /// (protects future messages that might).
+    /// The throw fragment has Spark's class prefix and message text.
     #[test]
     fn divide_by_zero_throw_expr_matches_legacy() {
         let got = SparkError::DivideByZero.throw_expr();
@@ -253,7 +245,7 @@ mod tests {
         assert!(got.ends_with("SQLSTATE: 22012')"), "got: {got}");
     }
 
-    /// RemainderByZero throw fragment likewise byte-identical.
+    /// The throw fragment has Spark's class prefix and message text.
     #[test]
     fn remainder_by_zero_throw_expr_matches_legacy() {
         let got = SparkError::RemainderByZero.throw_expr();
@@ -264,9 +256,8 @@ mod tests {
         assert!(got.ends_with("SQLSTATE: 22012')"), "got: {got}");
     }
 
-    /// InvalidArrayIndex throw fragment weaves HEAD/MID/TAIL literals with
-    /// the runtime `(idx)::VARCHAR` / `len((arr))::VARCHAR` casts — same
-    /// concatenation shape the old `array_index_error_expr` produced.
+    /// The fragment interpolates the index and array length at evaluation
+    /// time.
     #[test]
     fn invalid_array_index_throw_expr_matches_legacy() {
         let err = SparkError::InvalidArrayIndex {
@@ -361,9 +352,7 @@ mod tests {
         assert!(got.ends_with("SQLSTATE: 22023')"), "got: {got}");
     }
 
-    /// `ansi_throw_if` reproduces the legacy `ansi_zero_guard` shape:
-    /// `CASE WHEN ({divisor}) = 0 THEN error('[CLASS] msg') ELSE {inner} END`.
-    /// Caller supplies the parenthesised condition; helper adds nothing.
+    /// The caller supplies the parenthesized condition and inner expression.
     #[test]
     fn ansi_throw_if_matches_legacy_zero_guard_shape() {
         let sql = ansi_throw_if("(b) = 0", SparkError::DivideByZero, "(6) / (b)");

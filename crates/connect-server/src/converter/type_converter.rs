@@ -138,13 +138,8 @@ fn struct_field_to_proto(f: &StructField) -> proto::data_type::StructField {
 /// Parse a Spark type string (e.g. "int", "bigint", "decimal(10,2)") into a DataType.
 /// Used when Cast arrives as TypeStr rather than a structured proto DataType.
 ///
-/// Thin wrapper over the shared union-grammar parser
-/// (`thunderduck_core::types::spark_ddl` — pass-2 simplification consolidated
-/// the two legacy type-string grammars there). Acceptance is strictly-additively
-/// wider than the legacy local parser: `struct<name:type,...>` now parses
-/// instead of yielding `Unresolved`, `blob` maps to Binary, and a bare `null`
-/// token now parses to `DataType::Null`. Everything the legacy parser accepted
-/// parses identically; unknown input still yields `DataType::Unresolved`.
+/// Delegates to the shared additive Spark DDL grammar. Legacy parses retain
+/// their meaning; unknown input yields [`DataType::Unresolved`].
 pub fn parse_type_str(s: &str) -> DataType {
     thunderduck_core::types::spark_ddl::parse_spark_type_lenient(s)
 }
@@ -180,9 +175,6 @@ mod tests {
 
     #[test]
     fn calendar_interval_round_trips_to_interval() {
-        // Regression guard for the CalendarInterval <-> Interval asymmetry:
-        // data_type_to_proto(Interval) emits Kind::CalendarInterval, so decoding
-        // that proto must yield DataType::Interval back, not YearMonthInterval.
         let proto = data_type_to_proto(&DataType::Interval);
         assert_eq!(proto_to_data_type(&proto), DataType::Interval);
     }

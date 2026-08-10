@@ -60,7 +60,7 @@ Usage:
 EOF
 }
 
-# --- portable hashing / stat (macOS coreutils differ from GNU) --------------
+# Support both GNU and macOS hash/stat command variants.
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -84,7 +84,6 @@ ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 VENDOR_DIR="$ROOT/extensions/vendored"
 MANIFEST="$VENDOR_DIR/MANIFEST.toml"
 
-# --- verify mode -------------------------------------------------------------
 verify() {
   [[ -f "$MANIFEST" ]] || { err "MANIFEST.toml not found at $MANIFEST"; exit 1; }
 
@@ -134,7 +133,6 @@ verify() {
   log "verify OK ($checked artifacts, sha256 + size match MANIFEST.toml)"
 }
 
-# --- shared helpers ----------------------------------------------------------
 
 # Remove whatever vendored set is currently checked in (tracked or not —
 # first adoption has none).
@@ -224,7 +222,6 @@ finalize_and_verify() {
   verify
 }
 
-# --- adopt mode (release-download) -------------------------------------------
 adopt() {
   local release_tag="$1" duckdb_version="$2"
 
@@ -288,7 +285,6 @@ EOF
 EOF
 }
 
-# --- adopt mode (--from-local) ------------------------------------------------
 adopt_from_local() {
   local src_dir="$1"
   [[ -d "$src_dir" ]] || { err "not a directory: $src_dir"; exit 1; }
@@ -348,7 +344,6 @@ EOF
 EOF
 }
 
-# --- entry point --------------------------------------------------------------
 if [[ "${1:-}" == "--verify" ]]; then
   verify
 elif [[ "${1:-}" == "--from-local" ]]; then

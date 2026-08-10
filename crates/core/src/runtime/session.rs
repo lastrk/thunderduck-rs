@@ -27,8 +27,6 @@ pub enum StreamBatch {
     Error(String),
 }
 
-// ── Timezone detection ─────────────────────────────────────────────────────────
-
 /// Detect the system local timezone string.
 ///
 /// Resolution order:
@@ -56,8 +54,6 @@ fn detect_timezone() -> String {
     // 3. Fall back to UTC
     "UTC".to_string()
 }
-
-// ── Extension directory & S3 credential chain ─────────────────────────────────
 
 /// Redirect DuckDB's extension install directory when
 /// `THUNDERDUCK_DUCKDB_EXTENSION_DIR` is set.
@@ -123,8 +119,6 @@ fn configure_s3_credential_chain(conn: &duckdb::Connection, enabled: Option<Stri
     tracing::info!("S3 credential_chain configured — AWS credentials resolved automatically");
 }
 
-// ── Channel types ──────────────────────────────────────────────────────────────
-
 pub(crate) enum SessionCommand {
     Execute {
         sql: String,
@@ -189,8 +183,6 @@ pub(crate) enum SessionResult {
     Error(ThunderduckError),
 }
 
-// ── json_strip_nulls UDF ───────────────────────────────────────────────────────
-
 /// DuckDB scalar UDF that drops object keys whose value is JSON `null`,
 /// recursively, matching Spark's `to_json` default
 /// (`SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true`).
@@ -213,8 +205,8 @@ pub(crate) enum SessionResult {
 ///
 /// Field order is preserved via `serde_json`'s `preserve_order` feature
 /// (backing map is `IndexMap`, not `BTreeMap`), so the output field order
-/// matches DuckDB's `to_json(struct_pack(...))` insertion order — which in
-/// turn matches Spark's struct field order. Pass 89: `json-005`.
+/// matches DuckDB's `to_json(struct_pack(...))` insertion order and Spark's
+/// struct field order.
 struct JsonStripNulls;
 
 impl VScalar for JsonStripNulls {
@@ -282,8 +274,6 @@ pub(crate) fn strip_nulls(v: serde_json::Value) -> serde_json::Value {
         other => other,
     }
 }
-
-// ── DuckDbSession ──────────────────────────────────────────────────────────────
 
 /// An async handle to a DuckDB session running on a dedicated OS thread.
 ///
@@ -367,12 +357,10 @@ impl DuckDbSession {
                 // Register Spark-compatible SQL macros.
                 // These bridge Spark function names that differ from DuckDB equivalents.
                 let macro_sql = "
-CREATE OR REPLACE MACRO startswith(s, prefix) AS starts_with(s, prefix);
-CREATE OR REPLACE MACRO endswith(s, suffix) AS ends_with(s, suffix);
 CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p);
 -- json_strip_nulls(j) is registered by the Rust UDF below; see the
 -- `JsonStripNulls` VScalar impl. Spark to_json defaults to
--- ignoreNullFields=true, and DuckDB v1.5.1 has no native equivalent. Pass 89.
+-- ignoreNullFields=true, and DuckDB v1.5.1 has no native equivalent.
 CREATE OR REPLACE MACRO array_remove(arr, elem) AS
     list_filter(arr, x -> x IS DISTINCT FROM elem);
 CREATE OR REPLACE MACRO array_compact(arr) AS
@@ -386,9 +374,6 @@ CREATE OR REPLACE MACRO sequence(s, e, step := 1) AS generate_series(s, e, step)
 -- MAP case (DuckDB macros take precedence over built-ins of the same name).
 -- array_prepend(arr, elem) → DuckDB list_prepend has reversed arg order
 CREATE OR REPLACE MACRO array_prepend(arr, elem) AS list_prepend(elem, arr);
--- btrim(str[, trimStr]) → TRIM BOTH
-CREATE OR REPLACE MACRO btrim(s, t := NULL) AS
-    CASE WHEN t IS NULL THEN TRIM(s) ELSE TRIM(BOTH t FROM s) END;
 -- octet_length(str) → DuckDB octet_length only accepts BLOB; BIT_LENGTH works on VARCHAR
 CREATE OR REPLACE MACRO octet_length(s) AS (BIT_LENGTH(s) / 8);
 -- encode(str, charset) → binary representation (UTF-8 assumed)
@@ -406,11 +391,7 @@ CREATE OR REPLACE MACRO initcap(s) AS
         ' '
     );
 -- Spark bitwise / numeric functions not in DuckDB
-CREATE OR REPLACE MACRO shiftleft(x, n) AS (x << n);
-CREATE OR REPLACE MACRO shiftright(x, n) AS (x >> n);
 CREATE OR REPLACE MACRO shiftrightunsigned(x, n) AS (x >> n);
--- bit_get(x, pos): returns bit value (0 or 1) at position pos (0=LSB)
-CREATE OR REPLACE MACRO bit_get(x, pos) AS ((x::BIGINT >> pos) & 1)::INT;
 -- dayname/monthname: Spark returns 3-letter abbreviations; DuckDB built-ins return full names
 CREATE OR REPLACE MACRO dayname(d) AS strftime('%a', d);
 CREATE OR REPLACE MACRO monthname(d) AS strftime('%b', d);
@@ -418,27 +399,8 @@ CREATE OR REPLACE MACRO monthname(d) AS strftime('%b', d);
 -- Aggregate-compatible macros: collect_list / collect_set (used in spark.sql() path)
 CREATE OR REPLACE MACRO collect_list(x) AS LIST(x) FILTER (WHERE x IS NOT NULL);
 CREATE OR REPLACE MACRO collect_set(x) AS LIST(DISTINCT x) FILTER (WHERE x IS NOT NULL);
--- substring_index(str, delim, cnt): first/last cnt delim-separated tokens
-CREATE OR REPLACE MACRO substring_index(str, delim, cnt) AS
-    CASE WHEN cnt > 0 THEN
-        list_aggr(str_split(str, delim)[:cnt], 'string_agg', delim)
-    WHEN cnt < 0 THEN
-        list_aggr(str_split(str, delim)[cnt:], 'string_agg', delim)
-    ELSE '' END;
 -- format_number(x, d): format number with thousands separator and d decimal places
 CREATE OR REPLACE MACRO format_number(x, d) AS printf('%,.' || CAST(d AS VARCHAR) || 'f', x);
--- to_char(x, fmt): format date/timestamp using Spark (Java) format strings
-CREATE OR REPLACE MACRO to_char(x, fmt) AS
-    strftime(
-        replace(replace(replace(replace(replace(replace(replace(replace(
-            fmt,
-            'yyyy', '%Y'), 'YYYY', '%Y'),
-            'MM', '%m'),
-            'dd', '%d'), 'DD', '%d'),
-            'HH', '%H'),
-            'mm', '%M'),
-            'ss', '%S'),
-        x);
 -- next_day(d, day_name) is registered separately below (NEXT_DAY_MACRO_SQL)
 -- so unit tests can pin its DATE-return contract on a plain connection.
 -- map_from_arrays(keys, vals): Spark alias for DuckDB MAP(keys, vals)
@@ -446,8 +408,6 @@ CREATE OR REPLACE MACRO map_from_arrays(k, v) AS MAP(k, v);
 -- map_from_entries(arr_of_structs): MAP from array of {key, value} structs
 CREATE OR REPLACE MACRO map_from_entries(arr) AS MAP(list_transform(arr, s -> s.key), list_transform(arr, s -> s.value));
 -- map_concat is already built-in to DuckDB 1.5; no macro needed
--- arrays_zip(a, b): zip two arrays into array of structs
-CREATE OR REPLACE MACRO arrays_zip(a, b) AS list_zip(a, b);
 -- pmod(x, y): positive modulo (Spark semantics)
 CREATE OR REPLACE MACRO pmod(x, y) AS (((x % y) + y) % y);
 -- rint(x): round to nearest even (Spark rounds to nearest integer)
@@ -463,13 +423,6 @@ CREATE OR REPLACE MACRO degrees(x) AS x * 180.0 / pi();
 CREATE OR REPLACE MACRO radians(x) AS x * pi() / 180.0;
 -- unhex(s): Spark unhex returns BINARY; FROM_HEX returns BLOB in DuckDB
 CREATE OR REPLACE MACRO unhex(s) AS FROM_HEX(s);
--- conv(n, from_base, to_base): number base conversion (simplified 10→16/16→10)
-CREATE OR REPLACE MACRO conv(n, from_base, to_base) AS
-    CASE
-        WHEN from_base = 10 AND to_base = 16 THEN UPPER(HEX(CAST(n AS BIGINT)))
-        WHEN from_base = 16 AND to_base = 10 THEN CAST(('0x' || CAST(n AS VARCHAR))::BIGINT AS VARCHAR)
-        ELSE CAST(n AS VARCHAR)
-    END;
 -- soundex: Spark-compatible phonetic encoding
 -- Algorithm: uppercase → remove H/W (pos 2+) → encode per code table →
 --   dedup adjacent same codes → take first char + non-zero codes → pad/truncate to 4
@@ -532,8 +485,7 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                 // UDF that powers Spark's `to_json` default
                 // (`ignoreNullFields=true`). DuckDB v1.5.1's JSON extension
                 // has no native equivalent; τ wraps every `to_json(x)`
-                // emission with `json_strip_nulls(to_json(x))`. Pass 89:
-                // `json-005`.
+                // emission with `json_strip_nulls(to_json(x))`.
                 if let Err(e) =
                     conn.register_scalar_function::<JsonStripNulls>("json_strip_nulls")
                 {
@@ -892,8 +844,6 @@ impl Drop for DuckDbSession {
     }
 }
 
-// ── Session thread ─────────────────────────────────────────────────────────────
-
 fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>) {
     let mut view_schemas: HashMap<String, StructType> = HashMap::new();
 
@@ -1093,8 +1043,8 @@ mod tests {
         conn
     }
 
-    /// Root cause 026: DuckDB promotes `DATE + (n * INTERVAL 1 DAY)` to
-    /// TIMESTAMP. `next_day` must return DATE (Spark parity) — pin both the
+    /// DuckDB promotes `DATE + (n * INTERVAL 1 DAY)` to TIMESTAMP.
+    /// `next_day` must return DATE (Spark parity) — pin both the
     /// result value and its runtime type.
     #[test]
     fn next_day_returns_date_not_timestamp() {
@@ -1185,7 +1135,6 @@ mod tests {
         configure_s3_credential_chain(&conn, None);
     }
 
-    // ── Q3 (interval-transcode plan) — DuckDB's MonthDayNano layout ─────
     //
     // The interval-column Arrow transcoder in `crates/connect-server` maps
     // DuckDB's `Interval(MonthDayNano)` output to Spark's
@@ -1314,8 +1263,6 @@ mod tests {
         configure_s3_credential_chain(&conn, Some("True".into()));
     }
 
-    // ── json_strip_nulls UDF semantics (Pass 89, json-005) ─────────────
-
     use super::strip_nulls;
 
     fn strip_str(s: &str) -> String {
@@ -1367,10 +1314,9 @@ mod tests {
         );
     }
 
-    /// Regression against the earlier regex-based prototype: a string value
-    /// that contains an escaped `"` followed by `:null` MUST NOT be
+    /// A string value containing an escaped `"` followed by `:null` MUST NOT be
     /// corrupted. `serde_json`'s tokenizer treats the escape correctly, so
-    /// the raw string content is preserved intact. Pass 89 review-fix pin.
+    /// the raw string content is preserved intact.
     #[test]
     fn json_strip_nulls_preserves_string_values_with_embedded_quote_and_null_token() {
         // The JSON source literal is `{"raw":"foo\":null,bar","b":1}`. The
@@ -1390,8 +1336,6 @@ mod tests {
         assert_eq!(strip_str(r#""hello""#), r#""hello""#);
         assert_eq!(strip_str("true"), "true");
     }
-
-    // ── SchemaCacheEffect unit tests ────────────────────────────────────
 
     use super::SchemaCacheEffect;
     use crate::types::{DataType, StructField, StructType};

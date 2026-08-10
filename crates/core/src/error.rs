@@ -64,7 +64,6 @@ mod tests {
 
     #[test]
     fn classify_extracts_class_from_duckdb_prefixed_message() {
-        // DuckDB prepends its own "Invalid Input Error: " to our payload.
         let raw = "Invalid Input Error: [DIVIDE_BY_ZERO] Division by zero. SQLSTATE: 22012";
         let (class, clean) = classify_spark_runtime_error(raw).expect("classified");
         assert_eq!(class, "DIVIDE_BY_ZERO");
@@ -90,7 +89,6 @@ mod tests {
             }
             other => panic!("expected SparkRuntime, got: {other:?}"),
         }
-        // A plain DuckDB error is left untouched.
         let plain = ThunderduckError::DuckDb("Catalog Error: nope".into());
         assert!(matches!(
             plain.reclassified_spark_runtime(),

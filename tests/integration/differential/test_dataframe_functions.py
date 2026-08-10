@@ -33,9 +33,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# ============================================================================
-# Test Data Fixtures
-# ============================================================================
 
 @pytest.fixture(scope="class")
 def array_test_data(spark_reference, spark_thunderduck):
@@ -146,9 +143,7 @@ def math_test_data(spark_reference, spark_thunderduck):
     return df_ref, df_td
 
 
-# ============================================================================
 # Array Functions Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -354,9 +349,7 @@ class TestArrayFunctions:
         assert_dataframes_equal(ref_result, td_result, query_name="array_join")
 
 
-# ============================================================================
 # Map Functions Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -444,9 +437,7 @@ class TestMapFunctions:
         assert_dataframes_equal(ref_result, td_result, query_name="explode_map")
 
 
-# ============================================================================
 # Null Handling Functions Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -540,9 +531,7 @@ class TestNullFunctions:
         assert_dataframes_equal(ref_result, td_result, query_name="nanvl")
 
 
-# ============================================================================
 # String Functions Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -690,9 +679,7 @@ class TestStringFunctions:
         assert_dataframes_equal(ref_result, td_result, query_name="initcap")
 
 
-# ============================================================================
 # Math Functions Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions

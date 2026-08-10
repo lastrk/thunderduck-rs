@@ -30,7 +30,6 @@ class TestInsertDifferentialCorrected:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT with correct syntax")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_insert_corrected")
         spark_thunderduck.sql("DROP TABLE test_insert_corrected")
 
@@ -50,7 +49,6 @@ class TestInsertDifferentialCorrected:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT with STRING type")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_string")
         spark_thunderduck.sql("DROP TABLE test_string")
 

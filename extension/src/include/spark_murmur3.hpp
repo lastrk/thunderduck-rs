@@ -1,19 +1,7 @@
 #pragma once
 
-// Spark-bit-parity Murmur3_x86_32 primitives, mirroring
-// org.apache.spark.unsafe.hash.Murmur3_x86_32. Two notes that are easy to
-// miss when porting:
-//
-//  1. Spark's `hashUnsafeBytes` processes the tail (the bytes after the last
-//     4-byte-aligned word) ONE BYTE AT A TIME, running each tail byte
-//     through mixK1 + mixH1 individually. The canonical MurmurHash3 packs
-//     the tail bytes into a single k1 and does one mixK1. The two
-//     algorithms therefore diverge on any input whose length is not a
-//     multiple of 4. We mirror Spark's variant exactly here.
-//
-//  2. Java's signed-int arithmetic wraps modulo 2^32 with the same bit
-//     pattern as unsigned. We use uint32_t throughout, which is well-defined
-//     and matches bit-for-bit.
+// Spark's Murmur3_x86_32 variant. Its byte tail is processed one byte at a
+// time, unlike canonical MurmurHash3; uint32_t provides Java's wraparound.
 
 #include <cstddef>
 #include <cstdint>
@@ -76,13 +64,12 @@ static inline uint32_t Murmur3HashLong(int64_t input, uint32_t seed) {
 
 inline uint32_t Murmur3HashBytes(const uint8_t *p, size_t length, uint32_t seed) {
 	uint32_t h1 = seed;
-	const size_t aligned_length = length & ~static_cast<size_t>(3); // floor to multiple of 4
+	const size_t aligned_length = length & ~static_cast<size_t>(3);
 	for (size_t i = 0; i < aligned_length; i += 4) {
 		uint32_t half_word = Murmur3Read32LE(p + i);
 		h1 = Murmur3MixH1(h1, Murmur3MixK1(half_word));
 	}
-	// Spark variant: each tail byte processed individually through mixK1 +
-	// mixH1. This is NOT the canonical MurmurHash3 tail.
+	// Spark processes each tail byte as a separate mixK1/mixH1 pair.
 	for (size_t i = aligned_length; i < length; i++) {
 		uint32_t half_word = static_cast<uint32_t>(p[i]);
 		h1 = Murmur3MixH1(h1, Murmur3MixK1(half_word));

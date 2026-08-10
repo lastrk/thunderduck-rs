@@ -1,42 +1,14 @@
-//! Multi-column alias handling for Spark's generator functions.
-//!
-//! Spark's generator functions (`stack`, `explode` on maps, `posexplode`,
-//! `inline`, `json_tuple`) accept a Hive-style multi-column alias in raw SQL:
-//!
-//! ```text
-//! stack(2, 'age', CAST(age AS DOUBLE), 'salary', salary) AS (metric, value)
-//! ```
-//!
-//! sqlparser-rs 0.61's `SelectItem::ExprWithAlias` carries a single `Ident`
-//! for the alias and its projection reader hard-fails at the `(` after `AS`
-//! with `"Expected: an identifier after AS, found: ("`. The `Dialect` trait
-//! exposes no hook to customise select-item alias parsing, so we cannot
-//! extend `SparkDialect` to accept the syntax.
-//!
-//! Two entry points serve different τ paths:
-//!
-//! - [`strip_trailing_multi_alias`] — operates on `F.expr()` fragments
-//!   (trailing occurrence only). Used by `parse_expression` in `mod.rs`.
-//!
-//! - [`rewrite_multi_aliases`] — operates on full SQL statements (any
-//!   number of occurrences at depth 0). Used by `SparkSqlParserV2::parse`
-//!   in `mod.rs`. Each `AS (ident, ident+)` is replaced with a sentinel
-//!   `AS __td_multi_alias_<N>` and the alias lists are returned for
-//!   post-lowering splicing by [`splice_multi_aliases`].
-//!
-//! Both functions use the sqlparser-rs [`Tokenizer`](sqlparser::tokenizer::Tokenizer)
-//! — NOT raw SQL text. Reading tokens (not bytes) keeps τ within CLAUDE.md
-//! rule 1 (no string manipulation on SQL text).
+//! Bridges Spark's multi-column generator aliases across sqlparser-rs's
+//! single-alias projection grammar. Expression fragments strip a trailing
+//! alias list; full statements use collision-free sentinels and attach the
+//! recovered names after lowering. Both paths operate on tokens.
 
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::{CommonAst, CommonOp};
 use crate::transpiler_v2::error::{EmissionError, UnsupportedKind};
-use crate::transpiler_v2::expression::{
-    AliasExpression, Expression, FunctionCall, Literal, LiteralValue,
-};
-use crate::types::DataType;
+use crate::transpiler_v2::expression::Expression;
 
 use super::dialect::SparkDialect;
 
@@ -157,11 +129,6 @@ pub(super) fn strip_trailing_multi_alias(
     Ok((stripped, Some(aliases)))
 }
 
-// ── Full-SQL multi-alias rewrite ────────────────────────────────────────────
-
-/// Sentinel prefix used by [`rewrite_multi_aliases`] / [`splice_multi_aliases`].
-/// The format is `__td_multi_alias_<N>` where N is a 0-based index into the
-/// returned alias-lists vec.
 const SENTINEL_PREFIX: &str = "__td_multi_alias_";
 
 /// Cheap byte-level pre-check: does `sql` contain the literal (ASCII
@@ -204,11 +171,11 @@ fn might_contain_as_paren(sql: &str) -> bool {
 /// - `FROM (...) AS t(a,b)` — AS is followed by a Word, not LParen.
 /// - `AS (k)` — single ident, N < 2, rejected.
 ///
-/// Returns `(sql, vec![])` when no multi-alias is found (zero-cost: the caller
-/// skips `splice_multi_aliases` entirely).
+/// The third return value is a per-statement sentinel prefix absent from the
+/// input token stream.
 pub(super) fn rewrite_multi_aliases(
     sql: &str,
-) -> Result<(String, Vec<Vec<String>>), EmissionError> {
+) -> Result<(String, Vec<Vec<String>>, String), EmissionError> {
     // Fast pre-check: every multi-alias occurrence requires the literal
     // (case-insensitive) byte sequence "as" immediately followed by
     // whitespace-then-`(`, somewhere in the text. Skip the full tokenization
@@ -218,7 +185,7 @@ pub(super) fn rewrite_multi_aliases(
     // through to the real tokenizer below, which resolves it correctly; this
     // check only ever skips work, never changes behavior.
     if !might_contain_as_paren(sql) {
-        return Ok((sql.to_owned(), Vec::new()));
+        return Ok((sql.to_owned(), Vec::new(), SENTINEL_PREFIX.to_owned()));
     }
 
     let dialect = SparkDialect;
@@ -256,11 +223,10 @@ pub(super) fn rewrite_multi_aliases(
     }
 
     if occurrences.is_empty() {
-        return Ok((sql.to_owned(), Vec::new()));
+        return Ok((sql.to_owned(), Vec::new(), SENTINEL_PREFIX.to_owned()));
     }
 
-    // Reconstruct the token stream, replacing each occurrence's
-    // `AS ( ident, ident, ... )` span with `AS __td_multi_alias_<N>`.
+    let sentinel = fresh_sentinel_prefix(&tokens);
     let mut alias_lists: Vec<Vec<String>> = Vec::with_capacity(occurrences.len());
     let mut result = String::new();
     let mut pos = 0usize;
@@ -272,8 +238,7 @@ pub(super) fn rewrite_multi_aliases(
         for t in &tokens[pos..occ.as_idx] {
             result.push_str(&t.to_string());
         }
-        // Emit the sentinel: `AS __td_multi_alias_<N>`.
-        result.push_str(&format!("AS {SENTINEL_PREFIX}{idx}"));
+        result.push_str(&format!("AS {sentinel}{idx}"));
         pos = occ.rparen_idx + 1;
     }
     // Emit remaining tokens after the last occurrence.
@@ -281,7 +246,25 @@ pub(super) fn rewrite_multi_aliases(
         result.push_str(&t.to_string());
     }
 
-    Ok((result, alias_lists))
+    Ok((result, alias_lists, sentinel))
+}
+
+fn fresh_sentinel_prefix(tokens: &[Token]) -> String {
+    for nonce in 0..=tokens.len() {
+        let candidate = format!("{SENTINEL_PREFIX}{nonce}_");
+        let unused = tokens.iter().all(|token| {
+            !matches!(
+                token,
+                Token::Word(word)
+                    if word.value.get(..candidate.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&candidate))
+            )
+        });
+        if unused {
+            return candidate;
+        }
+    }
+    unreachable!("one more sentinel candidate than word tokens must be free")
 }
 
 /// A matched `AS ( ident, ident+ )` occurrence in the token stream.
@@ -354,27 +337,14 @@ fn next_non_ws(tokens: &[Token], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-// ── Post-lowering splice ────────────────────────────────────────────────────
-
-/// Walk the `CommonAst` tree recursively and replace sentinel-aliased
-/// projections (from [`rewrite_multi_aliases`]) with the appropriate
-/// generator-specific expansions.
-///
-/// Dispatch:
-/// - `stack(...)` + K >= 2 aliases -> `stack_multi_alias(inner, "a1", ..., "aK")`
-/// - `explode`/`explode_outer(arg)` + exactly 2 aliases -> two projections:
-///   `Alias(FunctionCall("map_explode_key", [arg]), a1)` and
-///   `Alias(FunctionCall("map_explode_val", [arg]), a2)`
-/// - Anything else -> boundary error.
-///
-/// After the walk, any unconsumed sentinel triggers a boundary error (the
-/// sentinel must never reach the analyzer).
+/// Attach alias lists recovered from sentinel rewriting to generator values.
 pub(super) fn splice_multi_aliases(
     ast: &mut CommonAst,
     alias_lists: &[Vec<String>],
+    sentinel: &str,
 ) -> Result<(), EmissionError> {
     let mut consumed = vec![false; alias_lists.len()];
-    splice_walk(ast, alias_lists, &mut consumed)?;
+    splice_walk(ast, alias_lists, sentinel, &mut consumed)?;
 
     // Sentinel-leak guard: every sentinel must have been consumed.
     for (idx, was_consumed) in consumed.iter().enumerate() {
@@ -382,7 +352,7 @@ pub(super) fn splice_multi_aliases(
             bail_boundary_proto!(
                 "sql::multi_alias::unconsumed_sentinel",
                 format!(
-                    "multi-alias sentinel __td_multi_alias_{idx} was not found in any \
+                    "multi-alias sentinel {sentinel}{idx} was not found in any \
                      Project node — it must not reach the analyzer"
                 ),
             );
@@ -396,6 +366,7 @@ pub(super) fn splice_multi_aliases(
 fn splice_walk(
     ast: &mut CommonAst,
     alias_lists: &[Vec<String>],
+    sentinel: &str,
     consumed: &mut [bool],
 ) -> Result<(), EmissionError> {
     // Process this node if it's a Project.
@@ -404,37 +375,32 @@ fn splice_walk(
         ..
     } = ast.op
     {
-        splice_projections(projections, alias_lists, consumed)?;
+        splice_projections(projections, alias_lists, sentinel, consumed)?;
     }
 
     // Descend into children.
     for child in ast.op.children_mut() {
-        splice_walk(child, alias_lists, consumed)?;
+        splice_walk(child, alias_lists, sentinel, consumed)?;
     }
     Ok(())
 }
 
-/// Process a single Project's projection list, replacing sentinel-aliased
-/// items with their expanded forms. The replacement may be 1:1 (stack) or
-/// 1:N (explode on MAP -> 2 projections), so we rebuild the vec.
 fn splice_projections(
     projections: &mut Vec<Expression>,
     alias_lists: &[Vec<String>],
+    sentinel: &str,
     consumed: &mut [bool],
 ) -> Result<(), EmissionError> {
-    // Take ownership and rebuild, splicing replacements in place.
     let old = std::mem::take(projections);
     let mut out: Vec<Expression> = Vec::with_capacity(old.len());
     for proj in old {
-        if let Some((sentinel_idx, aliases)) = extract_sentinel(&proj, alias_lists) {
+        if let Some((sentinel_idx, aliases)) = extract_sentinel(&proj, alias_lists, sentinel) {
             consumed[sentinel_idx] = true;
-            // Extract the inner expression from the Alias wrapper.
             let inner = match proj {
                 Expression::Alias(a) => *a.expr,
                 _ => unreachable!("extract_sentinel matched an Alias"),
             };
-            let replacements = dispatch_multi_alias(inner, aliases)?;
-            out.extend(replacements);
+            out.push(attach_multi_alias(inner, aliases)?);
         } else {
             out.push(proj);
         }
@@ -448,11 +414,12 @@ fn splice_projections(
 fn extract_sentinel<'a>(
     expr: &Expression,
     alias_lists: &'a [Vec<String>],
+    sentinel: &str,
 ) -> Option<(usize, &'a Vec<String>)> {
     let Expression::Alias(ref a) = expr else {
         return None;
     };
-    let idx = parse_sentinel_index(&a.alias)?;
+    let idx = parse_sentinel_index(&a.alias, sentinel)?;
     if idx < alias_lists.len() {
         Some((idx, &alias_lists[idx]))
     } else {
@@ -461,143 +428,33 @@ fn extract_sentinel<'a>(
 }
 
 /// Parse `__td_multi_alias_<N>` and return N, or None.
-fn parse_sentinel_index(alias: &str) -> Option<usize> {
-    alias.strip_prefix(SENTINEL_PREFIX)?.parse::<usize>().ok()
+fn parse_sentinel_index(alias: &str, sentinel: &str) -> Option<usize> {
+    alias.strip_prefix(sentinel)?.parse::<usize>().ok()
 }
 
-/// Dispatch the multi-alias expansion based on the inner expression and alias
-/// list. Returns the replacement expression(s).
-fn dispatch_multi_alias(
-    inner: Expression,
-    aliases: &[String],
-) -> Result<Vec<Expression>, EmissionError> {
-    match &inner {
-        Expression::FunctionCall(fc) => {
-            // N5: `fc.name` is already canonical lowercase — no local
-            // re-derivation.
-            match fc.name.as_str() {
-                "stack" => {
-                    if aliases.len() < 2 {
-                        bail_boundary_proto!(
-                            "sql::multi_alias::stack_arity",
-                            format!(
-                                "stack multi-alias requires at least 2 aliases, got {}",
-                                aliases.len()
-                            ),
-                        );
-                    }
-                    Ok(vec![build_stack_multi_alias(inner, aliases)])
-                }
-                "explode" | "explode_outer" => {
-                    if aliases.len() != 2 {
-                        bail_boundary_proto!(
-                            "sql::multi_alias::explode_arity",
-                            format!(
-                                "explode/explode_outer multi-alias requires exactly 2 aliases \
-                                 (key, value), got {}",
-                                aliases.len()
-                            ),
-                        );
-                    }
-                    if fc.args.len() != 1 {
-                        bail_boundary_proto!(
-                            "sql::multi_alias::explode_arg_count",
-                            format!(
-                                "explode/explode_outer requires exactly 1 argument, got {}",
-                                fc.args.len()
-                            ),
-                        );
-                    }
-                    let arg = fc.args[0].clone();
-                    Ok(build_map_explode_pair(arg, &aliases[0], &aliases[1]))
-                }
-                other => {
-                    bail_boundary_proto!(
-                        format!("sql::multi_alias::unsupported_generator::{other}"),
-                        format!(
-                            "multi-column alias `AS ({})` on `{other}` is not implemented \
-                             in τ's SparkSQL path",
-                            aliases.join(", ")
-                        ),
-                    );
-                }
-            }
+fn attach_multi_alias(inner: Expression, aliases: &[String]) -> Result<Expression, EmissionError> {
+    match inner {
+        Expression::Generator(mut generator) => {
+            generator.aliases = aliases.to_vec();
+            Ok(Expression::Generator(generator))
         }
-        _ => {
+        other => {
             bail_boundary_proto!(
                 "sql::multi_alias::non_function",
                 format!(
                     "multi-column alias `AS ({})` on a non-function expression is not \
-                     supported",
-                    aliases.join(", ")
+                     supported: {other:?}",
+                    aliases.join(", "),
                 ),
             );
         }
     }
 }
 
-// ── Shared builders ─────────────────────────────────────────────────────────
-
-/// Build a `FunctionCall("stack_multi_alias", [inner, Literal(a1), ..., Literal(aK)])`
-/// expression — the shape the analyzer's `expand_stack_projections` expects.
-///
-/// Shared by both the `F.expr()` fragment path ([`super::wrap_stack_multi_alias`])
-/// and the full-SQL path ([`splice_multi_aliases`]).
-pub(super) fn build_stack_multi_alias(inner: Expression, aliases: &[String]) -> Expression {
-    let mut args: Vec<Expression> = Vec::with_capacity(1 + aliases.len());
-    args.push(inner);
-    for a in aliases {
-        args.push(Expression::Literal(Literal {
-            value: LiteralValue::String(a.clone()),
-            data_type: DataType::String,
-        }));
-    }
-    Expression::FunctionCall(FunctionCall {
-        name: "stack_multi_alias".to_owned(),
-        args,
-        distinct: false,
-    })
-}
-
-/// Build the two-projection explode-on-MAP expansion:
-/// `[Alias(FunctionCall("map_explode_key", [arg]), a1),
-///   Alias(FunctionCall("map_explode_val", [arg]), a2)]`.
-///
-/// This is the EXACT shape that `try_convert_posexplode_multi_alias` in
-/// `v2_relation_converter.rs` produces for the DataFrame path — convergence
-/// is tested.
-pub(super) fn build_map_explode_pair(
-    arg: Expression,
-    key_alias: &str,
-    val_alias: &str,
-) -> Vec<Expression> {
-    let key_fn = Expression::FunctionCall(FunctionCall {
-        name: "map_explode_key".to_owned(),
-        args: vec![arg.clone()],
-        distinct: false,
-    });
-    let val_fn = Expression::FunctionCall(FunctionCall {
-        name: "map_explode_val".to_owned(),
-        args: vec![arg],
-        distinct: false,
-    });
-    vec![
-        Expression::Alias(AliasExpression {
-            expr: Box::new(key_fn),
-            alias: key_alias.to_owned(),
-        }),
-        Expression::Alias(AliasExpression {
-            expr: Box::new(val_fn),
-            alias: val_alias.to_owned(),
-        }),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── strip_trailing_multi_alias (existing, F.expr path) ──────────────────
+    use crate::transpiler_v2::generator::Generator;
 
     #[test]
     fn strips_trailing_two_column_alias() {
@@ -657,18 +514,16 @@ mod tests {
         assert_eq!(sql, "f(x) as (1, 2)");
     }
 
-    // ── rewrite_multi_aliases (full-SQL path) ───────────────────────────────
-
     #[test]
     fn rewrite_mid_list_occurrence_cx011() {
         // cx-011 shape: `SELECT id, explode(attrs) AS (k, v) FROM emp`
-        let (rewritten, alias_lists) =
+        let (rewritten, alias_lists, sentinel) =
             rewrite_multi_aliases("SELECT id, explode(attrs) AS (k, v) FROM emp")
                 .expect("must tokenize");
         assert_eq!(alias_lists.len(), 1);
         assert_eq!(alias_lists[0], vec!["k", "v"]);
         assert!(
-            rewritten.contains("__td_multi_alias_0"),
+            rewritten.contains(&format!("{sentinel}0")),
             "sentinel must appear in rewritten SQL: {rewritten}"
         );
         assert!(
@@ -686,30 +541,38 @@ mod tests {
     fn rewrite_trailing_occurrence_pv006() {
         // pv-006 shape — trailing position.
         let sql = "SELECT id, stack(2, 'age', age, 'salary', salary) AS (metric, value) FROM emp";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, sentinel) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert_eq!(alias_lists.len(), 1);
         assert_eq!(alias_lists[0], vec!["metric", "value"]);
-        assert!(rewritten.contains("__td_multi_alias_0"));
+        assert!(rewritten.contains(&format!("{sentinel}0")));
     }
 
     #[test]
     fn rewrite_two_occurrences_in_one_statement() {
         let sql = "SELECT explode(m1) AS (k1, v1), explode(m2) AS (k2, v2) FROM t";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, sentinel) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert_eq!(alias_lists.len(), 2);
         assert_eq!(alias_lists[0], vec!["k1", "v1"]);
         assert_eq!(alias_lists[1], vec!["k2", "v2"]);
-        assert!(rewritten.contains("__td_multi_alias_0"));
-        assert!(rewritten.contains("__td_multi_alias_1"));
+        assert!(rewritten.contains(&format!("{sentinel}0")));
+        assert!(rewritten.contains(&format!("{sentinel}1")));
     }
 
-    // ── Non-match fixtures (must return unchanged / empty alias lists) ──────
+    #[test]
+    fn rewrite_avoids_user_sentinel_names() {
+        let sql = "SELECT id AS __td_multi_alias_0_0, explode(m) AS (k, v) FROM t";
+        let (rewritten, aliases, sentinel) = rewrite_multi_aliases(sql).expect("rewrite");
+        assert_eq!(aliases, [vec!["k", "v"]]);
+        assert_ne!(sentinel, "__td_multi_alias_0_");
+        assert!(rewritten.contains("id AS __td_multi_alias_0_0"));
+        assert!(rewritten.contains(&format!("AS {sentinel}0")));
+    }
 
     #[test]
     fn rewrite_ignores_cte_body() {
         // `WITH a AS (SELECT ...)` — interior starts with SELECT, not ident-comma.
         let sql = "WITH a AS (SELECT 1) SELECT * FROM a";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(alias_lists.is_empty(), "CTE body must not match");
         assert_eq!(rewritten, sql);
     }
@@ -718,7 +581,7 @@ mod tests {
     fn rewrite_ignores_cte_column_list() {
         // `WITH t(k,v) AS (...)` — parens follow `t`, not `AS`.
         let sql = "WITH t(k,v) AS (SELECT 1, 2) SELECT * FROM t";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(alias_lists.is_empty(), "CTE column list must not match");
         assert_eq!(rewritten, sql);
     }
@@ -727,7 +590,7 @@ mod tests {
     fn rewrite_ignores_window_spec() {
         // `WINDOW w AS (PARTITION BY ...)` — interior has keywords, not pure ident-comma.
         let sql = "SELECT count(*) OVER w FROM t WINDOW w AS (PARTITION BY id)";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(alias_lists.is_empty(), "WINDOW spec must not match");
         assert_eq!(rewritten, sql);
     }
@@ -736,7 +599,7 @@ mod tests {
     fn rewrite_ignores_cast_as() {
         // `CAST(x AS DOUBLE)` — AS at depth > 0.
         let sql = "SELECT CAST(x AS DOUBLE) FROM t";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(alias_lists.is_empty(), "CAST AS must not match");
         assert_eq!(rewritten, sql);
     }
@@ -745,7 +608,7 @@ mod tests {
     fn rewrite_ignores_derived_table_alias() {
         // `FROM (...) AS t(a,b)` — AS is followed by a Word, not LParen.
         let sql = "SELECT * FROM (SELECT 1, 2) AS t(a, b)";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(alias_lists.is_empty(), "derived table alias must not match");
         assert_eq!(rewritten, sql);
     }
@@ -754,7 +617,7 @@ mod tests {
     fn rewrite_ignores_single_alias_in_parens() {
         // `AS (k)` — single ident, N < 2, must not match.
         let sql = "SELECT explode(m) AS (k) FROM t";
-        let (rewritten, alias_lists) = rewrite_multi_aliases(sql).expect("must tokenize");
+        let (rewritten, alias_lists, _) = rewrite_multi_aliases(sql).expect("must tokenize");
         assert!(
             alias_lists.is_empty(),
             "single-ident paren alias must not match"
@@ -762,79 +625,18 @@ mod tests {
         assert_eq!(rewritten, sql);
     }
 
-    // ── build_stack_multi_alias ─────────────────────────────────────────────
-
     #[test]
-    fn build_stack_multi_alias_shape() {
-        let inner = Expression::FunctionCall(FunctionCall {
-            name: "stack".to_owned(),
-            args: vec![],
-            distinct: false,
-        });
-        let result =
-            build_stack_multi_alias(inner.clone(), &["metric".to_owned(), "value".to_owned()]);
-        match result {
-            Expression::FunctionCall(fc) => {
-                assert_eq!(fc.name, "stack_multi_alias");
-                assert_eq!(fc.args.len(), 3);
-                assert!(matches!(&fc.args[0], Expression::FunctionCall(f) if f.name == "stack"));
-                match &fc.args[1] {
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String(s),
-                        ..
-                    }) => assert_eq!(s, "metric"),
-                    other => panic!("expected string literal, got {other:?}"),
-                }
-                match &fc.args[2] {
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String(s),
-                        ..
-                    }) => assert_eq!(s, "value"),
-                    other => panic!("expected string literal, got {other:?}"),
-                }
-            }
-            other => panic!("expected FunctionCall, got {other:?}"),
-        }
-    }
-
-    // ── build_map_explode_pair ───────────────────────────────────────────────
-
-    #[test]
-    fn build_map_explode_pair_shape() {
-        let arg = Expression::FunctionCall(FunctionCall {
-            name: "attrs".to_owned(),
-            args: vec![],
-            distinct: false,
-        });
-        let pair = build_map_explode_pair(arg, "k", "v");
-        assert_eq!(pair.len(), 2);
-
-        // First: Alias(map_explode_key(attrs), "k")
-        match &pair[0] {
-            Expression::Alias(a) => {
-                assert_eq!(a.alias, "k");
-                match a.expr.as_ref() {
-                    Expression::FunctionCall(fc) => {
-                        assert_eq!(fc.name, "map_explode_key");
-                    }
-                    other => panic!("expected FunctionCall, got {other:?}"),
-                }
-            }
-            other => panic!("expected Alias, got {other:?}"),
-        }
-
-        // Second: Alias(map_explode_val(attrs), "v")
-        match &pair[1] {
-            Expression::Alias(a) => {
-                assert_eq!(a.alias, "v");
-                match a.expr.as_ref() {
-                    Expression::FunctionCall(fc) => {
-                        assert_eq!(fc.name, "map_explode_val");
-                    }
-                    other => panic!("expected FunctionCall, got {other:?}"),
-                }
-            }
-            other => panic!("expected Alias, got {other:?}"),
-        }
+    fn attach_multi_alias_sets_generator_aliases() {
+        let generator = Generator::from_function("stack", vec![]).expect("generator");
+        let result = attach_multi_alias(
+            Expression::Generator(generator),
+            &["metric".to_owned(), "value".to_owned()],
+        )
+        .expect("attach aliases");
+        assert!(matches!(
+            result,
+            Expression::Generator(generator)
+                if generator.aliases == ["metric", "value"]
+        ));
     }
 }

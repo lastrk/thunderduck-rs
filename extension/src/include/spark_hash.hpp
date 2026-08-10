@@ -1,52 +1,13 @@
 #pragma once
 
-// ============================================================================
-// CONTRACT (mirrored in README.md "Spark hash functions" section). Both
-// functions registered below MUST keep these semantics; an integration agent
-// wiring this into Thunderduck / Thunderduck-RS should NOT add coalesce
-// wrappers, CAST wrappers, or NULL filters. See README for the full rationale
-// and the failure modes that motivated this design.
-//
-//   spark_xxhash64(VARIADIC ANY) -> BIGINT   (signed two's complement)
-//   spark_hash    (VARIADIC ANY) -> INTEGER  (signed two's complement)
-//
-// 1. INITIAL SEED 42 (for BOTH functions). `spark_xxhash64()` returns 42L,
-//    `spark_hash()` returns 42 — matches Spark's HashExpression default seed.
-//
-// 2. NULL SKIP: a NULL value at a given column/row leaves the running hash
-//    seed UNCHANGED for that row. The column is skipped, not propagated.
-//    Matches Spark's `HashExpression.eval`: `if (value == null) continue`.
-//
-//      spark_xxhash64(1::INT, NULL::INT, 2::INT)  ==  spark_xxhash64(1, 2)
-//
-//    This is enforced by `FunctionNullHandling::SPECIAL_HANDLING` on
-//    registration. Without that flag, DuckDB would short-circuit any row
-//    containing a NULL argument and return NULL — the OPPOSITE of Spark.
-//    DO NOT WRAP CALLERS IN coalesce/IFNULL; the resulting hash diverges.
-//
-//    Same rule applies to nested types:
-//      - LIST<T>:     null elements skipped
-//      - ARRAY<T,n>:  null elements skipped
-//      - STRUCT:      null field values skipped (field names not hashed)
-//      - MAP:         null values skipped; null keys are a Spark error
-//
-// 3. SIGNED RETURN TYPE is the direct bit-reinterpret of the unsigned
-//    XXH64/Murmur3 output (uint64 -> int64, uint32 -> int32). DO NOT
-//    wrap the result in `CAST(... AS BIGINT)` — DuckDB raises
-//    "Type UINT64 ... can't be cast ... to INT64" for any hash whose high
-//    bit is set (i.e. roughly half of all inputs), so a cast-based bridge
-//    from the hashfuncs community extension's UBIGINT/UINTEGER outputs is
-//    not viable. This native path sidesteps that entirely.
-//
-// 4. UNSUPPORTED DUCKDB TYPES throw at bind time with a clear message:
-//    UTINYINT, USMALLINT, UINTEGER, UBIGINT, HUGEINT (no Spark equivalent);
-//    TIME, TIME_TZ, TIMESTAMP_SEC, TIMESTAMP_MS, TIMESTAMP_NS, UUID, BIT,
-//    ENUM, UNION, VARINT (no exact Spark equivalent). The check is
-//    recursive: `LIST<UTINYINT>`, `STRUCT(x UTINYINT)`, `MAP<INT,HUGEINT>`
-//    all fail.
-//
-// ============================================================================
-
+// Spark hash API contract (also documented in README.md):
+//   spark_xxhash64(VARIADIC ANY) -> signed BIGINT
+//   spark_hash(VARIADIC ANY) -> signed INTEGER
+// Both use seed 42. NULL arguments are skipped, including nested list/array
+// elements, struct fields, and map values; callers must not add coalesce or
+// cast wrappers. Results are direct bit-reinterprets of the hash accumulators.
+// Unsupported types fail recursively at bind time, including unsigned types,
+// HUGEINT, unsupported time types, UUID, BIT, ENUM, UNION, and VARINT.
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/decimal.hpp"
@@ -63,9 +24,6 @@
 
 namespace duckdb {
 
-// ----------------------------------------------------------------------------
-// Tag types: parameterize the templated execution over the two algorithms.
-// ----------------------------------------------------------------------------
 struct SparkXxh64Tag {
 	using Seed = uint64_t;
 	using Out = int64_t;
@@ -98,9 +56,6 @@ struct SparkMurmur3Tag {
 	}
 };
 
-// ----------------------------------------------------------------------------
-// Bind-time type validation.
-// ----------------------------------------------------------------------------
 static inline void ValidateSparkSupportedType(const LogicalType &type, const char *fn_name) {
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
@@ -142,13 +97,11 @@ static inline void ValidateSparkSupportedType(const LogicalType &type, const cha
 	}
 }
 
-// ----------------------------------------------------------------------------
 // BigInteger.toByteArray()-equivalent for __int128.
 // Java semantics: minimum-length big-endian two's-complement byte array,
 // always >= 1 byte. Validated against `BigInteger.valueOf(v).toByteArray()`
 // for: 0 -> [00], 1 -> [01], 127 -> [7F], 128 -> [00 80], -1 -> [FF],
 // -128 -> [80], -129 -> [FF 7F].
-// ----------------------------------------------------------------------------
 static inline size_t Int128ToBigIntegerBytes(__int128 v, uint8_t out[16]) {
 	unsigned __int128 uv = static_cast<unsigned __int128>(v);
 	uint8_t buf[16];
@@ -172,10 +125,7 @@ static inline size_t Int128ToBigIntegerBytes(__int128 v, uint8_t out[16]) {
 	return len;
 }
 
-// ----------------------------------------------------------------------------
-// Float/Double NaN canonicalization (matches Java's Float.NaN /
-// Double.NaN bit patterns: 0x7FC00000 and 0x7FF8000000000000).
-// ----------------------------------------------------------------------------
+// Spark follows Java's canonical NaN bit patterns before hashing.
 static inline uint32_t SparkFloatBits(float v) {
 	if (std::isnan(v)) {
 		return 0x7FC00000U;
@@ -194,12 +144,10 @@ static inline uint64_t SparkDoubleBits(double v) {
 	return bits;
 }
 
-// ----------------------------------------------------------------------------
 // Recursive fold: hash a value at physical index `idx` of a flat-layout
 // Vector. Caller MUST ensure validity[idx] is true; this function does not
 // re-check. For nested types, the entire descendant subtree must have been
 // flattened by PrepareNestedForHashing before the first call.
-// ----------------------------------------------------------------------------
 template <class Tag>
 static typename Tag::Seed FoldFlatValueAt(Vector &flat_vec, idx_t idx, typename Tag::Seed seed) {
 	auto &type = flat_vec.GetType();
@@ -346,10 +294,8 @@ static typename Tag::Seed FoldFlatValueAt(Vector &flat_vec, idx_t idx, typename 
 	}
 }
 
-// ----------------------------------------------------------------------------
 // Recursively flatten every descendant child vector so FoldFlatValueAt can
 // use direct FlatVector::GetData / Validity access in the inner loops.
-// ----------------------------------------------------------------------------
 static inline void PrepareNestedForHashing(Vector &vec, idx_t count) {
 	switch (vec.GetType().id()) {
 	case LogicalTypeId::LIST: {
@@ -389,17 +335,16 @@ static inline void PrepareNestedForHashing(Vector &vec, idx_t count) {
 	}
 }
 
-// ----------------------------------------------------------------------------
 // Top-level column fold. Scalar types use UnifiedVectorFormat (so
-// CONSTANT/DICTIONARY vectors keep their fast paths). Nested types are
-// flattened in-place and processed row-major by FoldFlatValueAt.
-// ----------------------------------------------------------------------------
+// CONSTANT/DICTIONARY vectors keep their fast paths); each logical row must
+// use its selection index and validity mask. Nested types are flattened in-place
+// and processed row-major by FoldFlatValueAt.
 template <class Tag>
 static void FoldColumn(Vector &vec, idx_t count, typename Tag::Seed *seeds) {
 	auto type_id = vec.GetType().id();
 
 	if (type_id == LogicalTypeId::SQLNULL) {
-		return; // every row is NULL — seeds unchanged
+		return;
 	}
 
 	switch (type_id) {
@@ -615,9 +560,6 @@ static void FoldColumn(Vector &vec, idx_t count, typename Tag::Seed *seeds) {
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Exec function template — one body, two instantiations.
-// ----------------------------------------------------------------------------
 template <class Tag>
 static void SparkHashExec(DataChunk &args, ExpressionState &state, Vector &result) {
 	using Seed = typename Tag::Seed;
@@ -628,9 +570,6 @@ static void SparkHashExec(DataChunk &args, ExpressionState &state, Vector &resul
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	Out *out_data = FlatVector::GetData<Out>(result);
 
-	// Initialize all rows to INIT_SEED. INIT_SEED is a small positive
-	// integer (42), so the bit pattern is identical between Seed (unsigned)
-	// and Out (signed) — no special-case needed.
 	for (idx_t r = 0; r < rows; r++) {
 		out_data[r] = static_cast<Out>(Tag::INIT_SEED);
 	}
@@ -642,11 +581,6 @@ static void SparkHashExec(DataChunk &args, ExpressionState &state, Vector &resul
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Bind function: validates that every argument's type has a Spark equivalent.
-// Recurses into LIST/ARRAY/STRUCT/MAP. Does not store bind data — exec
-// dispatches dynamically on Vector::GetType().
-// ----------------------------------------------------------------------------
 template <class Tag>
 static unique_ptr<FunctionData> BindSparkHash(ClientContext &context, ScalarFunction &bound_function,
                                               vector<unique_ptr<Expression>> &arguments) {
@@ -656,27 +590,12 @@ static unique_ptr<FunctionData> BindSparkHash(ClientContext &context, ScalarFunc
 	return nullptr;
 }
 
-// ----------------------------------------------------------------------------
-// Function factories.
-//
-// NOTE TO DOWNSTREAM INTEGRATION AGENTS (Thunderduck / Thunderduck-RS):
-//   - Translate Spark `xxhash64(c1, ..., cN)` -> `spark_xxhash64(c1, ..., cN)`
-//     directly. NO coalesce wrapper. NO CAST wrapper. Result is already
-//     signed BIGINT; NULL skip happens inside the function.
-//   - Translate Spark `hash(c1, ..., cN)` -> `spark_hash(c1, ..., cN)`
-//     directly with the same rules.
-// See the CONTRACT block at the top of this file and README.md for the
-// rationale (in particular, the failure modes of the hashfuncs-based
-// approach that this replaces).
-// ----------------------------------------------------------------------------
 inline ScalarFunction CreateSparkXxhash64Function() {
 	ScalarFunction f("spark_xxhash64", {}, LogicalType::BIGINT, SparkHashExec<SparkXxh64Tag>,
 	                 BindSparkHash<SparkXxh64Tag>);
 	f.varargs = LogicalType::ANY;
-	// SPECIAL_HANDLING is REQUIRED: without it, DuckDB short-circuits any
-	// row containing a NULL argument and returns NULL. Spark's semantic is
-	// "skip that column, keep folding". Removing this flag silently breaks
-	// bit-parity with Spark — see the CONTRACT block above.
+	// SPECIAL_HANDLING is required: DuckDB otherwise propagates NULL for the
+	// whole row, while Spark skips the NULL argument and keeps folding.
 	f.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	return f;
 }
@@ -685,7 +604,8 @@ inline ScalarFunction CreateSparkHashFunction() {
 	ScalarFunction f("spark_hash", {}, LogicalType::INTEGER, SparkHashExec<SparkMurmur3Tag>,
 	                 BindSparkHash<SparkMurmur3Tag>);
 	f.varargs = LogicalType::ANY;
-	// SPECIAL_HANDLING is REQUIRED — see comment on CreateSparkXxhash64Function.
+	// Keep SPECIAL_HANDLING aligned with spark_xxhash64: NULL arguments are
+	// skipped rather than propagated.
 	f.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	return f;
 }

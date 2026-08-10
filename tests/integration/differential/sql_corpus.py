@@ -80,9 +80,7 @@ from pyspark.sql.types import (
 NAN = float("nan")
 
 
-# ---------------------------------------------------------------------------
 # Inputs — registered as temp views.
-# ---------------------------------------------------------------------------
 
 def build_inputs(spark: SparkSession) -> Dict[str, DataFrame]:
     emp_schema = StructType([
@@ -197,9 +195,7 @@ def build_inputs(spark: SparkSession) -> Dict[str, DataFrame]:
     return views
 
 
-# ---------------------------------------------------------------------------
 # Case registry
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Case:
@@ -224,11 +220,8 @@ def case(id, category, description, sql, flags=(), expected_error=None):
     )
 
 
-# ===========================================================================
 # Ordered MOST-FREQUENT-FIRST.
-# ===========================================================================
 
-# ── 1. SELECT / projection (most fundamental) ───────────────────────────────
 case("sel-001", "select", "select column list", "SELECT id, name, age FROM emp")
 case("sel-002", "select", "select star", "SELECT * FROM emp")
 case("sel-003", "select", "qualified star", "SELECT emp.* FROM emp")
@@ -246,7 +239,6 @@ case("sel-014", "select", "select struct field path", "SELECT id, address.city F
 case("sel-015", "select", "select with table alias", "SELECT e.id, e.name FROM emp AS e")
 case("sel-016", "select", "computed columns with function + alias", "SELECT id, age + 1 AS age1, upper(name) AS up FROM emp")
 
-# ── 2. WHERE / predicates ────────────────────────────────────────────────────
 case("whr-001", "predicate", "equality", "SELECT * FROM emp WHERE dept_id = 10")
 case("whr-002", "predicate", "inequality <>", "SELECT * FROM emp WHERE dept_id <> 10")
 case("whr-003", "predicate", "comparison >", "SELECT * FROM emp WHERE age > 30")
@@ -264,7 +256,6 @@ case("whr-014", "predicate", "predicate on expression", "SELECT * FROM emp WHERE
 case("whr-015", "predicate", "null-safe equality <=>", "SELECT * FROM emp WHERE dept_id <=> NULL")
 case("whr-016", "predicate", "parenthesized AND/OR/NOT predicate", "SELECT * FROM emp WHERE (age > 30 AND active) OR (NOT active)")
 
-# ── 3. Joins ─────────────────────────────────────────────────────────────────
 case("jn-001", "join", "INNER JOIN ON", "SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
 case("jn-002", "join", "implicit join (comma + WHERE)", "SELECT e.name, d.dept_name FROM emp e, dept d WHERE e.dept_id = d.dept_id")
 case("jn-003", "join", "LEFT OUTER JOIN", "SELECT e.name, d.dept_name FROM emp e LEFT JOIN dept d ON e.dept_id = d.dept_id")
@@ -281,52 +272,34 @@ case("jn-013", "join", "three-way join", "SELECT e.name, d.dept_name FROM emp e 
 case("jn-014", "join", "self join on manager", "SELECT e.name AS emp, m.name AS mgr FROM emp e LEFT JOIN emp m ON e.manager_id = m.id")
 case("jn-015", "join", "join then aggregate", "SELECT d.dept_name, avg(e.salary) AS avg_sal FROM emp e JOIN dept d ON e.dept_id = d.dept_id GROUP BY d.dept_name")
 case("jn-016", "join", "USING with subsequent unqualified col", "SELECT dept_id, count(*) AS n FROM emp JOIN dept USING (dept_id) GROUP BY dept_id")
-# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
-# "Latent bugs"): a BARE (unaliased) first table in a >=3-way comma join with
-# aliased tables after it — τ's flat-chain folding buries the bare table's
-# binding (DuckDB: `Referenced table "emp" not found`). An aliased first table
-# (`FROM emp e, ...`) works; two aliases of the same table alone work; the
-# trigger is specifically bare-first + aliased-rest in one comma chain. Same
-# "__td_jl wrapper buries a qualifier" family as passes 7/11/13/17, on a spine
-# shape pass 17's bare-TableScan hoist did not cover. Uncovered by TPC-H
-# Q7/Q8/Q21 (`FROM supplier, lineitem l1, ..., nation n1, nation n2`) after
-# FileScan landed.
+# A bare first table in a three-way comma join with aliased tables after it can
+# lose its binding during τ's flat-chain folding (`emp` is not found by
+# DuckDB). An aliased first table does not trigger this shape.
 case("jn-017", "join", "bare first table + aliased tables in comma join", "SELECT n1.dept_name, n2.dept_name FROM emp, dept n1, dept n2 WHERE emp.dept_id = n1.dept_id AND emp.dept_id = n2.dept_id")
-# Migrated from the retired legacy TPC-DS suite (its q90-at-cross-join τ-only check)
-# (a τ-only check: TPC-DS Q90 aliases a derived table `at` before CROSS JOIN;
-# Q90 itself can't be a differential case because Spark hits its own
-# DIVIDE_BY_ZERO bug on it). EXPECTED RED, same as the legacy test was red in
-# the migration baseline: Spark 4.1.1 accepts the keyword-like alias `at`
-# (verified live), but τ emits it unquoted and DuckDB reserves `at`
-# (Parser Error at `AS at`). The fix is τ quoting keyword-like aliases on
-# emission — this case is the fitness witness for that gap.
+# Spark accepts the keyword-like alias `at`, but τ emits it unquoted and DuckDB
+# reserves it (`Parser Error at AS at`). Alias quoting is required on emission.
 case("jn-018", "join", "keyword-like alias `at` before CROSS JOIN (TPC-DS Q90 parse shape)", "SELECT name, dept_name FROM (SELECT id, name FROM emp) at CROSS JOIN (SELECT dept_name FROM dept) d")
 case("jn-019", "join", "qualified star over join (left side + extra col)", "SELECT e.*, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
 case("jn-020", "join", "qualified star over outer join (right side, null-extended)", "SELECT d.* FROM emp e LEFT JOIN dept d ON e.dept_id = d.dept_id")
 case("jn-021", "join", "qualified star through post-join WHERE", "SELECT e.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id WHERE d.budget > 0")
 case("jn-022", "join", "both sides qualified star", "SELECT e.*, d.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
-# USING-join star-order witness (review finding 4, SQL front-end variant):
-# a multi-slot star bypasses the lone-star hoisted-slot delegate, and DuckDB's
-# raw `*` keeps the USING key at its natural position — silent positional
-# mislabeling vs Spark's key-hoisted schema. Born red by design.
+# A multi-slot star bypasses the lone-star hoisted-slot delegate, and DuckDB's
+# raw `*` keeps the USING key at its natural position instead of Spark's
+# key-hoisted schema order.
 case("jn-023", "join", "multi-slot star over USING join (star-order witness)", "SELECT *, 1 AS one FROM emp JOIN dept USING (dept_id)")
-# jn-024 (F11): the SAME alias `x` on BOTH join sides. Spark ERRORS
+# The SAME alias `x` on BOTH join sides makes Spark ERROR
 # AMBIGUOUS_REFERENCE (`x.id` could be either side) even in the ON clause,
-# because the qualifier binds both scopes. SQL analog of DataFrame join-023;
-# previously deferred (τ resolved first-match/left), LANDED via ADR-024
-# tier-3e (Pass F3) — τ now matches Spark's error. Part of the baseline oracle.
+# because the qualifier binds both scopes.
 case("jn-024", "join", "F11 — duplicate alias both join sides (Spark & τ error AMBIGUOUS_REFERENCE; landed via ADR-024 tier-3e)", "SELECT x.salary FROM emp x JOIN emp2 x ON x.id = x.id", expected_error="AMBIGUOUS_REFERENCE")
-# NOTE (F8/F10 have NO faithful SQL witness): F8's DataFrame plan is a filter
+# F8/F10 have no faithful SQL form: F8's DataFrame plan is a filter
 # ABOVE a projection that created the alias; the only SQL form with that plan
 # is a derived table (`... FROM (SELECT dept_id AS k FROM emp) e WHERE e.k=101`),
 # where `e.k` gains a LIVE binding and BOTH engines succeed (0 rows) — not
 # born red. The single-SELECT form `SELECT dept_id AS k FROM emp e WHERE e.k`
 # errors in BOTH engines (a WHERE cannot see a select-list alias — a different
 # scoping rule, not F8's dead-alias lineage). F10's derived-table analog
-# likewise gains a live binding and succeeds in both. See the DataFrame
-# witnesses filt-018/filt-019 and tasks/select-block-review-findings.md.
+# likewise gains a live binding and succeeds in both.
 
-# ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")
 case("agg-002", "aggregate", "COUNT(col) ignores nulls", "SELECT count(bonus) AS n FROM emp")
 case("agg-003", "aggregate", "COUNT(DISTINCT)", "SELECT count(DISTINCT dept_id) AS nd FROM emp")
@@ -347,36 +320,23 @@ case("agg-017", "aggregate", "aggregate FILTER (WHERE) clause (spark4)", "SELECT
 case("agg-018", "aggregate", "collect_list / collect_set", "SELECT dept_id, collect_list(name) names FROM emp GROUP BY dept_id", flags=("schema_only",))
 case("agg-019", "aggregate", "percentile / median", "SELECT percentile(salary, 0.5) AS p50, median(salary) AS med FROM emp")
 case("agg-020", "aggregate", "any / every boolean aggregates", "SELECT dept_id, any(active) any_a, every(active) all_a FROM emp GROUP BY dept_id")
-# agg-021: pass-3 fix — `expr_has_aggregate` (v2_lowering.rs) used to check only
-# whether a projection item's OWN top-level call name was an aggregate, so
-# `abs(count(*))` (aggregate nested inside a non-aggregate call's args) was
-# misclassified as non-aggregate. That misclassification fed `GROUP BY ALL`'s
-# non-aggregate-column inference, which would incorrectly try to group by
-# `abs(count(*))` itself. `function_call_has_aggregate` now descends into call
-# args (and window PARTITION BY / ORDER BY), so GROUP BY ALL correctly groups
-# only by `dept_id`.
+# `function_call_has_aggregate` descends into nested call arguments, so
+# `GROUP BY ALL` excludes `abs(count(*))` from its grouping keys and groups only
+# by `dept_id`.
 case("agg-021", "aggregate", "GROUP BY ALL excludes aggregate nested in fn args (spark4)", "SELECT dept_id, abs(count(*)) n FROM emp GROUP BY ALL", flags=("spark4",))
-# agg-022 / agg-023: fixed (corpus-driven pass 2). SQL *special-form* syntax
-# parses to dedicated sqlparser `Expr` variants — `EXTRACT(f FROM x)` ->
-# `Expr::Extract`, `SUBSTRING(s FROM p FOR n)` -> `Expr::Substring` — NOT
-# `Expr::Function`. `expr_has_aggregate` (v2_lowering.rs) previously had no arms
-# for these, so an aggregate nested inside a special form was missed: under
-# `GROUP BY ALL` it was not excluded from the grouping keys and τ tried to GROUP
-# BY an expression containing an aggregate -> DuckDB error. Spark groups only by
-# `dept_id`. The walker (and its `&mut` named-window mirror) now descend into the
-# special-form variants (Extract/Ceil/Floor/Substring/Position/Trim/Overlay/
-# CompoundFieldAccess), so both cases group only by `dept_id` — matching Spark.
+# SQL special forms such as `EXTRACT` and `SUBSTRING` have dedicated AST
+# variants. The aggregate walker descends into those variants, so `GROUP BY ALL`
+# excludes nested aggregates and groups only by `dept_id`.
 case("agg-022", "aggregate", "aggregate nested in EXTRACT special form under GROUP BY ALL", "SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL", flags=("spark4",))
 case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under GROUP BY ALL", "SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL", flags=("spark4",))
-# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
-# "Latent bugs"): τ's resolved schema for avg(DECIMAL) is correct
+# τ's resolved schema for avg(DECIMAL) is correct
 # (decimal(14,6), matches Spark) but the EMITTED SQL produces DOUBLE data — the
 # Arrow batch carries float64 while the schema frame claims decimal, so
 # collected values come back as Python floats vs Spark's Decimals. num-026
 # covers the same expression but is schema_only, which is exactly how this
 # slipped through. Rows 2/4/8 give a non-terminating average (13499.99/3) so
 # the decimal-rounded reference value can never equal the raw double.
-# Uncovered by TPC-H Q1 (avg_qty/avg_price/avg_disc) after FileScan landed.
+# The schema-only numeric case does not verify this data representation.
 case("agg-024", "aggregate", "avg(DECIMAL) must return decimal DATA, not just decimal schema", "SELECT avg(bonus) AS avg_bonus FROM emp WHERE id IN (2, 4, 8)")
 
 # N5 — canonical substrate function names at conversion. Unaliased so Spark's
@@ -385,7 +345,6 @@ case("agg-024", "aggregate", "avg(DECIMAL) must return decimal DATA, not just de
 # (`sum(salary)` / `avg(salary)`), never echoing the as-written case.
 case("agg-025", "aggregate", "mixed-case aggregate names canonicalize to lowercase pretty names", "SELECT SUM(salary), AvG(salary) FROM emp")
 
-# ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")
 case("ord-002", "ordering", "ORDER BY DESC", "SELECT * FROM emp ORDER BY salary DESC")
 case("ord-003", "ordering", "NULLS FIRST / LAST", "SELECT * FROM emp ORDER BY dept_id ASC NULLS FIRST, bonus DESC NULLS LAST")
@@ -398,15 +357,14 @@ case("ord-009", "ordering", "LIMIT with OFFSET", "SELECT * FROM emp ORDER BY id 
 case("ord-010", "ordering", "OFFSET only", "SELECT * FROM emp ORDER BY id OFFSET 2", flags=("spark4",))
 case("ord-011", "ordering", "SORT BY (Spark per-partition)", "SELECT * FROM emp SORT BY salary DESC", flags=("schema_only",))
 case("ord-012", "ordering", "DISTRIBUTE BY + SORT BY / CLUSTER BY", "SELECT * FROM emp CLUSTER BY dept_id", flags=("schema_only",))
-# ord-014: O6 verify-first witness (07-11 finding 7). The projection RENAMES
-# salary to `id` while ORDER BY references the ORIGINAL unique emp.id — the
+# The projection RENAMES salary to `id` while ORDER BY references the ORIGINAL
+# unique emp.id — the
 # hidden-column promotion produces projections [salary AS id, id] and a
 # duplicate-named intermediate schema [id, id]. Pre-N10 this was a
 # silently-wrong-pick risk (promoted name not uniquified); post-N10 emission
 # binds duplicates by expr_id. Unique sort key → deterministic total order.
 case("ord-014", "ordering", "ORDER BY original column shadowed by a same-named projection rename (hidden-promotion dup-name)", "SELECT salary AS id FROM emp ORDER BY emp.id")
 
-# ── 6. Conditional / null handling ───────────────────────────────────────────
 case("cnd-001", "conditional", "searched CASE WHEN", "SELECT name, CASE WHEN age >= 40 THEN 'senior' ELSE 'junior' END AS band FROM emp")
 case("cnd-002", "conditional", "simple CASE (expr WHEN val)", "SELECT dept_id, CASE dept_id WHEN 10 THEN 'infra' WHEN 20 THEN 'data' ELSE 'other' END AS nm FROM emp")
 case("cnd-003", "conditional", "chained WHEN branches", "SELECT CASE WHEN age < 30 THEN 'a' WHEN age < 45 THEN 'b' ELSE 'c' END AS band FROM emp")
@@ -420,7 +378,6 @@ case("cnd-010", "conditional", "CASE inside aggregate", "SELECT avg(CASE WHEN ac
 case("cnd-011", "conditional", "nested CASE", "SELECT CASE WHEN active THEN CASE WHEN age > 40 THEN 'senior-active' ELSE 'active' END ELSE 'inactive' END AS s FROM emp")
 case("cnd-012", "conditional", "COALESCE chain", "SELECT coalesce(bonus, cast(score AS decimal(9,2)), 0) AS c FROM emp")
 
-# ── 7. Scalar functions & SQL-syntax operators ───────────────────────────────
 case("fn-001", "scalar_fn", "string concat || operator", "SELECT name || '@' || cast(dept_id AS string) AS handle FROM emp")
 case("fn-002", "scalar_fn", "CONCAT / CONCAT_WS", "SELECT concat(name, '-', cast(dept_id AS string)) c1, concat_ws('|', name, name) c2 FROM emp")
 case("fn-003", "scalar_fn", "SUBSTRING(s FROM p FOR n) SQL syntax", "SELECT substring(name FROM 1 FOR 2) AS ss FROM emp")
@@ -483,7 +440,6 @@ case("fn-026", "scalar_fn", "json_object_keys: object JSON -> keys array", "SELE
 case("fn-027", "scalar_fn", "bit_get pos >= bit-width raises (ANSI)", "SELECT bit_get(lng, 64) AS b FROM nums", expected_error="INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE")
 case("fn-028", "scalar_fn", "bit_get in-bounds (null value -> null)", "SELECT bit_get(lng, 1) AS b FROM nums")
 
-# ── 8. Subqueries (the headline SQL-only family; ADR-008) ────────────────────
 case("sq-001", "subquery", "scalar subquery in SELECT (uncorrelated)", "SELECT name, salary, (SELECT max(salary) FROM emp) AS gmax FROM emp")
 case("sq-002", "subquery", "scalar subquery in WHERE (uncorrelated)", "SELECT * FROM emp WHERE salary > (SELECT avg(salary) FROM emp)")
 case("sq-003", "subquery", "correlated scalar in SELECT (dept avg)", "SELECT e.name, (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id) AS dept_avg FROM emp e")
@@ -494,38 +450,14 @@ case("sq-007", "subquery", "correlated NOT EXISTS (orphans)", "SELECT * FROM emp
 case("sq-008", "subquery", "IN (subquery)", "SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM dept WHERE country = 'AT')")
 case("sq-009", "subquery", "NOT IN with NULL (3VL trap)", "SELECT * FROM emp WHERE dept_id NOT IN (SELECT dept_id FROM dept WHERE budget IS NULL OR dept_id = 40)")
 case("sq-010", "subquery", "correlated IN with predicate", "SELECT * FROM emp e WHERE e.dept_id IN (SELECT d.dept_id FROM dept d WHERE d.budget > e.salary)")
-# sq-011/sq-012 were originally authored as `> ALL (subquery)` / `> ANY (subquery)`
-# (SQL-standard quantified comparison predicates). Spark 4.1.1 does not support this
-# grammar at all (PARSE_SYNTAX_ERROR — Spark's ALL/ANY apply only to array literals,
-# not subqueries), verified live against the vendored reference. Rewritten to the
-# exact relational decorrelation of each predicate (NOT EXISTS / EXISTS with a
-# non-equi correlation), which is semantically faithful including the empty-set edge
-# and exercises non-equi-correlated anti-/semi-join machinery not covered elsewhere
-# in the corpus (sq-007/sq-006's correlations are pure equality).
+# Spark does not support quantified subqueries (`> ALL` / `> ANY`); these cases
+# use equivalent correlated NOT EXISTS / EXISTS forms with non-equi predicates.
 case("sq-011", "subquery", "> ALL rewritten as correlated NOT EXISTS (non-equi correlation)", "SELECT * FROM emp e WHERE NOT EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept_id = 20 AND e2.salary >= e.salary)")
 case("sq-012", "subquery", "> ANY / SOME rewritten as correlated EXISTS (non-equi correlation)", "SELECT * FROM emp e WHERE EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept_id = 30 AND e.salary > e2.salary)")
-# sq-013 ("= ANY (subquery)") deleted: same PARSE_SYNTAX_ERROR class as sq-011/012,
-# but `= ANY (subquery)` is definitionally `IN (subquery)` — its only faithful
-# rewrite is verbatim sq-008 (modulo the country constant), so it adds no coverage.
 case("sq-014", "subquery", "derived table (subquery in FROM)", "SELECT dept_id, n FROM (SELECT dept_id, count(*) AS n FROM emp GROUP BY dept_id) t WHERE n > 1")
 case("sq-015", "subquery", "correlated subquery in HAVING", "SELECT e.dept_id, count(*) AS n FROM emp e GROUP BY e.dept_id HAVING count(*) > (SELECT avg(cnt) FROM (SELECT count(*) AS cnt FROM emp GROUP BY dept_id))")
-# sq-016 was originally authored with the innermost subquery (e3) referencing the
-# OUTERMOST alias `e`, skipping the middle nesting level `e2` — verified live that
-# Spark's own correlation resolution only reaches one level up, so the reference
-# itself throws UNRESOLVED_COLUMN.WITH_SUGGESTION before τ is ever compared.
-# (Separately: τ was found to silently over-resolve this exact skipped-level shape
-# via an accidental name-only qualifier fallback — a distinct latent bug, tracked
-# separately, NOT fixed by this rewrite. Original SQL preserved here for whoever
-# picks that up as a future Spark-emulated error-parity case once the harness
-# wraps `.sql()` itself in try/except:
-#   SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2
-#     WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3
-#     WHERE e3.dept_id <=> e.dept_id))
-# )
-# Rewritten so each nesting level correlates exactly one level up (e3 -> e2 instead
-# of e3 -> e), which is Spark's actual rule and is a genuinely new shape: no other
-# corpus case nests a correlated scalar subquery inside another correlated scalar
-# subquery (sq-004 is single-level; sq-019's two correlated scalars are siblings).
+# Each nested level correlates exactly one level up, matching Spark's correlation
+# rule and exercising a correlated scalar subquery nested inside another one.
 case("sq-016", "subquery", "nested correlated (2 levels, one-level-up at each level)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e2.dept_id))")
 case("sq-017", "subquery", "scalar subquery -> NULL when no match", "SELECT d.dept_name, (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.dept_id) AS top_sal FROM dept d")
 case("sq-018", "subquery", "subquery inside COALESCE", "SELECT e.name, coalesce((SELECT d.dept_name FROM dept d WHERE d.dept_id = e.dept_id), 'UNASSIGNED') AS dept FROM emp e")
@@ -533,8 +465,7 @@ case("sq-019", "subquery", "multiple correlated subqueries", "SELECT e.name, (SE
 case("sq-020", "subquery", "subquery in CASE branch", "SELECT name, CASE WHEN salary > (SELECT avg(salary) FROM emp) THEN 'above' ELSE 'below' END AS rel FROM emp")
 case("sq-021", "subquery", "IN (group HAVING) -> semi-join (TPC-H Q18 shape)", "SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM emp GROUP BY dept_id HAVING sum(salary) > 200000)")
 case("sq-022", "subquery", "de-correlatable avg (TPC-H Q17 shape)", "SELECT sum(e.salary) / 7.0 AS avg_yearly FROM emp e WHERE e.salary < 0.2 * (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id)")
-# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
-# "Latent bugs"): this is sq-016's ORIGINAL level-skipping SQL — the innermost
+# A level-skipping correlation has the innermost
 # subquery (e3) references the OUTERMOST alias `e`, skipping the middle level
 # (e2). Spark's correlation resolution reaches only ONE level up, so Spark
 # rejects this eagerly at .sql() with UNRESOLVED_COLUMN.WITH_SUGGESTION. τ,
@@ -544,8 +475,8 @@ case("sq-022", "subquery", "de-correlatable avg (TPC-H Q17 shape)", "SELECT sum(
 # unresolvable qualified reference must raise UNRESOLVED_COLUMN instead of
 # silently mis-binding. This case goes green when τ raises the same class.
 case("sq-023", "subquery", "level-skipping correlation must raise UNRESOLVED_COLUMN (Spark parity)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e.dept_id))", expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
-# Pass F2 stage 3: correlated EXISTS referencing an OUTER struct field BARE
-# (no outer alias qualifier on `address` — it resolves via the outer emp
+# A correlated EXISTS may reference an OUTER struct field BARE (no outer alias
+# qualifier on `address` — it resolves via the outer emp
 # scope's own `address` struct column, not a relation alias). Spark itself
 # accepts this (live-Spark-verified): `address.city` inside the subquery
 # resolves to the outer `emp e` row's struct field, matching rows where
@@ -553,7 +484,6 @@ case("sq-023", "subquery", "level-skipping correlation must raise UNRESOLVED_COL
 # both Vienna).
 case("sq-024", "subquery", "correlated EXISTS referencing outer struct field bare", "SELECT e.name FROM emp e WHERE EXISTS (SELECT 1 FROM dept WHERE dept.location = address.city)")
 
-# ── 9. CTEs (WITH) ───────────────────────────────────────────────────────────
 case("cte-001", "cte", "single CTE", "WITH ds AS (SELECT dept_id, avg(salary) a FROM emp GROUP BY dept_id) SELECT e.name, s.a FROM emp e JOIN ds s ON e.dept_id = s.dept_id")
 case("cte-002", "cte", "multiple CTEs", "WITH a AS (SELECT dept_id, count(*) c FROM emp GROUP BY dept_id), b AS (SELECT dept_id, avg(salary) s FROM emp GROUP BY dept_id) SELECT a.dept_id, a.c, b.s FROM a JOIN b USING (dept_id)")
 case("cte-003", "cte", "CTE referenced twice", "WITH e AS (SELECT id, name, manager_id FROM emp) SELECT emp.name AS emp, mgr.name AS mgr FROM e emp LEFT JOIN e mgr ON emp.manager_id = mgr.id")
@@ -565,7 +495,6 @@ case("cte-008", "cte", "two independent CTEs unioned", "WITH a AS (SELECT id FRO
 case("cte-009", "cte", "recursive CTE (verify on pin)", "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5) SELECT * FROM seq", flags=("spark4",))
 case("cte-010", "cte", "recursive CTE org hierarchy (verify)", "WITH RECURSIVE chain(id, name, manager_id, lvl) AS (SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL UNION ALL SELECT e.id, e.name, e.manager_id, c.lvl + 1 FROM emp e JOIN chain c ON e.manager_id = c.id) SELECT * FROM chain", flags=("spark4",))
 
-# ── 10. Window functions ─────────────────────────────────────────────────────
 case("win-001", "window", "ROW_NUMBER", "SELECT name, dept_id, row_number() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS rn FROM emp")
 case("win-002", "window", "RANK / DENSE_RANK", "SELECT name, rank() OVER (ORDER BY salary) rk, dense_rank() OVER (ORDER BY salary) drk FROM emp")
 case("win-003", "window", "PERCENT_RANK / CUME_DIST", "SELECT name, percent_rank() OVER (ORDER BY salary) pr, cume_dist() OVER (ORDER BY salary) cd FROM emp")
@@ -582,15 +511,11 @@ case("win-013", "window", "RANGE BETWEEN INTERVAL (time frame)", "SELECT id, las
 case("win-014", "window", "top-per-group via window + outer filter", "SELECT * FROM (SELECT name, dept_id, salary, row_number() OVER (PARTITION BY dept_id ORDER BY salary DESC) rn FROM emp) WHERE rn = 1")
 case("win-015", "window", "multiple windows different partitions", "SELECT name, rank() OVER (PARTITION BY dept_id ORDER BY salary) r1, rank() OVER (PARTITION BY active ORDER BY age) r2 FROM emp")
 case("win-016", "window", "window over expression", "SELECT name, sum(salary + coalesce(cast(bonus AS double),0)) OVER (PARTITION BY dept_id) AS comp_sum FROM emp")
-# win-017: pass-3 fix — `resolve_named_windows_in_expr` (v2_lowering.rs) only
-# descended through Function/Nested/UnaryOp/Cast/BinaryOp, so a named-window
-# reference nested inside a CASE branch fell to the `_ => {}` no-op arm and
-# stayed an unresolved `WindowType::NamedWindow`, surfacing a spurious "not
-# defined in WINDOW clause" boundary error even though `w` IS defined. The
-# widened walk now descends into CASE (and BETWEEN, InList, IS NULL, etc.).
+# A named-window reference inside a CASE branch must be resolved like one in
+# other expression nodes; otherwise a defined `w` appears to be missing from
+# the WINDOW clause.
 case("win-017", "window", "named WINDOW clause referenced inside CASE branch", "SELECT name, CASE WHEN active THEN rank() OVER w ELSE NULL END AS rk FROM emp WINDOW w AS (PARTITION BY dept_id ORDER BY salary)")
 
-# ── 11. Set operations ───────────────────────────────────────────────────────
 case("set-001", "setop", "UNION (distinct)", "SELECT id, name FROM emp UNION SELECT id, name FROM emp2")
 case("set-002", "setop", "UNION ALL", "SELECT id, name FROM emp UNION ALL SELECT id, name FROM emp2")
 case("set-003", "setop", "UNION DISTINCT (explicit)", "SELECT dept_id FROM emp UNION DISTINCT SELECT dept_id FROM emp2")
@@ -602,7 +527,6 @@ case("set-008", "setop", "MINUS (EXCEPT synonym)", "SELECT dept_id FROM dept MIN
 case("set-009", "setop", "3-way UNION ALL", "SELECT id FROM emp UNION ALL SELECT id FROM emp2 UNION ALL SELECT dept_id FROM dept")
 case("set-010", "setop", "set op then ORDER BY", "SELECT id, name FROM emp UNION SELECT id, name FROM emp2 ORDER BY id")
 
-# ── 12. GROUP BY extensions ──────────────────────────────────────────────────
 case("gx-001", "group_ext", "ROLLUP", "SELECT dept_id, active, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active)")
 case("gx-002", "group_ext", "CUBE", "SELECT dept_id, active, count(*) n FROM emp GROUP BY CUBE (dept_id, active)")
 case("gx-003", "group_ext", "GROUPING SETS (explicit)", "SELECT dept_id, active, count(*) n FROM emp GROUP BY GROUPING SETS ((dept_id, active), (dept_id), ())")
@@ -613,26 +537,15 @@ case("gx-007", "group_ext", "ROLLUP with HAVING", "SELECT dept_id, count(*) n FR
 case("gx-008", "group_ext", "CUBE 3 columns", "SELECT dept_id, active, year(hire_date) y, count(*) n FROM emp GROUP BY CUBE (dept_id, active, year(hire_date))")
 case("gx-009", "group_ext", "ROLLUP + order by grouping_id", "SELECT dept_id, active, grouping_id() gid, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active) ORDER BY gid")
 case("gx-010", "group_ext", "GROUP BY ... WITH ROLLUP (Hive syntax)", "SELECT dept_id, active, count(*) n FROM emp GROUP BY dept_id, active WITH ROLLUP")
-# gx-011: pass-3 fix — `rewrite_grouping_id` (emission.rs) previously walked
-# only a hand-enumerated set of containers (FunctionCall args / Alias / Cast /
-# CaseWhen); a no-arg `grouping_id()` nested inside a `Binary` expression (here,
-# `+ 1`) fell through untouched and reached DuckDB as a literal zero-arg
-# `grouping_id()` -> parser error (DuckDB requires explicit grouping-column
-# args). The generic `children_mut` walk now splices the ROLLUP grouping
-# columns regardless of the surrounding container shape.
+# `rewrite_grouping_id` walks nested expressions, so a no-arg `grouping_id()`
+# inside `+ 1` receives the ROLLUP grouping columns instead of reaching DuckDB
+# as a zero-argument call.
 case("gx-011", "group_ext", "grouping_id() nested in arithmetic expr (ROLLUP)", "SELECT dept_id, active, grouping_id() + 1 AS gid1, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active)")
-# gx-012: fixed (corpus-driven pass 1). The gx-011 fix widened
-# `rewrite_grouping_id` (emission.rs) so a no-arg `grouping_id()` gets the
-# grouping columns spliced in anywhere in the aggregate SELECT list — but
-# `render_aggregate_op` still emitted the HAVING predicate through plain
-# `render_expr`, WITHOUT the rewrite, so a no-arg `grouping_id()` in HAVING
-# reached DuckDB as a zero-arg call -> parser error. The HAVING branch of
-# `render_aggregate_op` now applies `rewrite_grouping_id` before rendering, so
-# grouping functions in HAVING over ROLLUP/CUBE/GROUPING SETS splice the
-# grouping columns exactly as the SELECT list does.
+# HAVING predicates over ROLLUP/CUBE/GROUPING SETS use the same
+# `rewrite_grouping_id` traversal as the SELECT list, so a no-arg
+# `grouping_id()` is rendered with the grouping columns.
 case("gx-012", "group_ext", "grouping_id() in HAVING over ROLLUP", "SELECT dept_id, count(*) n FROM emp GROUP BY ROLLUP (dept_id) HAVING grouping_id() = 0")
 
-# ── 13. Complex types & LATERAL VIEW ─────────────────────────────────────────
 case("cx-001", "complex_type", "array literal + element access", "SELECT array(1, 2, 3) AS arr, array(1,2,3)[0] AS first")
 case("cx-002", "complex_type", "map literal + key access", "SELECT map('a', 1, 'b', 2) AS m, map('a',1)['a'] AS av")
 case("cx-003", "complex_type", "named_struct + field access", "SELECT named_struct('n', name, 'a', age) AS info FROM emp")
@@ -647,16 +560,12 @@ case("cx-011", "complex_type", "explode map -> key,value", "SELECT id, explode(a
 case("cx-012", "complex_type", "inline (array<struct> -> cols)", "SELECT inline(array(named_struct('a', 1, 'b', 'x'), named_struct('a', 2, 'b', 'y')))")
 case("cx-013", "complex_type", "higher-order transform lambda", "SELECT transform(tags, x -> upper(x)) AS up_tags FROM emp")
 case("cx-014", "complex_type", "higher-order filter / exists", "SELECT filter(tags, x -> x LIKE 'r%') r_tags, exists(tags, x -> x = 'rust') has_rust FROM emp")
-# Stale default-projection witnesses (review finding 3 in
-# tasks/select-block-review-findings.md): a LATERAL VIEW merged onto a block
-# that carries default_projections (range's `id` bind; a join's hoisted slot
-# list) must extend the SELECT list with the generated columns — today the
-# stale defaults win and the generated columns silently vanish from the wire.
-# Born red by design; the evidence gate for the emission fix.
+# A LATERAL VIEW merged onto a block with default projections (such as range's
+# `id` bind or a join's hoisted slot list) must retain the generated columns;
+# stale defaults otherwise make them disappear from the wire.
 case("cx-015", "complex_type", "LATERAL VIEW over range() (stale default-projection witness)", "SELECT * FROM range(3) LATERAL VIEW explode(array(1, 2)) t AS c")
 case("cx-016", "complex_type", "LATERAL VIEW over join (stale default-projection witness)", "SELECT * FROM emp e JOIN dept d ON e.dept_id = d.dept_id LATERAL VIEW explode(e.tags) t AS tag")
 
-# ── 14. Table-valued / FROM-clause expressions ───────────────────────────────
 case("tbl-001", "table_expr", "inline table VALUES", "SELECT * FROM VALUES (1, 'a'), (2, 'b'), (3, 'c') AS t(n, s)")
 case("tbl-002", "table_expr", "VALUES feeding a join", "SELECT e.name, v.label FROM emp e JOIN (VALUES (10, 'infra'), (20, 'data')) AS v(did, label) ON e.dept_id = v.did")
 case("tbl-003", "table_expr", "TABLESAMPLE PERCENT", "SELECT * FROM emp TABLESAMPLE (50 PERCENT)", flags=("nondeterministic",))
@@ -667,47 +576,21 @@ case("tbl-007", "table_expr", "explode() as table function", "SELECT * FROM expl
 case("tbl-008", "table_expr", "broadcast hint", "SELECT /*+ BROADCAST(d) */ e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id", flags=("cosmetic",))
 case("tbl-009", "table_expr", "coalesce/repartition hint", "SELECT /*+ COALESCE(1) */ * FROM emp", flags=("cosmetic",))
 case("tbl-010", "table_expr", "subquery alias required", "SELECT t.dept_id, t.n FROM (SELECT dept_id, count(*) n FROM emp GROUP BY dept_id) AS t")
-# tbl-011: pass-3 fix — `lower_table_factor`'s `TableFactor::Function` arm
-# (`LATERAL f(...)`) built the table-function node but silently dropped the
-# user alias (`alias: _`), unlike the sibling `Derived` / `Table`-with-args
-# branches. Now composed through the shared `apply_table_alias` helper, so
-# `AS r(id)` renames the single output column via `ToDf`. Uses `range` rather
-# than `explode` as the underlying table function — `explode` hits an
-# unrelated, pre-existing τ boundary gap ("table-function analysis" not yet
-# implemented for `TableFunction[explode]`, see `tbl-007`), which would mask
-# the alias-plumbing fix under test here.
-#
-# NOTE: the sibling fix in the same finding — `TableFactor::TableFunction`
-# (ANSI `TABLE(<expr>) AS alias` syntax) — is unit-test-only. Real Spark's
-# grammar treats a bare `TABLE(...)` in FROM position as invoking a
-# table-valued function literally NAMED `TABLE` (used for passing a TABLE
-# argument to a Python UDTF/PTF), not as "call the function inside the
-# parens" — `TABLE(explode(...))` throws Spark's own
-# `UNRESOLVABLE_TABLE_VALUED_FUNCTION`/`UNRESOLVED_ROUTINE`, verified against
-# the vendored Spark 4.1.1 reference. That branch is therefore unreachable via
-# real PySpark SQL traffic and is covered only by
-# `table_function_table_syntax_with_alias_columns_renames_via_todf` in
-# `crates/core/src/parser_v2/v2_lowering.rs`.
+# A `LATERAL` table function's alias must be applied to its output columns;
+# `AS r(id)` therefore renames the `range` output. `explode` is not used here
+# because its table-function analysis is a separate unsupported path.
 case("tbl-011", "table_expr", "LATERAL table function with column alias list", "SELECT r.id FROM LATERAL range(3) AS r(id)")
-# tbl-012: KNOWN-RED witness (NOT a pass-3 fix — out of findings 1-6). The
-# tbl-011 fix restored the *alias* on `TableFactor::Function` (`LATERAL
-# f(...)`), but the arm still swallows the `lateral: true` flag (`..`), so
-# correlation to outer columns is lost; and the underlying generator TVF
-# (`explode`) has no τ table-function analysis yet (see tbl-007). A correlated
-# lateral generator — `LATERAL explode(e.tags)` referencing the outer row — is
-# valid Spark 4.x (SPARK-41961) but fails end-to-end in τ today. Flips green
-# once both the swallowed `lateral` flag and generator-TVF analysis land.
+# Correlated `LATERAL explode(e.tags)` is valid Spark 4.x, but τ currently
+# loses the lateral flag and lacks generator table-function analysis.
 case("tbl-012", "table_expr", "correlated LATERAL table function over outer column (known gap)", "SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)")
-# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
-# "Latent bugs"): a derived table with a COLUMN ALIAS LIST `AS t (a, b)` whose
+# A derived table with a COLUMN ALIAS LIST `AS t (a, b)` whose
 # body contains a JOIN — referencing the renamed aggregate column fails
 # (DuckDB: `Referenced column "count" not found; Candidate bindings:
 # "count(d.dept_id)"`). The same shape WITHOUT the join inside works, so the
 # join is the trigger. Uncovered by TPC-H Q13 (`... AS c_orders (c_custkey,
-# c_count)`) after FileScan landed.
+# c_count)`).
 case("tbl-013", "table_expr", "derived-table column alias list over a JOIN body", "SELECT b, count(*) AS n FROM (SELECT e.dept_id, count(d.dept_id) FROM emp e LEFT OUTER JOIN dept d ON e.dept_id = d.dept_id GROUP BY e.dept_id) AS t (a, b) GROUP BY b")
 
-# ── 15. Advanced predicates / SQL-specific operators ─────────────────────────
 case("pr-001", "predicate_adv", "IS DISTINCT FROM", "SELECT * FROM emp WHERE dept_id IS DISTINCT FROM 10")
 case("pr-002", "predicate_adv", "IS NOT DISTINCT FROM NULL", "SELECT * FROM emp WHERE manager_id IS NOT DISTINCT FROM NULL")
 case("pr-003", "predicate_adv", "LIKE ANY", "SELECT * FROM emp WHERE name LIKE ANY ('A%', '%e')")
@@ -719,7 +602,6 @@ case("pr-008", "predicate_adv", "struct equality comparison", "SELECT * FROM emp
 case("pr-009", "predicate_adv", "NOT with IN subquery", "SELECT * FROM emp WHERE NOT (dept_id IN (SELECT dept_id FROM dept WHERE country = 'DE'))")
 case("pr-010", "predicate_adv", "boolean column directly", "SELECT * FROM emp WHERE active")
 
-# ── 16. PIVOT / UNPIVOT ──────────────────────────────────────────────────────
 case("pv-001", "pivot", "PIVOT single aggregate", "SELECT * FROM (SELECT dept_id, active, salary FROM emp) PIVOT (avg(salary) FOR active IN (true AS act, false AS inact))")
 case("pv-002", "pivot", "PIVOT count", "SELECT * FROM (SELECT dept_id, active FROM emp) PIVOT (count(*) FOR active IN (true AS t, false AS f))")
 case("pv-003", "pivot", "PIVOT multiple aggregates", "SELECT * FROM (SELECT dept_id, active, salary FROM emp) PIVOT (avg(salary) AS a, max(salary) AS m FOR active IN (true AS act))")
@@ -735,7 +617,6 @@ case("pv-005", "pivot", "PIVOT on dept_id", "SELECT * FROM (SELECT active, dept_
 # on different code paths).
 case("pv-006", "pivot", "stack() unpivot form (cast-unified value slot)", "SELECT id, stack(2, 'age', cast(age AS double), 'salary', salary) AS (metric, value) FROM emp")
 
-# ── 17. Typed literals & intervals ───────────────────────────────────────────
 case("lit-001", "typed_literal", "DATE literal", "SELECT DATE '2026-01-15' AS d")
 case("lit-002", "typed_literal", "TIMESTAMP literal", "SELECT TIMESTAMP '2026-01-15 10:30:00' AS ts")
 case("lit-003", "typed_literal", "INTERVAL day literal", "SELECT hire_date + INTERVAL '90' DAY AS later FROM emp")
@@ -753,14 +634,13 @@ case("lit-007", "typed_literal", "DECIMAL literal arithmetic", "SELECT 100.25 * 
 case("lit-008", "typed_literal", "timestamp - timestamp -> interval", "SELECT (TIMESTAMP '2026-06-30 00:00:00' - TIMESTAMP '2026-06-01 00:00:00') AS diff_iv")
 case("lit-009", "typed_literal", "string escape literal", "SELECT 'line1\\nline2' AS s, 'tab\\there' AS t")
 case("lit-010", "typed_literal", "INTERVAL arithmetic in WHERE", "SELECT * FROM emp WHERE last_login > current_timestamp() - INTERVAL '30' DAY", flags=("nondeterministic",))
-# lit-011: R1-6 fix witness. Spark promotes DATE +/- a sub-day-field
+# Spark promotes DATE +/- a sub-day-field
 # DayTimeIntervalType (HOUR/MINUTE/SECOND) to TIMESTAMP, but keeps DATE for a
 # day-only or YearMonthIntervalType interval (live-probed against Spark
 # 4.1.1 Connect). `hire_date` is DATE-typed on the `emp` fixture (see
 # lit-003).
 case("lit-011", "typed_literal", "DATE +/- sub-day INTERVAL promotes to TIMESTAMP, day/month INTERVAL stays DATE (R1-6)", "SELECT hire_date + INTERVAL '25' HOUR AS promoted_add, hire_date - INTERVAL '25' HOUR AS promoted_sub, hire_date + INTERVAL '1' DAY AS stays_date_day, hire_date + INTERVAL '2' MONTH AS stays_date_month FROM emp")
 
-# ── 18. Numeric tower × non-exotic built-in functions ────────────────────────
 # Each function applied across the supported numeric types (short/int/bigint/
 # float/double/decimal) to pin Spark's per-type RESULT TYPE and coercion rules —
 # the ADR-005 divergent slice where DuckDB most often disagrees. The oracle
@@ -798,17 +678,40 @@ case("num-030", "numeric_tower", "bitwise AND/OR/XOR over short/int/bigint", "SE
 case("num-031", "numeric_tower", "shift/bit_count over integral tower", "SELECT shiftleft(a, 2) shl, shiftright(lng, 1) shr, bit_count(a) bc FROM nums", flags=("schema_only",))
 case("num-032", "numeric_tower", "hex/bin over int vs bigint", "SELECT hex(a) ha, hex(lng) hl, bin(a) ba FROM nums", flags=("schema_only",))
 
+# These cases pin Spark's distinct error classes for recursive UNION, LATERAL
+# NATURAL/USING joins, and ragged VALUES rows.
+case("errcls-101", "error_class", "A1 — recursive CTE with UNION (not ALL)", "WITH RECURSIVE seq(n) AS (SELECT 1 UNION SELECT n + 1 FROM seq WHERE n < 5) SELECT * FROM seq", flags=("spark4",), expected_error="UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE")
+case("errcls-102", "error_class", "A1 — LATERAL join with NATURAL join", "SELECT * FROM emp NATURAL JOIN LATERAL (SELECT 1 AS id)", expected_error="INCOMPATIBLE_JOIN_TYPES")
+case("errcls-103", "error_class", "A1 — LATERAL join with USING", "SELECT * FROM emp JOIN LATERAL (SELECT 1 AS id) USING (id)", expected_error="UNSUPPORTED_FEATURE.LATERAL_JOIN_USING")
+case("errcls-104", "error_class", "A1 — ragged VALUES rows", "SELECT * FROM VALUES (1, 2), (3) AS t(a, b)", expected_error="INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH")
 
-# ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
+# Lexical failures, unbalanced delimiters, and empty expression slots are
+# classified as Spark-emulated PARSE_SYNTAX_ERROR cases.
+case("parseerr-002", "error_class", "unbalanced paren — malformed by delimiter count", "SELECT (1 FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-003", "error_class", "dangling GROUP BY — expression required, input ended", "SELECT * FROM emp GROUP BY", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-004", "error_class", "unterminated string — lexical failure", "SELECT 'abc FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-005", "error_class", "empty UNPIVOT IN list — expression required, slot empty", "SELECT * FROM emp UNPIVOT (v FOR k IN ())", expected_error="PARSE_SYNTAX_ERROR")
+# `SELECT * FRM emp` is malformed, but sqlparser reports
+# `Expected: end of statement, found: FRM` — byte-identical in form to the shape
+# produced by genuine τ grammar gaps (HiveQL TRANSFORM -> `found: 'cat'`,
+# VERSION AS OF -> `found: AS`, CREATE TABLE ... USING -> `found: USING`), all of
+# which Spark ACCEPTS. Upgrading this shape would tell users their valid Spark is
+# invalid, so this ambiguous parser error is not mapped unconditionally.
+case("parseerr-001", "error_class", "keyword typo; error shape is indistinguishable from a τ grammar gap", "SELECT * FRM emp", flags=("deferred",), expected_error="PARSE_SYNTAX_ERROR")
+# Time-travel syntax is accepted by Spark and fails later with
+# UNSUPPORTED_FEATURE.TIME_TRAVEL; it must not be mapped to
+# PARSE_SYNTAX_ERROR merely because sqlparser rejects it.
+case("parseerr-101", "error_class", "counter-example — time travel: τ says sql::parse_error, Spark says UNSUPPORTED_FEATURE.TIME_TRAVEL (must NOT become PARSE_SYNTAX_ERROR)", "SELECT * FROM emp VERSION AS OF 1", flags=("deferred",), expected_error="UNSUPPORTED_FEATURE.TIME_TRAVEL")
+
+
 #
 # Query text is loaded VERBATIM at import time from the canonical .sql files
 # (tests/integration/sql/{tpch,tpcds}_queries/) — those files stay the single
-# source of truth, exactly as the legacy TPC-H /
-# TPC-DS suites read them. These clusters reference the
+# source of truth. These clusters reference the
 # parquet-backed TPC temp views (lineitem, orders, ..., store_sales, ...),
 # registered by the sql_corpus_* fixtures in conftest.py alongside the
 # in-memory corpus views. Red cases here are the τ fitness signal (ADR-022) —
-# see .agent-output/tpc-baseline.md for the pre-migration pass/fail oracle.
+# see .agent-output/tpc-baseline.md for the regression oracle.
 
 _SQL_QUERIES_DIR = Path(__file__).resolve().parent.parent / "sql"
 
@@ -820,8 +723,7 @@ for _n in range(1, 23):
         (_SQL_QUERIES_DIR / "tpch_queries" / f"q{_n}.sql").read_text(),
     )
 
-# The exact query set the legacy TPC-DS suite exercised (its
-# STANDARD_QUERIES + VARIANT_QUERIES): Q36 excluded (DuckDB limitation),
+# The query set used here excludes Q36 (DuckDB limitation),
 # Q72 excluded (Spark OOM), Q90 excluded (Spark DIVIDE_BY_ZERO bug).
 _TPCDS_QUERY_IDS = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
@@ -846,9 +748,7 @@ for _q in _TPCDS_QUERY_IDS:
     )
 
 
-# ---------------------------------------------------------------------------
 # Coverage summary + optional self-check runner
-# ---------------------------------------------------------------------------
 
 def coverage() -> Dict[str, int]:
     counts: Dict[str, int] = {}

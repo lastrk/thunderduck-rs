@@ -5,19 +5,12 @@
 #include "duckdb/common/types/decimal.hpp"
 #include "spark_precision.hpp"
 #include "wide_integer.hpp"
-#include "spark_aggregates.hpp" // reuse spark_avg DECIMAL path + WriteAggResult
+#include "spark_aggregates.hpp"
 
 namespace duckdb {
 
-// ============================================================================
-// spark_try_sum: overflow-safe SUM (Spark 3.5+ try_sum).
-//
-// Same result type as spark_sum (BIGINT for integer inputs, DECIMAL(min(p+10,38),s)
-// for DECIMAL inputs) but returns NULL instead of raising / wrapping on overflow.
-// Verified vs Spark 4.1.1: try_sum(bigint) -> BIGINT, overflow -> NULL.
-// ============================================================================
-
-// ---- Integer path (accumulate int64_t with overflow detection) -------------
+// spark_try_sum returns BIGINT/DECIMAL(min(p+10, 38), s) and returns NULL for
+// arithmetic overflow or a decimal sum outside the declared Spark precision.
 struct SparkTrySumIntegerState {
 	int64_t value;
 	bool isset;
@@ -90,8 +83,6 @@ struct SparkTrySumIntegerOperation {
 	}
 };
 
-// ---- DECIMAL path (hugeint_t state, __int128 arithmetic; NULL if it exceeds
-//      10^result_precision) ----
 struct SparkTrySumDecimalBindData : public FunctionData {
 	uint8_t result_precision;
 
@@ -105,11 +96,7 @@ struct SparkTrySumDecimalBindData : public FunctionData {
 	}
 };
 
-// Stores hugeint_t, not a raw __int128, and converts only for stack-local
-// arithmetic — see SPARK_ASSERT_STATE_LAYOUT in spark_aggregates.hpp for why
-// (DuckDB aligns aggregate states to 8 bytes; a 16-byte-aligned member is UB).
-// Note in particular that the previous form passed `&state.value` — a misaligned
-// __int128* — straight into __builtin_add_overflow.
+// Keep the state 8-byte aligned; convert to __int128 only for arithmetic.
 struct SparkTrySumDecimalState {
 	hugeint_t value;
 	bool isset;
@@ -188,8 +175,9 @@ struct SparkTrySumDecimalOperation {
 		auto &bind_data = finalize_data.input.bind_data->Cast<SparkTrySumDecimalBindData>();
 		unsigned __int128 limit = Pow10_128(bind_data.result_precision);
 		__int128 value = HugeintToInt128(state.value);
+		// The sum may fit in __int128 but still exceed Spark's result precision.
 		if (Abs128(value) >= limit) {
-			finalize_data.ReturnNull(); // Spark: overflow beyond result precision -> NULL
+			finalize_data.ReturnNull();
 			return;
 		}
 		WriteAggResult(target, value);
@@ -253,13 +241,6 @@ inline AggregateFunctionSet CreateSparkTrySumFunctionSet() {
 	decimal_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(decimal_func);
 
-	auto add_int = [&](const LogicalType &in) {
-		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
-		    in, LogicalType::BIGINT);
-		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-		set.AddFunction(f);
-	};
-	// One OP works for all widths (input is cast to int64_t in Operation).
 	{
 		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int8_t, int64_t, SparkTrySumIntegerOperation>(
 		    LogicalType::TINYINT, LogicalType::BIGINT);
@@ -284,19 +265,12 @@ inline AggregateFunctionSet CreateSparkTrySumFunctionSet() {
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
-	(void)add_int;
 	return set;
 }
 
-// ============================================================================
-// spark_try_avg: overflow-safe AVG (Spark 3.5+ try_avg).
-//
-// Integer/float inputs -> DOUBLE average (double accumulation; matches Spark 4.1.1,
-//   which does NOT overflow-to-NULL for integer avg — verified: avg(bigint_max,
-//   bigint_max) = 9.22e18 double, not NULL).
-// DECIMAL input -> reuses the spark_avg DECIMAL path (an average never exceeds the
-//   input range, so the Spark overflow-to-NULL case is unreachable for avg).
-// ============================================================================
+// spark_try_avg uses DOUBLE for integer/floating inputs and does not turn a
+// large integer average into NULL; DECIMAL inputs reuse Spark's decimal average
+// rules, whose result remains within the input range.
 
 struct SparkTryAvgDoubleState {
 	double sum;
@@ -353,18 +327,11 @@ struct SparkTryAvgDoubleOperation {
 inline AggregateFunctionSet CreateSparkTryAvgFunctionSet() {
 	AggregateFunctionSet set("spark_try_avg");
 
-	// DECIMAL overload: reuse spark_avg's DECIMAL implementation + bind.
 	auto decimal_func = GetSparkAvgDecimalFunction<hugeint_t>();
 	decimal_func.bind = BindSparkAvgDecimal;
 	decimal_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(decimal_func);
 
-	// Integer + floating overloads -> DOUBLE.
-	auto add_double = [&](const LogicalType &in) {
-		// dispatched below per physical input type
-		(void)in;
-	};
-	(void)add_double;
 	{
 		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int8_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::TINYINT, LogicalType::DOUBLE);

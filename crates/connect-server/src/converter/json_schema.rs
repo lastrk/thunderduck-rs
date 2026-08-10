@@ -37,7 +37,6 @@ fn struct_from_value(value: &Value) -> StructType {
                 .unwrap_or_default()
                 .to_owned();
             let nullable = f.get("nullable").and_then(Value::as_bool).unwrap_or(true);
-            // "type" can be a quoted string or a nested object.
             let dt = type_from_value(f.get("type"));
             if nullable {
                 StructField::nullable(name, dt)
@@ -96,25 +95,8 @@ fn type_from_object(obj: &Value) -> DataType {
 mod tests {
     use super::*;
 
-    // ── parse_json_schema — depth-aware nullable / name lookups (rev-fix 1) ──
-    //
-    // Regression for the review's High #1: a struct-typed field's JSON body
-    // carries nested `"name"` / `"nullable"` keys inside `type.fields[…]`;
-    // depth-blind lookup returned an INNER field's value if it came first
-    // in the source ordering. Pass 88 activated the JSON schema preference
-    // path in `convert_local_relation`, exposing this pre-existing bug on
-    // any `StructField("parent", StructType([StructField(..., False)]), True)`
-    // shape. The test constructs that exact shape (using key ordering that
-    // WOULD have tripped the depth-blind version — nested `nullable=false`
-    // appearing before the outer `nullable=true` in the source string) and
-    // asserts the outer nullability wins.
-
     #[test]
     fn parse_json_schema_reads_outer_nullable_not_inner_when_nested_field_is_non_null() {
-        // Handcrafted JSON with the nested `"nullable":false` positioned so
-        // depth-blind `.find()` would (incorrectly) see it BEFORE the outer
-        // `"nullable":true`. The `type` key is placed before the outer
-        // `nullable` key to force this ordering.
         let json = r#"{
           "type":"struct",
           "fields":[
@@ -152,13 +134,8 @@ mod tests {
         );
     }
 
-    /// Companion: PySpark's alphabetised key ordering (what the corpus
-    /// actually exercises) still parses correctly — pin the no-regression
-    /// contract for the happy path.
     #[test]
     fn parse_json_schema_pyspark_alphabetised_key_order_round_trips() {
-        // Matches `_schema.json()` output for
-        // `Struct<parent: Struct<child: int nullable=false> nullable=true>`.
         let json = r#"{"fields":[{"metadata":{},"name":"parent","nullable":true,"type":{"fields":[{"metadata":{},"name":"child","nullable":false,"type":"integer"}],"type":"struct"}}],"type":"struct"}"#;
         let st = parse_json_schema(json);
         assert_eq!(st.fields.len(), 1);

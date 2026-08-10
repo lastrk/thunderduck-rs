@@ -22,9 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # Distinct Operations
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -135,9 +133,7 @@ class TestDistinctOperations:
         assert_dataframes_equal(ref, td, "distinct_empty_dataframe")
 
 
-# =============================================================================
 # DropDuplicates Operations
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -236,9 +232,7 @@ class TestDropDuplicatesOperations:
         assert_dataframes_equal(ref, td, "drop_duplicates_with_nulls_in_subset")
 
 
-# =============================================================================
 # Combined Operations
-# =============================================================================
 
 
 @pytest.mark.differential

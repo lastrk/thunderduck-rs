@@ -30,7 +30,6 @@ SPARK_BROADCAST_THRESHOLD="${SPARK_BROADCAST_THRESHOLD:--1}"
 # First launch downloads the jars from Maven (network). Override to re-pin.
 DELTA_SPARK_PACKAGE="${DELTA_SPARK_PACKAGE:-io.delta:delta-spark_4.1_2.13:4.3.0}"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -40,7 +39,6 @@ echo -e "${BLUE}================================================================
 echo -e "${BLUE}Starting Apache Spark ${SPARK_VERSION} Connect Reference Server${NC}"
 echo -e "${BLUE}================================================================${NC}"
 
-# Check if Spark is installed
 if [ ! -d "$SPARK_HOME" ]; then
     echo -e "${RED}ERROR: Spark not found at $SPARK_HOME${NC}"
     exit 1
@@ -48,7 +46,6 @@ fi
 
 echo -e "${GREEN}Using Spark at: $SPARK_HOME${NC}"
 
-# Check if server is already running
 if pgrep -f "org.apache.spark.sql.connect.service.SparkConnectServer.*${SPARK_PORT}" > /dev/null; then
     echo -e "${GREEN}✓ Spark Connect server already running on port ${SPARK_PORT}${NC}"
     exit 0
@@ -63,10 +60,8 @@ mkdir -p "$SPARK_LOG_DIR"
 
 echo -e "${BLUE}Starting Spark Connect server on port ${SPARK_PORT}...${NC}"
 
-# Set required JVM options for Apache Arrow (Spark 4.1.x requirement)
 export SPARK_SUBMIT_OPTS="--add-opens=java.base/java.nio=ALL-UNNAMED"
 
-# Build warehouse dir argument if provided
 WAREHOUSE_CONF=""
 if [ -n "$SPARK_WAREHOUSE_DIR" ]; then
     echo -e "${BLUE}Using custom warehouse dir: ${SPARK_WAREHOUSE_DIR}${NC}"
@@ -108,7 +103,7 @@ fi
     ${WAREHOUSE_CONF} \
     > "${SPARK_LOG_DIR}/start.log" 2>&1 &
 
-# Server is backgrounded — caller (DualServerManager.wait_for_port) handles readiness via TCP socket polling.
+# The caller owns readiness polling for this background process.
 echo -e "${GREEN}Spark Connect server process started on port ${SPARK_PORT}${NC}"
 echo -e "${BLUE}Logs: ${SPARK_LOG_DIR}/start.log${NC}"
 echo -e "${BLUE}================================================================${NC}"

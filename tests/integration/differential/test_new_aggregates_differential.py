@@ -204,9 +204,7 @@ def _create_grouped_stats_data(spark, view_name="grouped_stats_data"):
     return df
 
 
-# =============================================================================
 # Basic Aggregate Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -369,9 +367,7 @@ class TestNewAggregates_Differential:
         )
 
 
-# =============================================================================
 # Statistical Aggregate Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -454,9 +450,7 @@ class TestStatisticalAggregates_Differential:
         assert_dataframes_equal(ref, td, "percentile_approx", ignore_nullable=True)
 
 
-# =============================================================================
 # Regression Aggregate Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -563,9 +557,7 @@ class TestRegressionAggregates_Differential:
         assert_dataframes_equal(ref, td, "regr_sxy", ignore_nullable=True)
 
 
-# =============================================================================
 # Grouped Aggregate Functions
-# =============================================================================
 
 
 @pytest.mark.differential

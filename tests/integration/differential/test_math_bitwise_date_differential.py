@@ -73,9 +73,7 @@ def _create_date_data(spark, view_name="date_data"):
     return df
 
 
-# =============================================================================
 # Math Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -188,9 +186,7 @@ class TestMathFunctions_Differential:
         assert_dataframes_equal(ref, td, "positive", ignore_nullable=True)
 
 
-# =============================================================================
 # Bitwise Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -249,9 +245,7 @@ class TestBitwiseFunctions_Differential:
         assert_dataframes_equal(ref, td, "shiftright", ignore_nullable=True)
 
 
-# =============================================================================
 # Date Functions
-# =============================================================================
 
 
 @pytest.mark.differential

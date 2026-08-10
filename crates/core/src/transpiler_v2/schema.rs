@@ -1,18 +1,12 @@
 //! τ's attribute-identity substrate — [`ExprId`] / [`Attribute`] /
 //! [`ResolvedSchema`].
 //!
-//! N9 INCREMENT 1: pure carriage. Every production `TypedAst::new` site mints
-//! or copies an [`ExprId`] per output column, but NOTHING downstream consumes
-//! the ids yet (no resolver rewrite, no emission read) — this increment is
-//! behavior-frozen: zero emitted-SQL change, zero test-string churn.
-//!
 //! **Convention:** construct [`Attribute`] ONLY via the constructors below
 //! (`minted` / `from_field`) or by `.clone()`-ing an existing one. Do **not**
 //! write `Attribute { .. }` struct literals outside this module — an
 //! out-of-module literal is exactly the "implicit minting at a passthrough"
-//! landmine this increment exists to avoid: every fresh id must come from a
-//! visible `::minted` call so a reviewer (and a future increment's grep) can
-//! find every place identity is created versus carried.
+//! landmine: every fresh id must come from a visible `::minted` call so
+//! identity creation is distinct from identity carriage.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,8 +28,8 @@ use super::name_fold::eq_fold;
 
 /// A process-unique identifier minted once per logical output column and
 /// carried (cloned) through every operator that merely passes a column
-/// through, so downstream increments can tell "the same column, threaded
-/// through N operators" from "a new column that happens to share a name".
+/// through, distinguishing the same logical column from a new column with the
+/// same name.
 ///
 /// Precedent: Spark's `NamedExpression.newExprId` / `curId` (an atomic
 /// counter scoped to the JVM). Like Spark's `ExprId`, this type promises
@@ -70,10 +64,10 @@ pub struct Attribute {
     pub nullable: bool,
     /// This column's stable identity — see [`ExprId`].
     pub expr_id: ExprId,
-    /// ADR-023 tier-3 source-qualifier lineage (Spark attribute lineage) —
+    /// Source-qualifier lineage (Spark attribute lineage) —
     /// which relation qualifiers (table names / user aliases) this column
     /// inherits, now intrinsic to `Attribute` rather than a parallel
-    /// per-node `RelScope` vector (N9 increment 3). Empty for a genuinely
+    /// per-node parallel vector. Empty for a genuinely
     /// CREATED column (an `Alias` or a computed expression) — see
     /// [`Attribute::minted`]. Seeded at leaf origination points (`TableScan`,
     /// `AliasedRelation`) via [`Attribute::with_quals`]; carried through
@@ -207,7 +201,7 @@ impl ResolvedSchema {
     /// is intentionally no blanket `Into<StructType>` — the two production
     /// callers (`generate_with_schema` / `analyze_schema` in `mod.rs`) call
     /// this explicitly; any OTHER production call site is id-laundering and
-    /// should stop and get reviewed rather than silently added.
+    /// should remain explicit at the boundary.
     pub fn to_struct_type(&self) -> StructType {
         StructType {
             fields: self.fields.iter().map(Attribute::to_field).collect(),
@@ -220,24 +214,14 @@ impl ResolvedSchema {
         self.fields.iter().find(|f| eq_fold(&f.name, name))
     }
 
-    /// First-occurrence lookup by [`ExprId`] — the single home of the
-    /// id-lookup-plus-name-agreement-assert shape that used to be hand-rolled
-    /// at four sites (analyzer.rs's `output_attribute` /
-    /// `promote_project_subtree`, emission.rs's `bare_dup_slot` /
-    /// `requalify_column_ref`). Duplicate ids within one schema are clones of
-    /// the same attribute from a duplicated projection (N10-lite) — first
-    /// match is sound: same id, same per-row value, regardless of which slot
-    /// is addressed. Returns the matched position alongside the attribute so
-    /// callers that need a `usize` (the two emission.rs sites) and callers
-    /// that only need the `&Attribute` (the two analyzer.rs sites) both stay
-    /// single-walk.
+    /// First-occurrence lookup by [`ExprId`]. Duplicate ids within one schema
+    /// are clones of the same attribute from a duplicated projection, so the
+    /// first match is sound: same id, same per-row value, regardless of slot.
+    /// Returns the matched position alongside the attribute.
     ///
     /// `ref_name` is the reference's OWN stamped name, checked
-    /// case-insensitively against the resolved attribute's name via a single
-    /// `debug_assert` (a mismatch signals a resolver stamping bug, not a
-    /// reachable production case) — the per-site prefix each of the four
-    /// call sites used to carry in its own assert message is lost; the
-    /// generic message below is deemed acceptable in trade for one home.
+    /// case-insensitively against the resolved attribute's name. A mismatch
+    /// signals a resolver-stamping bug.
     pub(crate) fn field_by_id(&self, id: ExprId, ref_name: &str) -> Option<(usize, &Attribute)> {
         let (k, f) = self
             .fields
@@ -425,16 +409,15 @@ mod tests {
         assert_ne!(attr, different_case);
     }
 
-    // ── name_fold (finding 3, case-folding unification) ────────────────────
     // `eq_fold`/`fold_key`'s own unit tests (ASCII/Unicode fold behavior,
     // the JDK-21 divergence table, the İ residual) live in
     // `super::name_fold`'s test module; this schema-level test is the
-    // resolution substrate's own intra-τ consistency witness.
+    // resolution substrate's own consistency witness.
 
     #[test]
     fn field_by_name_intra_tau_consistency_on_unicode_schema() {
-        // Pins the finding-3 fix: a schema carrying an accented column name
-        // must resolve the SAME way `eq_fold`/`fold_key` say it should —
+        // A schema carrying an accented column name must resolve the same way
+        // `eq_fold`/`fold_key` define it —
         // `field_by_name` is the resolution substrate's own lookup, so this
         // is the direct intra-τ consistency witness.
         let st = StructType::new(vec![field("É", DataType::String, true)]);

@@ -3,10 +3,8 @@
 //! Operators merge their clause into the child's open [`SelectBlock`] when
 //! the clause ordinal and alias-visibility preconditions hold, and wrap the
 //! child as a derived table (a fresh block) only on slot-occupancy conflict.
-//! This replaces the former wrap-every-operator-then-flatten-heuristically
-//! string rendering: one uniform mechanism instead of per-shape inlining
-//! ladders (the Calcite `RelToSqlConverter` approach; ADR-001 sanctions the
-//! node-reducing merges as result-irrelevant cosmetic simplification).
+//! This provides one uniform mechanism for clause placement and derived-table
+//! wrapping (ADR-001 permits the resulting cosmetic simplification).
 //!
 //! A block stores **already-rendered SQL fragments** (projection slot lists,
 //! predicates, sort keys) produced by `emission`'s expression layer; this
@@ -43,8 +41,8 @@ pub(crate) enum Clause {
 }
 
 /// A rendered relational unit: either an open, merge-accepting SELECT block
-/// or an opaque SQL string (set-op chains, `WITH RECURSIVE`, and every
-/// operator still on a legacy string renderer). Nothing merges into `Raw`;
+/// or an opaque SQL string (set-op chains, `WITH RECURSIVE`, and operators
+/// that require string rendering). Nothing merges into `Raw`;
 /// parents wrap it.
 #[derive(Debug)]
 pub(crate) enum SqlUnit {
@@ -103,8 +101,7 @@ pub(crate) enum FromItem {
         /// Render `LATERAL` before the right side.
         lateral: bool,
     },
-    /// Verbatim FROM body (lateral-view chains). Carries the aliases it
-    /// exposes so the block's scope stays truthful.
+    /// A verbatim FROM body and the aliases it exposes.
     Raw {
         /// The FROM-body SQL.
         sql: String,
@@ -173,9 +170,7 @@ pub(crate) enum DistinctKind {
 /// nothing binds through it.
 pub(crate) const WRAP_ALIAS: &str = "__td_sub";
 
-/// One soft SELECT slot: the analyzer-declared output column name plus its
-/// rendered SQL. Named so consumers can filter (`DropColumns`) or extend
-/// (`LateralView`) the list without parsing SQL text.
+/// One analyzer-named, rendered SELECT slot.
 #[derive(Debug, Clone)]
 pub(crate) struct DefaultSlot {
     /// The output column name, in analyzer casing.
@@ -260,9 +255,7 @@ impl SelectBlock {
         &self.from
     }
 
-    /// Extend the FROM body in place (lateral-view chaining):
-    /// `FROM <old-from><suffix>`, exposing `extra_aliases` in addition to the
-    /// current scope. Caller must have checked `max_clause == From`.
+    /// Append `suffix` to FROM and expose `extra_aliases`.
     pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<String>) {
         debug_assert_eq!(self.max_clause, Clause::From);
         let sql = format!("{}{suffix}", self.from.to_sql());
@@ -284,10 +277,7 @@ impl SelectBlock {
         self.default_projections.as_deref()
     }
 
-    /// Extend the soft SELECT slot list with `extra` (lateral-view
-    /// chaining's generated columns) — a no-op when defaults are `None`,
-    /// since a free block already renders `*`, which covers appended
-    /// columns without an explicit slot list.
+    /// Add soft SELECT slots when a default list exists.
     pub(crate) fn extend_default_projections(&mut self, extra: Vec<DefaultSlot>) {
         if let Some(slots) = &mut self.default_projections {
             slots.extend(extra);
@@ -465,8 +455,7 @@ impl SelectBlock {
         sql.push_str(&self.from.to_sql());
         match self.where_conjuncts.as_slice() {
             [] => {}
-            // A single predicate renders bare (parity with the former
-            // `render_filter`); composed predicates parenthesize each
+            // A single predicate renders bare; composed predicates parenthesize each
             // conjunct to keep operator precedence unambiguous.
             [only] => {
                 sql.push_str(" WHERE ");

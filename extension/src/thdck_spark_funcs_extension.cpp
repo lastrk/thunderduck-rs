@@ -16,27 +16,15 @@
 
 namespace duckdb {
 
-// ---------------------------------------------------------------------------
-// Write helpers: convert __int128 to target physical type
-// ---------------------------------------------------------------------------
-
 template <typename T>
 static inline void WriteResult(T *data, idx_t idx, __int128 val) {
 	data[idx] = static_cast<T>(val);
 }
 
-// Specialization for hugeint_t
 template <>
 inline void WriteResult<hugeint_t>(hugeint_t *data, idx_t idx, __int128 val) {
 	data[idx] = Int128ToHugeint(val);
 }
-
-// ---------------------------------------------------------------------------
-// Execution function template
-// ---------------------------------------------------------------------------
-// RESULT_TYPE is the physical C++ type for the output DECIMAL
-// (int16_t, int32_t, int64_t, or hugeint_t).
-// Inputs are always hugeint_t because we promote both arguments to DECIMAL(38, s).
 
 template <typename RESULT_TYPE>
 static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -44,7 +32,6 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 	auto &bind_data = func_expr.bind_info->Cast<SparkDivBindData>();
 	uint32_t scale_adj = bind_data.scale_adj;
 
-	// Precompute power-of-10 once for the entire batch (scale_adj is constant)
 	unsigned __int128 pow10_val = (scale_adj > 0) ? Pow10_128(scale_adj) : 0;
 
 	idx_t count = args.size();
@@ -52,10 +39,10 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 	auto *__restrict result_data = FlatVector::GetData<RESULT_TYPE>(result);
 	auto &result_validity = FlatVector::Validity(result);
 
-	// Fast path: both inputs are flat vectors (avoids UnifiedVectorFormat overhead)
 	auto &a_vec = args.data[0];
 	auto &b_vec = args.data[1];
 
+	// Flat vectors use the fast path; retain the validity-aware branch for NULLs.
 	if (a_vec.GetVectorType() == VectorType::FLAT_VECTOR && b_vec.GetVectorType() == VectorType::FLAT_VECTOR) {
 		auto *__restrict a_data = FlatVector::GetData<hugeint_t>(a_vec);
 		auto *__restrict b_data = FlatVector::GetData<hugeint_t>(b_vec);
@@ -63,7 +50,6 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 		auto &b_validity = FlatVector::Validity(b_vec);
 
 		if (a_validity.AllValid() && b_validity.AllValid()) {
-			// Fastest path: no nulls, sequential access
 			for (idx_t i = 0; i < count; i++) {
 				__int128 b_val = HugeintToInt128(b_data[i]);
 				if (__builtin_expect(b_val == 0, 0)) {
@@ -74,7 +60,6 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 				WriteResult(result_data, i, SparkDecimalDivide(a_val, b_val, pow10_val));
 			}
 		} else {
-			// Flat but with nulls
 			for (idx_t i = 0; i < count; i++) {
 				if (!a_validity.RowIsValid(i) || !b_validity.RowIsValid(i)) {
 					result_validity.SetInvalid(i);
@@ -92,7 +77,8 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 		return;
 	}
 
-	// Generic path: handles constant vectors, dictionary vectors, etc.
+	// UnifiedVectorFormat is required for constant/dictionary vectors; always use
+	// its selection indices and validity mask when reading each logical row.
 	UnifiedVectorFormat a_fmt, b_fmt;
 	a_vec.ToUnifiedFormat(count, a_fmt);
 	b_vec.ToUnifiedFormat(count, b_fmt);
@@ -104,7 +90,7 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 		auto a_idx = a_fmt.sel->get_index(i);
 		auto b_idx = b_fmt.sel->get_index(i);
 
-		// NULL propagation
+		// NULL operands and division by zero produce NULL, not a numeric result.
 		if (!a_fmt.validity.RowIsValid(a_idx) || !b_fmt.validity.RowIsValid(b_idx)) {
 			result_validity.SetInvalid(i);
 			continue;
@@ -112,7 +98,6 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 
 		__int128 b_val = HugeintToInt128(b_data[b_idx]);
 
-		// Division by zero -> NULL (unlikely in normal data)
 		if (__builtin_expect(b_val == 0, 0)) {
 			result_validity.SetInvalid(i);
 			continue;
@@ -121,17 +106,10 @@ static void SparkDivExec(DataChunk &args, ExpressionState &state, Vector &result
 		__int128 a_val = HugeintToInt128(a_data[a_idx]);
 		__int128 div_result = SparkDecimalDivide(a_val, b_val, pow10_val);
 
-		// Write result, converting from __int128 to the target physical type
 		WriteResult(result_data, i, div_result);
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Bind function: resolve types and select implementation
-// ---------------------------------------------------------------------------
-
-// Helper: promote an integer LogicalType to a DECIMAL(p, 0) equivalent.
-// Returns the DECIMAL type if promotion is possible, or an invalid type otherwise.
 static LogicalType PromoteIntToDecimal(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::TINYINT:
@@ -154,10 +132,8 @@ static unique_ptr<FunctionData> BindSparkDecimalDiv(ClientContext &context, Scal
 	auto type_a = arguments[0]->return_type;
 	auto type_b = arguments[1]->return_type;
 
-	// Promote integer types to DECIMAL(p, 0) when paired with a DECIMAL operand.
-	// This handles expressions like `95 / 100.0` where DuckDB resolves 95 as INTEGER
-	// and 100.0 as DECIMAL. The `/` operator override catches this via implicit cast
-	// matching, but the bind function receives the original (pre-cast) types.
+	// DuckDB binds integer literals before the DECIMAL operator override, so
+	// promote integral operands here as well.
 	if (type_a.id() != LogicalTypeId::DECIMAL) {
 		auto promoted = PromoteIntToDecimal(type_a);
 		if (promoted.id() != LogicalTypeId::INVALID) {
@@ -181,23 +157,16 @@ static unique_ptr<FunctionData> BindSparkDecimalDiv(ClientContext &context, Scal
 	uint8_t p2 = DecimalType::GetWidth(type_b);
 	uint8_t s2 = DecimalType::GetScale(type_b);
 
-	// Compute result type per Spark 4.1 rules
 	auto result = ComputeDivisionType(p1, s1, p2, s2);
 
-	// scale_adj = result_scale - s1 + s2
-	// This is always >= 0 for valid Spark inputs
 	uint32_t scale_adj = static_cast<uint32_t>(result.scale) - static_cast<uint32_t>(s1) + static_cast<uint32_t>(s2);
 
-	// Promote both inputs to DECIMAL(38, s_original) -> hugeint_t physical type
-	// DuckDB will insert implicit casts
 	bound_function.arguments[0] = LogicalType::DECIMAL(38, s1);
 	bound_function.arguments[1] = LogicalType::DECIMAL(38, s2);
 
-	// Set result type
 	auto result_type = LogicalType::DECIMAL(result.precision, result.scale);
 	bound_function.return_type = result_type;
 
-	// Select implementation based on result physical type
 	switch (result_type.InternalType()) {
 	case PhysicalType::INT16:
 		bound_function.function = SparkDivExec<int16_t>;
@@ -218,16 +187,11 @@ static unique_ptr<FunctionData> BindSparkDecimalDiv(ClientContext &context, Scal
 	return make_uniq<SparkDivBindData>(scale_adj);
 }
 
-// ---------------------------------------------------------------------------
 // spark_try_divide: Spark 3.5+ try_divide(dividend, divisor)
 //
 // divisor == 0 (or NULL operand) -> NULL. Otherwise divide using Spark's type
 // promotion: any DECIMAL operand -> DECIMAL result (identical to spark_decimal_div,
 // which already returns NULL on zero); all other numeric operands -> DOUBLE.
-// Verified vs Spark 4.1.1: try_divide(10,2)=5.0 (DOUBLE), try_divide(1.5,0.5 dec)
-// = 3.000000 DECIMAL(9,6), try_divide(x,0)=NULL.
-// ---------------------------------------------------------------------------
-
 static void SparkTryDivideDoubleExec(DataChunk &args, ExpressionState &state, Vector &result) {
 	idx_t count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -249,7 +213,7 @@ static void SparkTryDivideDoubleExec(DataChunk &args, ExpressionState &state, Ve
 		}
 		double b_val = b_data[b_idx];
 		if (b_val == 0.0) {
-			result_validity.SetInvalid(i); // Spark: divide-by-zero -> NULL
+			result_validity.SetInvalid(i);
 			continue;
 		}
 		result_data[i] = a_data[a_idx] / b_val;
@@ -261,7 +225,6 @@ static unique_ptr<FunctionData> BindSparkTryDivide(ClientContext &context, Scala
 	auto type_a = arguments[0]->return_type;
 	auto type_b = arguments[1]->return_type;
 
-	// DECIMAL division only when both sides are DECIMAL or an integral type that can be promoted to DECIMAL.
 	auto is_decimal_or_integral = [](LogicalTypeId id) {
 		switch (id) {
 		case LogicalTypeId::DECIMAL:
@@ -280,17 +243,12 @@ static unique_ptr<FunctionData> BindSparkTryDivide(ClientContext &context, Scala
 		return BindSparkDecimalDiv(context, bound_function, arguments);
 	}
 
-	// All other numeric operands -> DOUBLE division (Spark: int/int -> double).
 	bound_function.arguments[0] = LogicalType::DOUBLE;
 	bound_function.arguments[1] = LogicalType::DOUBLE;
 	bound_function.return_type = LogicalType::DOUBLE;
 	bound_function.function = SparkTryDivideDoubleExec;
 	return nullptr;
 }
-
-// ---------------------------------------------------------------------------
-// Internal loading logic
-// ---------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
 	vector<LogicalType> args = {LogicalType::ANY, LogicalType::ANY};
@@ -300,31 +258,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(func);
 
-	// spark_try_divide (ext5): divide-by-zero -> NULL, Spark type promotion.
 	vector<LogicalType> try_div_args = {LogicalType::ANY, LogicalType::ANY};
 	ScalarFunction try_div("spark_try_divide", std::move(try_div_args), LogicalType::ANY, SparkTryDivideDoubleExec,
 	                       BindSparkTryDivide);
 	try_div.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	loader.RegisterFunction(try_div);
 
-	// Spark-compatible aggregate functions
+	// Register every Spark-compatible scalar, aggregate, JSON, and hash entry
+	// point here; DuckDB COUNT already supplies Spark's BIGINT count semantics.
 	loader.RegisterFunction(CreateSparkSumFunctionSet());
 	loader.RegisterFunction(CreateSparkAvgFunctionSet());
-	loader.RegisterFunction(CreateSparkTrySumFunctionSet()); // ext5
-	loader.RegisterFunction(CreateSparkTryAvgFunctionSet()); // ext5
+	loader.RegisterFunction(CreateSparkTrySumFunctionSet());
+	loader.RegisterFunction(CreateSparkTryAvgFunctionSet());
 	loader.RegisterFunction(CreateSparkSkewnessFunction());
 	loader.RegisterFunction(CreateSparkSchemaOfJsonFunction());
-	// COUNT not needed — DuckDB COUNT already returns BIGINT (matches Spark)
 
-	// Spark-bit-parity hash functions. See src/include/spark_hash.hpp and
-	// README.md "Spark hash functions" for the integration contract.
 	loader.RegisterFunction(CreateSparkXxhash64Function());
 	loader.RegisterFunction(CreateSparkHashFunction());
 }
-
-// ---------------------------------------------------------------------------
-// Extension class methods
-// ---------------------------------------------------------------------------
 
 void ThdckSparkFuncsExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

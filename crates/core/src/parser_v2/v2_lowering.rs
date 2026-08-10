@@ -1,22 +1,9 @@
 //! sqlparser-rs AST → τ [`CommonAst`] lowering.
 //!
-//! Scope (per architecture plan §4):
-//! - `SELECT expr, … FROM table WHERE … GROUP BY … ORDER BY … LIMIT n OFFSET m`
-//! - bare `SELECT literal`
-//! - `SELECT … FROM (VALUES ...)` and other subquery-in-FROM forms
-//! - basic joins (INNER / LEFT / RIGHT / FULL / CROSS / LEFT SEMI / LEFT ANTI)
-//! - `SELECT *`
-//!
-//! Deferred (surface as [`EmissionError::Unsupported`] with `ProtoShape` kind):
-//! PIVOT, GROUPING SETS, ROLLUP, CUBE, LATERAL VIEW, TABLESAMPLE, CTE,
-//! UNION/INTERSECT/EXCEPT, window functions, HOFs, `json_tuple` rewrites,
-//! command statements.
-//!
 //! **INV10:** imports only value-level types from `crate::types` plus
 //! intra-τ modules. No `crate::parser`, `crate::logical`, `crate::expression`.
 //!
-//! **Plan-id policy (Open Decision 12):** every [`UnresolvedColumn`] emitted
-//! by this module has `plan_id = None`.
+//! Every [`UnresolvedColumn`] emitted by this module has `plan_id = None`.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -47,6 +34,7 @@ use crate::transpiler_v2::expression::{
     StarExpression, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
     WindowFunction,
 };
+use crate::transpiler_v2::generator::Generator;
 use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
 use crate::transpiler_v2::EmissionError;
@@ -88,7 +76,6 @@ pub fn lower_statement_or_ddl(
             let ast = lower_query(*q, &CteScope::new())?;
             Ok(SqlStatement::Query(ast))
         }
-        // ── CREATE [OR REPLACE] TEMP[ORARY] VIEW ──────────────────────────
         Statement::CreateView(cv) if cv.temporary => {
             // Spark-emulated parse errors (match Spark 4.1.1 ParseException
             // wording exactly). These fire before unsupported-clause guards
@@ -127,7 +114,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── Non-temporary CREATE VIEW ─────────────────────────────────────
         Statement::CreateView(ref cv) if cv.or_replace && cv.if_not_exists => {
             Err(EmissionError::Unsupported {
                 kind: UnsupportedKind::ProtoShape,
@@ -154,7 +140,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── CREATE TABLE ──────────────────────────────────────────────────
         Statement::CreateTable(CreateTable {
             name,
             columns,
@@ -210,7 +195,7 @@ pub fn lower_statement_or_ddl(
             initialize,
             require_user,
         }) => {
-            // Bail loudly on unsupported clauses.
+            // Reject unsupported clauses.
             if or_replace {
                 bail_boundary_proto!(
                     "sql::create_table::or_replace",
@@ -503,8 +488,7 @@ pub fn lower_statement_or_ddl(
 
             let table_name = extract_simple_name(&name, "sql::create_table::name")?;
 
-            // Lower column definitions: name + type, with bail on constraints
-            // (DEFAULT, NOT NULL, CHECK, etc.).
+            // Lower column definitions and reject column constraints.
             let fields: Vec<StructField> = columns
                 .into_iter()
                 .map(|col| {
@@ -530,7 +514,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── DROP TABLE / DROP VIEW ────────────────────────────────────────
         Statement::Drop {
             object_type: ObjectType::Table,
             if_exists,
@@ -636,7 +619,6 @@ pub fn lower_statement_or_ddl(
             }))
         }
 
-        // ── INSERT INTO ───────────────────────────────────────────────────
         Statement::Insert(Insert {
             insert_token: _,
             optimizer_hint,
@@ -660,7 +642,7 @@ pub fn lower_statement_or_ddl(
             settings,
             format_clause,
         }) => {
-            // Bail loudly on unsupported clauses.
+            // Reject unsupported clauses.
             if optimizer_hint.is_some() {
                 bail_boundary_proto!(
                     "sql::insert::optimizer_hint",
@@ -755,7 +737,6 @@ pub fn lower_statement_or_ddl(
                 );
             }
 
-            // Extract the table name.
             let table_name = match table {
                 TableObject::TableName(ref obj_name) => {
                     extract_simple_name(obj_name, "sql::insert::table_name")?
@@ -774,12 +755,8 @@ pub fn lower_statement_or_ddl(
                 reason: "INSERT without a source query is not supported".to_owned(),
             })?;
 
-            // Determine whether this is INSERT ... VALUES or INSERT ... SELECT.
-            // VALUES bodies arrive as `Query { body: SetExpr::Values(..) }`.
             let body = *source_query;
             if body.with.is_some() || body.order_by.is_some() || body.limit_clause.is_some() {
-                // INSERT ... SELECT with ORDER BY / LIMIT / WITH — lower as
-                // a full query.
                 let ast = lower_query(body, &CteScope::new())?;
                 return Ok(SqlStatement::Ddl(DdlStatement::InsertSelect {
                     table: table_name,
@@ -788,7 +765,6 @@ pub fn lower_statement_or_ddl(
             }
             match *body.body {
                 SetExpr::Values(values) => {
-                    // Lower each row of literal values.
                     let rows: Vec<Vec<Expression>> = values
                         .rows
                         .into_iter()
@@ -804,7 +780,6 @@ pub fn lower_statement_or_ddl(
                     }))
                 }
                 _ => {
-                    // Reassemble the Query and lower it.
                     let reassembled = Query {
                         with: None,
                         body: body.body,
@@ -826,7 +801,6 @@ pub fn lower_statement_or_ddl(
             }
         }
 
-        // ── TRUNCATE TABLE ────────────────────────────────────────────────
         Statement::Truncate(Truncate {
             table_names,
             partitions,
@@ -879,11 +853,8 @@ pub fn lower_statement_or_ddl(
 
 /// Reject unsupported clauses common to both temp and non-temp CREATE VIEW.
 ///
-/// Takes the whole [`sqlparser::ast::CreateView`] rather than its individual
-/// clause fields: eight of the ten are same-typed `bool`/`Option`, so a
-/// positional argument list was a silent-transposition hazard (only one of the
-/// twelve rejection branches below has a test). Named field reads make a
-/// mis-wire a compile error instead.
+/// Takes the whole [`sqlparser::ast::CreateView`] so each clause is checked by
+/// name rather than through positional arguments.
 fn reject_unsupported_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), EmissionError> {
     if !cv.columns.is_empty() {
         bail_boundary_proto!(
@@ -1236,7 +1207,7 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
             // `UNION BY NAME` is parseable in `SparkDialect` but positional
             // lowering would silently align columns by position — a wrong
             // result. Reject it as a Thunderduck-boundary error rather than
-            // mis-lower (ADR-022; loud-fail per CLAUDE.md gotcha #9).
+            // mis-lower (ADR-022).
             if matches!(
                 set_quantifier,
                 SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
@@ -1266,166 +1237,73 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
     }
 }
 
-/// Dispatch table mapping a generator function name + outer flag + column aliases
-/// to the `(alias, FunctionCall)` column pairs consumed by `CommonOp::LateralView`.
-///
-/// Single source of truth for BOTH `LATERAL VIEW explode(...) t AS tag` syntax
-/// (via `lower_lateral_views`) and `LATERAL explode(...) AS r(v)` comma-syntax
-/// (via `lower_lateral_generator_item`). ADR-004/INV7 convergence by construction.
-fn generator_view_columns(
+fn lateral_generator(
     gen_name: &str,
     outer: bool,
-    arg: Expression,
+    args: Vec<Expression>,
     aliases: Vec<String>,
-) -> Result<Vec<(String, Expression)>, EmissionError> {
-    // `explode` + OUTER and `explode_outer` emit the same shape — normalize once
-    // here so the match below needs only a single arm for it.
-    let gen_name = if outer && gen_name == "explode" {
-        "explode_outer"
-    } else {
-        gen_name
+) -> Result<Generator, EmissionError> {
+    let Some(mut generator) = Generator::from_function(gen_name, args) else {
+        bail_boundary_proto!(
+            format!("sql::lateral_view::generator::{gen_name}"),
+            format!("LATERAL VIEW generator `{gen_name}` not supported in τ")
+        );
     };
-    match gen_name {
-        "explode" if aliases.len() == 1 => Ok(vec![(
-            aliases.into_iter().next().expect("len checked == 1"),
-            Expression::FunctionCall(FunctionCall {
-                name: "explode".to_owned(),
-                args: vec![arg],
-                distinct: false,
-            }),
-        )]),
-        "explode_outer" if aliases.len() == 1 => Ok(vec![(
-            aliases.into_iter().next().expect("len checked == 1"),
-            Expression::FunctionCall(FunctionCall {
-                name: "explode_outer".to_owned(),
-                args: vec![arg],
-                distinct: false,
-            }),
-        )]),
-        "posexplode" if !outer && aliases.len() == 2 => {
-            let mut it = aliases.into_iter();
-            let pos_alias = it.next().expect("len checked == 2");
-            let val_alias = it.next().expect("len checked == 2");
-            Ok(vec![
-                (
-                    pos_alias,
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_pos".to_owned(),
-                        args: vec![arg.clone()],
-                        distinct: false,
-                    }),
-                ),
-                (
-                    val_alias,
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_val".to_owned(),
-                        args: vec![arg],
-                        distinct: false,
-                    }),
-                ),
-            ])
-        }
-        "posexplode" if outer => {
-            bail_boundary_proto!(
-                "sql::lateral_view::outer_posexplode",
-                "OUTER posexplode in LATERAL VIEW not implemented in τ"
-            );
-        }
-        "posexplode" => {
-            bail_boundary_proto!(
-                "sql::lateral_view::posexplode_alias_count",
-                "posexplode in LATERAL VIEW requires exactly 2 aliases"
-            );
-        }
-        _ => {
-            bail_boundary_proto!(
-                format!("sql::lateral_view::generator::{gen_name}"),
-                format!("LATERAL VIEW generator `{gen_name}` not supported in τ")
-            );
-        }
-    }
+    generator.outer |= outer;
+    generator.aliases = aliases;
+    Ok(generator)
 }
 
-/// Fold `lateral_views` into the plan tree — each `LATERAL VIEW [OUTER]
-/// generator(arg) table_alias AS col1[, col2]` becomes a
-/// [`CommonOp::LateralView`] wrapping `base`.
-///
-/// Dispatch table (generator name lowercased, alias count), via
-/// [`generator_view_columns`]:
-/// - `explode` / `explode_outer`, 1 alias → single-column LateralView
-/// - `posexplode`, 2 aliases → split into `posexplode_pos` + `posexplode_val`
-/// - Chained (2+) LATERAL VIEWs → boundary error
-/// - OUTER posexplode → boundary error (no CASE-wrapped pos/val renderer)
-/// - Everything else (wrong alias count, unknown generator, non-1-arg) → boundary error
 fn lower_lateral_views(
     base: CommonAst,
     lateral_views: Vec<LateralView>,
     cte_scope: &CteScope,
 ) -> Result<CommonAst, EmissionError> {
-    if lateral_views.is_empty() {
-        return Ok(base);
-    }
-    if lateral_views.len() > 1 {
-        bail_boundary_proto!(
-            "sql::lateral_view::chained",
-            "multiple LATERAL VIEW clauses not implemented in τ"
-        );
-    }
-    let lv = lateral_views.into_iter().next().expect("len checked == 1");
-    // Extract the generator function name and arguments from the parsed Expr.
-    let (gen_name, gen_args) = match &lv.lateral_view {
-        Expr::Function(func) => {
-            let name = object_name_to_string(&func.name).to_lowercase();
-            let args: Vec<Expression> = match &func.args {
-                FunctionArguments::List(list) => list
-                    .args
-                    .iter()
-                    .map(|a| function_arg_to_expr(a.clone(), cte_scope))
-                    .collect::<Result<Vec<_>, _>>()?,
-                _ => {
-                    bail_boundary_proto!(
-                        "sql::lateral_view::generator_args",
-                        "LATERAL VIEW generator with non-list arguments not supported in τ"
-                    );
-                }
-            };
-            (name, args)
-        }
-        _ => {
+    lateral_views.into_iter().try_fold(base, |input, lv| {
+        let (gen_name, gen_args) = match lv.lateral_view {
+            Expr::Function(func) => {
+                let name = object_name_to_string(&func.name).to_lowercase();
+                let args = match func.args {
+                    FunctionArguments::List(list) => list
+                        .args
+                        .into_iter()
+                        .map(|arg| function_arg_to_expr(arg, cte_scope))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => {
+                        bail_boundary_proto!(
+                            "sql::lateral_view::generator_args",
+                            "LATERAL VIEW generator with non-list arguments not supported in τ"
+                        );
+                    }
+                };
+                (name, args)
+            }
+            _ => {
+                bail_boundary_proto!(
+                    "sql::lateral_view::generator",
+                    "LATERAL VIEW with non-function generator not supported in τ"
+                );
+            }
+        };
+        let qualifier = object_name_to_string(&lv.lateral_view_name);
+        let aliases = lv
+            .lateral_col_alias
+            .into_iter()
+            .map(|alias| alias.value)
+            .collect::<Vec<_>>();
+        if aliases.is_empty() {
             bail_boundary_proto!(
-                "sql::lateral_view::generator",
-                "LATERAL VIEW with non-function generator not supported in τ"
+                "sql::lateral_view::empty_aliases",
+                "LATERAL VIEW with no column aliases not supported in τ"
             );
         }
-    };
-    // Require exactly one generator argument.
-    if gen_args.len() != 1 {
-        bail_boundary_proto!(
-            "sql::lateral_view::generator_arity",
-            "LATERAL VIEW generator must have exactly 1 argument"
-        );
-    }
-    let arg = gen_args.into_iter().next().expect("len checked == 1");
-    let table_alias = object_name_to_string(&lv.lateral_view_name);
-    let aliases: Vec<String> = lv
-        .lateral_col_alias
-        .iter()
-        .map(|id| id.value.clone())
-        .collect();
-    if aliases.is_empty() {
-        bail_boundary_proto!(
-            "sql::lateral_view::empty_aliases",
-            "LATERAL VIEW with no column aliases not supported in τ"
-        );
-    }
-
-    let columns = generator_view_columns(&gen_name, lv.outer, arg, aliases)?;
-
-    Ok(CommonAst::new(CommonOp::LateralView {
-        input: Box::new(base),
-        table_alias,
-        columns,
-    }))
+        let generator = lateral_generator(&gen_name, lv.outer, gen_args, aliases)?;
+        Ok(CommonAst::new(CommonOp::Generate {
+            input: Box::new(input),
+            generator,
+            qualifier: Some(qualifier),
+        }))
+    })
 }
 
 fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
@@ -1738,9 +1616,6 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
     let mut acc = lower_table_with_joins(first, cte_scope)?;
     for twj in items {
         acc = if is_lateral_generator_item(&twj) {
-            // Correlated LATERAL generator (e.g. `LATERAL explode(e.tags) AS r(v)`)
-            // — redirect to CommonOp::LateralView so the existing analyzer/emission
-            // machinery resolves the correlated arg against the left plan's schema.
             lower_lateral_generator_item(acc, twj.relation, cte_scope)?
         } else {
             // Detect comma-form LATERAL derived table: `, LATERAL (subquery) t`
@@ -1764,11 +1639,6 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
     Ok(acc)
 }
 
-/// True iff the raw comma-item is a `LATERAL <generator>(arg) AS alias(cols)` shape
-/// that should redirect to `CommonOp::LateralView` instead of the normal
-/// CrossJoin fold. Predicate is narrow by design (ADR-022 — no false positives):
-/// trailing joins, non-generator functions, no-alias, and non-LATERAL items
-/// all fall through to the existing CrossJoin path.
 fn is_lateral_generator_item(twj: &TableWithJoins) -> bool {
     if !twj.joins.is_empty() {
         return false;
@@ -1777,26 +1647,19 @@ fn is_lateral_generator_item(twj: &TableWithJoins) -> bool {
         TableFactor::Function {
             lateral,
             name,
-            args,
             alias,
+            ..
         } => {
-            if !lateral || alias.is_none() || args.len() != 1 {
+            if !lateral || alias.is_none() {
                 return false;
             }
             let func_name = object_name_to_string(name).to_lowercase();
-            matches!(
-                func_name.as_str(),
-                "explode" | "explode_outer" | "posexplode"
-            )
+            Generator::is_function(&func_name)
         }
         _ => false,
     }
 }
 
-/// Lower a correlated `LATERAL <generator>(arg) AS alias(cols)` comma-item
-/// into `CommonOp::LateralView { input: acc, ... }`. The generator arg
-/// references columns from the left plan (e.g. `e.tags`), which the
-/// existing `analyze_lateral_view` resolves against the input's schema.
 fn lower_lateral_generator_item(
     acc: CommonAst,
     relation: TableFactor,
@@ -1811,16 +1674,10 @@ fn lower_lateral_generator_item(
         _ => unreachable!("is_lateral_generator_item verified Function variant"),
     };
     let gen_name = object_name_to_string(&name).to_lowercase();
-    // Lower the single generator argument.
-    let arg_exprs: Vec<Expression> = raw_args
+    let args = raw_args
         .into_iter()
         .map(|a| function_arg_to_expr(a, cte_scope))
-        .collect::<Result<_, _>>()?;
-    let arg = arg_exprs
-        .into_iter()
-        .next()
-        .expect("is_lateral_generator_item checked args.len() == 1");
-    // Extract alias name and column list from the `AS r(v)` alias.
+        .collect::<Result<Vec<_>, _>>()?;
     let table_alias_obj = alias.expect("is_lateral_generator_item checked alias.is_some()");
     let table_alias = table_alias_obj.name.value;
     let column_aliases: Vec<String> = table_alias_obj
@@ -1828,14 +1685,11 @@ fn lower_lateral_generator_item(
         .iter()
         .map(|c| c.name.value.clone())
         .collect();
-    // For the comma-LATERAL syntax, `OUTER` is not expressible — always non-outer.
-    let outer = gen_name == "explode_outer";
-    // Use the shared generator dispatch table.
-    let columns = generator_view_columns(&gen_name, outer, arg, column_aliases)?;
-    Ok(CommonAst::new(CommonOp::LateralView {
+    let generator = lateral_generator(&gen_name, false, args, column_aliases)?;
+    Ok(CommonAst::new(CommonOp::Generate {
         input: Box::new(acc),
-        table_alias,
-        columns,
+        generator,
+        qualifier: Some(table_alias),
     }))
 }
 
@@ -1875,7 +1729,7 @@ fn lower_table_factor(
         // `TableFactor::Table` with `args: Some(..)`; a plain `FROM emp` has
         // `args: None`. Branch on `args` so the TVF path builds a
         // `CommonOp::TableFunction` while the bare-table path is preserved
-        // verbatim (no regression for CTE inlining / TableScan / aliases).
+        // verbatim, preserving CTE inlining, TableScan, and alias handling.
         TableFactor::Table {
             name,
             alias,
@@ -1933,9 +1787,7 @@ fn lower_table_factor(
                     // DataFrame front-end (`df.alias("e")`) so both front-ends
                     // produce the same CommonAST node for the same meaning
                     // (INV7, ADR-004). Emission's alias-hoisting recognizes
-                    // `AliasedRelation`; the retired `TableScan { alias:
-                    // Some(..) }` form buried the user alias inside a synthetic
-                    // subquery. Mirrors the CTE branch above.
+                    // `AliasedRelation`.
                     let scan = CommonAst::new(CommonOp::TableScan { table });
                     match alias {
                         Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
@@ -1990,7 +1842,7 @@ fn lower_table_factor(
             };
             // A user alias (`TABLE(range(3)) AS r(id)`) composes on top via
             // `ToDf` + `AliasedRelation`, same as the `Table`-with-args and
-            // `Derived` branches above — previously silently dropped here.
+            // `Derived` branches above.
             apply_table_alias(node, alias)
         }
         TableFactor::UNNEST {
@@ -2022,9 +1874,9 @@ fn lower_table_factor(
                 .map(|a| function_arg_to_expr(a, cte_scope))
                 .collect::<Result<_, _>>()?;
             // A user alias (`LATERAL explode(arr) AS x(v)`) composes the same
-            // way — previously silently dropped here. The `lateral: bool`
+            // way. The `lateral: bool`
             // flag remains swallowed by `..`; lateral correlation semantics
-            // are a separate, pre-existing gap this fix does not widen into.
+            // are a separate gap outside this lowering path.
             apply_table_alias(table_function_node(func_name, arg_exprs, false), alias)
         }
         // SQL `PIVOT` (BigQuery/Snowflake/Databricks). Unlike the DataFrame
@@ -2211,8 +2063,16 @@ fn table_function_node(name: String, args: Vec<Expression>, with_ordinality: boo
     // N5: canonicalize once at the shared construction site so every
     // consumer (analyzer::analyze_table_function, emission::build_table_function)
     // can drop its own case-insensitive re-derivation.
+    let name = name.to_ascii_lowercase();
+    if !with_ordinality && Generator::is_function(&name) {
+        return CommonAst::new(CommonOp::Generate {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            generator: Generator::from_function(&name, args).expect("generator name checked"),
+            qualifier: None,
+        });
+    }
     CommonAst::new(CommonOp::TableFunction {
-        name: name.to_ascii_lowercase(),
+        name,
         args,
         with_ordinality,
     })
@@ -2464,9 +2324,6 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
 /// other rewriting named windows. The parse-from-SQL parity test
 /// `expr_has_aggregate_classifier_table` guards against drift.
 fn expr_has_aggregate(expr: &Expr) -> bool {
-    // Fix pass (review M4): extend the walker to every composite
-    // shape the projection can contain. A missed shape used to mis-classify
-    // e.g. `SELECT count(x) IN (1, 2)` as non-aggregate.
     match expr {
         Expr::Function(f) => function_call_has_aggregate(f),
         Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
@@ -2516,7 +2373,6 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         | Expr::AtTimeZone {
             timestamp: expr, ..
         } => expr_has_aggregate(expr),
-        // ── SQL special forms ────────────────────────────────────────────
         // sqlparser parses `EXTRACT`/`CEIL`/`FLOOR`/`SUBSTRING`/`POSITION`/
         // `TRIM`/`OVERLAY` and bracket field access to dedicated `Expr`
         // variants (NOT `Expr::Function`). These arms MUST stay in lockstep
@@ -2617,11 +2473,6 @@ fn function_arg_has_aggregate(arg: &FunctionArg) -> bool {
 }
 
 fn is_aggregate_function_name(name: &str) -> bool {
-    // Fix pass (review M3 + perf OPT-5): defer to τ's canonical
-    // aggregate roster (the classifier column of the `AGG_SPECS` table in
-    // `transpiler_v2::type_inference`) instead of a locally-drifted 32-name
-    // subset. The lookup is case-insensitive without a per-call `String`
-    // allocation.
     is_aggregate_classifier_name(name)
 }
 
@@ -2669,7 +2520,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
             // shape the analyzer's nested-struct resolution (analyzer.rs
             // `resolve_column`'s tier (d), via `struct_qualifier_info` /
-            // `build_struct_extract_chain`, Pass F2) is written for. A 3-part
+            // `build_struct_extract_chain`) is written for. A 3-part
             // struct path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
             // "address", name:"geo.lat"}` so the analyzer can walk the struct;
             // 2-part refs `t.c` are byte-identical to before (parts[0] qualifier,
@@ -3297,12 +3148,8 @@ fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Express
                 body: Box::new(new_body),
             })
         }
-        // The historical hand-rolled walker left `InSubquery` and `Window`
-        // untouched (subqueries/windows inside a Spark lambda body would
-        // themselves be `UnsupportedProtoShape` from upstream lower_expr —
-        // never reaching this rewrite). `map_children` DOES descend into
-        // them, so pass them through explicitly to keep the rewrite
-        // byte-identical.
+        // Subqueries and windows are unsupported inside Spark lambda bodies;
+        // preserve these variants if they reach this rewrite.
         e @ (Expression::InSubquery(_) | Expression::Window(_)) => e,
         // Every other variant recurses structurally via `map_children`
         // (leaves come back unchanged).
@@ -3394,6 +3241,23 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
     let (distinct, mut args) = lower_function_args(f.args, cte_scope)?;
     if let Some(pred) = filter {
         args = desugar_aggregate_filter(&name, args, *pred, cte_scope)?;
+    }
+    if Generator::is_function(&name) {
+        if distinct {
+            bail_boundary_proto!(
+                format!("sql::generator::{name}::distinct"),
+                "DISTINCT is not valid on a generator function",
+            );
+        }
+        if over.is_some() {
+            bail_boundary_proto!(
+                format!("sql::generator::{name}::window"),
+                "OVER is not valid on a generator function",
+            );
+        }
+        return Ok(Expression::Generator(
+            Generator::from_function(&name, args).expect("generator name checked"),
+        ));
     }
     let call = Expression::FunctionCall(FunctionCall {
         name,
@@ -3769,7 +3633,6 @@ fn resolve_named_windows_in_expr(
         } => {
             resolve_named_windows_in_expr(expr, defs)?;
         }
-        // ── SQL special forms ────────────────────────────────────────────
         // `&mut` mirror of `expr_has_aggregate`'s special-form arms — a
         // named-window ref can legally nest inside any of these (e.g.
         // `extract(YEAR FROM lag(ts) OVER w)`). Keep in lockstep; the parity
@@ -3899,7 +3762,7 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
         // interval` stays `DATE` either way (see `date_like_interval_result`
         // — `IntervalKind::YearMonth` and `IntervalKind::Calendar` both hit
         // its stay-`Date` arm), so re-kinding these to `YearMonth` is out of
-        // scope for the R1-6 fix.
+        // scope for the interval semantics.
         Slot::Months(factor) => IntervalExpression {
             months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
             days: 0,
@@ -3968,7 +3831,7 @@ fn extract_interval_string(expr: &Expr) -> Option<&str> {
 /// Lower a compound (`X TO Y`) interval literal. Supports ONLY the singular
 /// field pairs `YEAR TO MONTH` → [`IntervalKind::YearMonth`] and `DAY TO
 /// SECOND` → [`IntervalKind::DayTime`], the only two pairs that τ's field-less
-/// interval `DataType`s encode wire-exactly (per architecture-pass-3). Every
+/// interval `DataType`s encode wire-exactly. Every
 /// other pair, or any field precision, is the existing
 /// `sql::expr::interval::compound` Thunderduck boundary (ADR-022).
 fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
@@ -4588,7 +4451,7 @@ fn wrap_not(e: Expression, negated: bool) -> Expression {
 /// Spark `<=>`), NOT null-unsafe `=` (which would wrongly yield NULL on the NOT form
 /// with a NULL column). Components are AND-folded per tuple, tuples OR-folded, and
 /// `negated` (`NOT IN`) wraps the whole chain in `NOT` (exact complement, also never
-/// NULL). Mirrors the pass-138 `build_like_chain` reduce-fold + NOT-wrap.
+/// NULL).
 ///
 /// Every RHS element must be an `Expr::Tuple` of arity == `cols.len()`; a non-tuple
 /// element or an arity mismatch is a Thunderduck-boundary error (Spark rejects these
@@ -4829,12 +4692,11 @@ mod tests {
         }
     }
 
-    // ── timestampadd / timestampdiff unit demotion (intv-006 regression) ───
     //
     // sqlparser parses the leading datetime UNIT (`MONTH`, `DAY`, …) as an
     // `Expr::Identifier`; the generic identifier arm would lower it to an
     // `UnresolvedColumn`, and the analyzer would then raise a spurious
-    // `UnknownColumn { name: "MONTH" }`. These tests pin the fix: the unit is
+    // `UnknownColumn { name: "MONTH" }`. These tests pin the unit handling:
     // demoted to a string literal, and the plan analyzes to the Spark-parity
     // return type (TIMESTAMP for add, BIGINT/Long for diff).
 
@@ -4950,7 +4812,7 @@ mod tests {
     #[test]
     fn parse_inline_values_lowers_to_values_op() {
         // Top-level `VALUES` lowers to `CommonOp::Values` with default
-        // `col1..colN` names (pass-129).
+        // `col1..colN` names.
         let plan = parse("VALUES (1, 'a'), (2, 'b')").expect("should parse");
         match plan.op {
             CommonOp::Values { rows, column_names } => {
@@ -4970,7 +4832,7 @@ mod tests {
     #[test]
     fn parse_range_table_function_lowers_to_table_function_not_scan() {
         // `FROM range(5)` must lower to `CommonOp::TableFunction`, NOT a bare
-        // `TableScan{"range"}` (pass-141; the `..` used to swallow `args`).
+        // `TableScan{"range"}` (table-function arguments are preserved).
         let plan = parse("SELECT id FROM range(5)").expect("should parse");
         match plan.op {
             CommonOp::Project { input, .. } => match input.op {
@@ -4994,7 +4856,7 @@ mod tests {
     fn parse_range_table_function_with_alias_columns_renames_via_todf() {
         // `range(5) AS t(id2)` → AliasedRelation{ ToDf{ TableFunction, [id2] }, t }
         // — a user alias composes on top of the TVF via the shared
-        // `apply_table_alias` helper (pass-141).
+        // `apply_table_alias` helper.
         let plan = parse("SELECT id2 FROM range(5) AS t(id2)").expect("should parse");
         let aliased = match plan.op {
             CommonOp::Project { input, .. } => *input,
@@ -5025,12 +4887,6 @@ mod tests {
             other => panic!("expected TableFunction, got {other:?}"),
         }
     }
-
-    // ── TableFactor::TableFunction / TableFactor::Function alias handling
-    // (finding 3: the alias was silently dropped, unlike the sibling
-    // Table-with-args / Derived branches). Both `TABLE(f(...))` and
-    // `LATERAL f(...)` compose their alias via the shared `apply_table_alias`
-    // helper, mirroring `parse_range_table_function_with_alias_columns_renames_via_todf`. ──
 
     #[test]
     fn table_function_table_syntax_with_alias_columns_renames_via_todf() {
@@ -5117,7 +4973,7 @@ mod tests {
 
     #[test]
     fn parse_bare_table_still_lowers_to_table_scan() {
-        // Regression: `FROM emp` (args None) must keep the bare-table path.
+        // `FROM emp` (args None) must keep the bare-table path.
         let plan = parse("SELECT * FROM emp").expect("should parse");
         match plan.op {
             CommonOp::Project { input, .. } => {
@@ -5134,7 +4990,7 @@ mod tests {
     #[test]
     fn parse_bare_from_values_with_alias_columns_renames_via_todf() {
         // `SELECT * FROM VALUES (..) AS t(n, s)` → Project over AliasedRelation
-        // over ToDf(["n","s"]) over Values (pass-129 + pass-118 Derived arm).
+        // over ToDf(["n","s"]) over Values.
         let plan = parse("SELECT * FROM VALUES (1, 'a') AS t(n, s)").expect("should parse");
         let aliased = match plan.op {
             CommonOp::Project { input, .. } => *input,
@@ -5218,8 +5074,6 @@ mod tests {
             "sql::distinct_on"
         );
     }
-
-    // ── ceil/floor lowering (num-001/002/003) ────────────────────────────
 
     #[test]
     fn ceil_1arg_lowers_to_single_arg_function_call() {
@@ -5713,9 +5567,6 @@ mod tests {
         );
     }
 
-    // ── expr_has_aggregate descends into non-aggregate function args
-    // (finding 1: `abs(count(x))` used to misclassify the whole statement) ──
-
     #[test]
     fn aggregate_nested_inside_non_aggregate_function_is_still_aggregate_query() {
         // `abs(count(x))` — the outer call `abs` is not an aggregate, but its
@@ -5758,7 +5609,6 @@ mod tests {
         );
     }
 
-    // ── SQL special-form aggregate classification (agg-022 / agg-023) ──────
     //
     // sqlparser parses EXTRACT / SUBSTRING / POSITION / TRIM / OVERLAY /
     // CEIL / FLOOR / bracket-access to dedicated `Expr` variants (NOT
@@ -5925,8 +5775,7 @@ mod tests {
 
     #[test]
     fn parse_group_by_with_cube() {
-        // Postfix `GROUP BY <cols> WITH CUBE` → flat grouping, Cube kind. No
-        // corpus witness yet — this test keeps the Cube modifier arm live.
+        // Postfix `GROUP BY <cols> WITH CUBE` → flat grouping, Cube kind.
         let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY a, b WITH CUBE")
             .expect("WITH CUBE should parse");
         match plan.op {
@@ -5979,7 +5828,6 @@ mod tests {
 
     #[test]
     fn parse_select_unresolved_column_has_plan_id_none() {
-        // Open Decision 12 anchor.
         let plan = parse("SELECT id FROM t").expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
             panic!("expected Project");
@@ -6219,8 +6067,6 @@ mod tests {
         );
     }
 
-    // ── Pass 18: WITH RECURSIVE lowering ──────────────────────────────────
-
     #[test]
     fn parse_recursive_cte_009_lowers_to_recursive_cte_with_self_ref_table_scan() {
         // cte-009 shape: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL
@@ -6401,8 +6247,6 @@ mod tests {
 
     #[test]
     fn parse_pivot_lowers_to_common_op_pivot() {
-        // Pass 107: `SELECT * FROM t PIVOT (...)` now lowers to a
-        // `CommonOp::Pivot` with implicit (schema-derived) grouping.
         let plan =
             parse("SELECT * FROM t PIVOT (SUM(x) FOR y IN (1, 2))").expect("PIVOT should lower");
         match pivot_node(plan) {
@@ -6547,9 +6391,6 @@ mod tests {
 
     #[test]
     fn parse_div_keyword_lowers_to_integer_divide_cast() {
-        // Pass 73: SparkSQL's `a DIV b` — the SparkDialect's `parse_infix`
-        // registers DIV as an integer-division operator; v2_lowering
-        // wraps the resulting binary in a `CAST(... AS BIGINT)`.
         let plan = parse("SELECT a div 2 FROM t").expect("should parse");
         match plan.op {
             CommonOp::Project { projections, .. } => {
@@ -6568,8 +6409,6 @@ mod tests {
 
     #[test]
     fn parse_extract_year_lowers_to_year_function() {
-        // Pass 73: `EXTRACT(YEAR FROM col)` lowers to a FunctionCall to
-        // `year(col)` (INTEGER return-type, matching Spark).
         let plan = parse("SELECT EXTRACT(YEAR FROM d) FROM t").expect("should parse");
         match plan.op {
             CommonOp::Project { projections, .. } => match &projections[0] {
@@ -6585,10 +6424,6 @@ mod tests {
 
     #[test]
     fn single_arg_lambda_lowers_to_lambda_expression() {
-        // Pass 84: `x -> upper(x)` inside `transform(tags, ...)` must lower to
-        // `Expression::Lambda { params: ["x"], body: FunctionCall(upper) }`.
-        // Pass 86 L1 witness: the identifier `x` inside the body must be
-        // rewritten to `LambdaVariable("x")` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT transform(tags, x -> upper(x)) FROM emp").expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
             panic!("expected Project");
@@ -6615,10 +6450,6 @@ mod tests {
 
     #[test]
     fn multi_arg_lambda_lowers_to_lambda_expression() {
-        // Pass 84: `(acc, x) -> concat(acc, x)` inside `reduce(...)` must lower
-        // to `Expression::Lambda { params: ["acc", "x"], body: FunctionCall }`.
-        // Pass 86 L1 witness: both `acc` and `x` inside the body must be
-        // rewritten to `LambdaVariable` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT reduce(tags, '', (acc, x) -> concat(acc, x)) FROM emp")
             .expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
@@ -6650,14 +6481,14 @@ mod tests {
 
     #[test]
     fn nested_lambda_shadowing_preserved() {
-        // Pass 86 L2: nested-lambda shadowing witness. In
+        // Nested-lambda shadowing: in
         // `transform(arr1, x -> transform(arr2, y -> concat(x, y)))`, the
         // inner-lambda body references BOTH the outer's `x` and the inner's
         // `y`. After lowering, both must be rewritten to `LambdaVariable`:
         // outer's `x` reaches through the inner-Lambda arm because
         // `remaining = params \ inner.params = ["x"] \ ["y"] = ["x"]` (the
         // outer param survives the shadow-filter). Inner's `y` is rewritten
-        // by the inner-lambda pass itself.
+        // by the inner-lambda rewrite itself.
         let plan = parse("SELECT transform(arr1, x -> transform(arr2, y -> concat(x, y))) FROM t")
             .expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
@@ -6707,8 +6538,8 @@ mod tests {
 
     #[test]
     fn parse_syntax_error_returns_unsupported_proto_shape() {
-        // Review M2: sqlparser errors are boundary failures (input never
-        // reached CommonAst) → surface as `UnsupportedProtoShape`, not
+        // sqlparser errors are boundary failures (input never reaches
+        // CommonAst) → surface as `UnsupportedProtoShape`, not
         // `UnsupportedOp`. Exercised through the public entry point so the
         // top-level mapping (parser_v2::SparkSqlParserV2::parse) is anchored.
         use crate::parser_v2::SparkSqlParserV2;
@@ -6830,10 +6661,6 @@ mod tests {
             "sql::named_window::unknown"
         );
     }
-
-    // ── resolve_named_windows_in_expr descends into composite shapes
-    // (finding 2: a named-window ref nested in CASE/fn-args used to hit a
-    // spurious "not defined in WINDOW clause" error even though it was) ────
 
     #[test]
     fn named_window_ref_inside_case_branch_resolves() {
@@ -7174,8 +7001,6 @@ mod tests {
         assert_eq!(fc.args.len(), 4);
     }
 
-    // ── Pass 106 — uncorrelated subquery lowering ────────────────────────
-
     #[test]
     fn scalar_subquery_lowers_to_unanalyzed_scalar_subquery() {
         let plan = parse("SELECT (SELECT max(sal) FROM emp) AS gmax FROM emp").expect("parse");
@@ -7229,7 +7054,7 @@ mod tests {
 
     #[test]
     fn subquery_sees_outer_cte_scope() {
-        // Review M1: a subquery's `FROM <cte>` must inline the outer CTE body
+        // A subquery's `FROM <cte>` must inline the outer CTE body
         // (an AliasedRelation over the CTE's own plan), NOT a TableScan named
         // `c`. If a real table `c` existed, a TableScan would silently read it
         // instead of the CTE — Spark shadows the table with the CTE (cte-006).
@@ -7267,8 +7092,6 @@ mod tests {
             ),
         }
     }
-
-    // ── SQL PIVOT / UNPIVOT lowering (pass 107) ──────────────────────────
 
     /// Find the `CommonOp::Pivot` node under the outer `SELECT * FROM (…) PIVOT`.
     fn pivot_node(plan: CommonAst) -> CommonOp {
@@ -7428,8 +7251,8 @@ mod tests {
     fn lower_like_all_folds_to_and_chain() {
         // pr-004: sqlparser 0.61 mis-parses `LIKE ALL (…)` as `LIKE ALL(...)`
         // (function call). We detect that artifact and fold into an AND-chain.
-        // This test also PINS that parser artifact: a future sqlparser that
-        // gains native `LIKE ALL` changes the parse and fails here loudly.
+        // This test also pins that parser artifact: a future sqlparser that
+        // gains native `LIKE ALL` changes the parse and fails here.
         let plan = parse("SELECT id FROM t WHERE name LIKE ALL ('%a%', '%e%')")
             .expect("should parse+lower");
         match where_predicate(&plan) {
@@ -7499,7 +7322,7 @@ mod tests {
 
     #[test]
     fn lower_plain_like_still_single_pattern() {
-        // Regression guard: ordinary `LIKE 'p'` (any:false, non-ALL pattern) must
+        // Ordinary `LIKE 'p'` (any:false, non-ALL pattern) must
         // still reach the unchanged single-pattern arm.
         let plan = parse("SELECT id FROM t WHERE a LIKE 'x%'").expect("should parse+lower");
         match where_predicate(&plan) {
@@ -7589,7 +7412,7 @@ mod tests {
 
     #[test]
     fn lower_scalar_in_still_uses_inlist() {
-        // Regression: single-column IN keeps the scalar InListExpression path.
+        // Single-column IN keeps the scalar InListExpression path.
         let plan = parse("SELECT id FROM t WHERE a IN (1, 2)").expect("should parse+lower");
         match where_predicate(&plan) {
             Expression::InList(l) => assert!(!l.negated),
@@ -7658,8 +7481,6 @@ mod tests {
             other => panic!("expected Unary NOT, got {other:?}"),
         }
     }
-
-    // ── Complex-type bracket access + nested struct paths (cx-001/002/004) ──
 
     #[test]
     fn lower_array_index_builds_extract_value_over_array() {
@@ -8040,177 +7861,145 @@ mod tests {
         );
     }
 
-    // ── LATERAL VIEW lowering (cx-007/cx-008/cx-009) ────────────────────
+    fn generator_of(
+        plan: CommonAst,
+    ) -> (Option<String>, crate::transpiler_v2::generator::Generator) {
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::Generate {
+            generator,
+            qualifier,
+            ..
+        } = input.op
+        else {
+            panic!("expected Generate under Project");
+        };
+        (qualifier, generator)
+    }
 
-    /// Helper: extract a `CommonOp::LateralView` from a lowered SQL that
-    /// produces `Project { input: LateralView { .. }, .. }`.
-    fn lateral_view_of(plan: CommonAst) -> (String, Vec<(String, Expression)>) {
-        match plan.op {
-            CommonOp::Project { input, .. } => match input.op {
-                CommonOp::LateralView {
-                    table_alias,
-                    columns,
-                    ..
-                } => (table_alias, columns),
-                other => panic!("expected LateralView under Project, got {other:?}"),
-            },
-            other => panic!("expected Project at top, got {other:?}"),
+    #[test]
+    fn lateral_view_lowers_each_generator_family() {
+        use crate::transpiler_v2::generator::GeneratorKind;
+
+        for (sql, kind, outer, aliases) in [
+            (
+                "SELECT * FROM emp e LATERAL VIEW explode(e.tags) t AS tag",
+                GeneratorKind::Explode,
+                false,
+                &["tag"][..],
+            ),
+            (
+                "SELECT * FROM emp e LATERAL VIEW OUTER posexplode(e.tags) t AS pos, tag",
+                GeneratorKind::PosExplode,
+                true,
+                &["pos", "tag"][..],
+            ),
+            (
+                "SELECT * FROM emp e LATERAL VIEW inline(e.structs) t AS name, salary",
+                GeneratorKind::Inline,
+                false,
+                &["name", "salary"][..],
+            ),
+            (
+                "SELECT * FROM emp e LATERAL VIEW json_tuple(e.json, 'a', 'b') t AS a, b",
+                GeneratorKind::JsonTuple,
+                false,
+                &["a", "b"][..],
+            ),
+            (
+                "SELECT * FROM emp e LATERAL VIEW stack(2, 'a', 1, 'b', 2) t AS k, v",
+                GeneratorKind::Stack,
+                false,
+                &["k", "v"][..],
+            ),
+        ] {
+            let (qualifier, generator) = generator_of(parse(sql).expect("generator SQL"));
+            assert_eq!(qualifier.as_deref(), Some("t"));
+            assert_eq!(generator.kind, kind);
+            assert_eq!(generator.outer, outer);
+            assert_eq!(
+                generator.aliases,
+                aliases
+                    .iter()
+                    .map(|alias| (*alias).to_owned())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
     #[test]
-    fn lateral_view_explode_fires_with_correct_alias_and_column() {
-        let plan = parse("SELECT e.id, t.tag FROM emp e LATERAL VIEW explode(e.tags) t AS tag")
-            .expect("should parse");
-        let (alias, cols) = lateral_view_of(plan);
-        assert_eq!(alias, "t");
-        assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].0, "tag");
-        match &cols[0].1 {
-            Expression::FunctionCall(f) => {
-                assert_eq!(f.name, "explode");
-                assert_eq!(f.args.len(), 1);
-            }
-            other => panic!("expected explode FunctionCall, got {other:?}"),
-        }
+    fn lateral_view_alias_mismatch_is_left_for_analysis() {
+        let (_, generator) = generator_of(
+            parse("SELECT * FROM emp e LATERAL VIEW posexplode(e.tags) t AS tag")
+                .expect("lowering"),
+        );
+        assert_eq!(generator.aliases, ["tag"]);
     }
 
     #[test]
-    fn lateral_view_outer_folds_to_explode_outer() {
-        let plan =
-            parse("SELECT e.id, t.tag FROM emp e LATERAL VIEW OUTER explode(e.tags) t AS tag")
-                .expect("should parse");
-        let (_, cols) = lateral_view_of(plan);
-        match &cols[0].1 {
-            Expression::FunctionCall(f) => assert_eq!(f.name, "explode_outer"),
-            other => panic!("expected explode_outer FunctionCall, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lateral_view_posexplode_splits_into_pos_and_val() {
+    fn lateral_view_chained_becomes_nested_generate() {
         let plan = parse(
-            "SELECT e.id, t.pos, t.tag FROM emp e LATERAL VIEW posexplode(e.tags) t AS pos, tag",
+            "SELECT * FROM emp e \
+             LATERAL VIEW explode(e.tags) t AS tag \
+             LATERAL VIEW explode(e.tags) t2 AS tag2",
         )
-        .expect("should parse");
-        let (alias, cols) = lateral_view_of(plan);
-        assert_eq!(alias, "t");
-        assert_eq!(cols.len(), 2);
-        assert_eq!(cols[0].0, "pos");
-        assert_eq!(cols[1].0, "tag");
-        match &cols[0].1 {
-            Expression::FunctionCall(f) => assert_eq!(f.name, "posexplode_pos"),
-            other => panic!("expected posexplode_pos, got {other:?}"),
-        }
-        match &cols[1].1 {
-            Expression::FunctionCall(f) => assert_eq!(f.name, "posexplode_val"),
-            other => panic!("expected posexplode_val, got {other:?}"),
-        }
+        .expect("chained generators");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::Generate {
+            input,
+            qualifier: Some(outer),
+            ..
+        } = input.op
+        else {
+            panic!("expected outer Generate");
+        };
+        assert_eq!(outer, "t2");
+        assert!(matches!(
+            input.op,
+            CommonOp::Generate {
+                qualifier: Some(ref inner),
+                ..
+            } if inner == "t"
+        ));
     }
 
     #[test]
-    fn lateral_view_chained_is_boundary_error() {
-        assert_eq!(
-            boundary_shape(
-                "SELECT * FROM emp e \
-                 LATERAL VIEW explode(e.tags) t AS tag \
-                 LATERAL VIEW explode(e.tags) t2 AS tag2"
+    fn comma_lateral_generators_converge_with_lateral_view() {
+        for (comma, view) in [
+            (
+                "SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)",
+                "SELECT e.id, r.v FROM emp e LATERAL VIEW explode(e.tags) r AS v",
             ),
-            "sql::lateral_view::chained"
-        );
-    }
-
-    #[test]
-    fn lateral_view_posexplode_one_alias_is_boundary_error() {
-        assert_eq!(
-            boundary_shape("SELECT * FROM emp e LATERAL VIEW posexplode(e.tags) t AS tag"),
-            "sql::lateral_view::posexplode_alias_count"
-        );
-    }
-
-    #[test]
-    fn lateral_view_outer_posexplode_is_boundary_error() {
-        assert_eq!(
-            boundary_shape(
-                "SELECT * FROM emp e LATERAL VIEW OUTER posexplode(e.tags) t AS pos, tag"
+            (
+                "SELECT e.id, r.pos, r.val FROM emp e, LATERAL posexplode(e.tags) AS r(pos, val)",
+                "SELECT e.id, r.pos, r.val FROM emp e LATERAL VIEW posexplode(e.tags) r AS pos, val",
             ),
-            "sql::lateral_view::outer_posexplode"
-        );
-    }
-
-    #[test]
-    fn lateral_view_unknown_generator_is_boundary_error() {
-        let shape = boundary_shape("SELECT * FROM emp e LATERAL VIEW inline(e.structs) t AS v");
-        assert!(
-            shape.starts_with("sql::lateral_view::generator::"),
-            "expected generator boundary shape, got `{shape}`"
-        );
-    }
-
-    // ── Pass 13 — LATERAL generator comma-syntax redirect to LateralView ──
-
-    /// CONVERGENCE: `FROM emp e, LATERAL explode(e.tags) AS r(v)` produces a
-    /// CommonAst structurally EQUAL to `FROM emp e LATERAL VIEW explode(e.tags) r
-    /// AS v`. Both syntaxes must converge to the same LateralView node shape.
-    #[test]
-    fn comma_lateral_explode_converges_with_lateral_view_syntax() {
-        let comma_plan = parse("SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)")
-            .expect("comma LATERAL should parse");
-        let lv_plan = parse("SELECT e.id, r.v FROM emp e LATERAL VIEW explode(e.tags) r AS v")
-            .expect("LATERAL VIEW should parse");
-        assert_eq!(
-            comma_plan, lv_plan,
-            "comma-LATERAL and LATERAL VIEW must produce identical CommonAst"
-        );
-    }
-
-    /// DISCRIMINATOR regression guard: non-LATERAL `FROM emp, explode(array(1,2))`
-    /// still lowers to a CrossJoin with right=TableFunction, NOT a LateralView.
-    /// sqlparser parses this as `TableFactor::Table { args: Some(...) }` (not
-    /// `TableFactor::Function`), so the redirect predicate never fires.
-    #[test]
-    fn non_lateral_comma_explode_lowers_to_cross_join_not_lateral_view() {
-        let plan =
-            parse("SELECT * FROM emp, explode(array(1, 2))").expect("non-LATERAL should parse");
-        match plan.op {
-            CommonOp::Project { input, .. } => match input.op {
-                CommonOp::Join {
-                    join_type,
-                    ref right,
-                    ..
-                } => {
-                    assert_eq!(join_type, JoinType::Cross, "must be a CrossJoin");
-                    assert!(
-                        matches!(right.op, CommonOp::TableFunction { .. }),
-                        "right side must be TableFunction, got: {:?}",
-                        right.op
-                    );
-                }
-                other => panic!("expected Join under Project, got {other:?}"),
-            },
-            other => panic!("expected Project, got {other:?}"),
+            (
+                "SELECT r.a, r.b FROM emp e, LATERAL json_tuple(e.json, 'a', 'b') AS r(a, b)",
+                "SELECT r.a, r.b FROM emp e LATERAL VIEW json_tuple(e.json, 'a', 'b') r AS a, b",
+            ),
+        ] {
+            assert_eq!(
+                parse(comma).expect("comma LATERAL"),
+                parse(view).expect("LATERAL VIEW")
+            );
         }
     }
 
-    /// The comma-LATERAL redirect handles `posexplode` with 2-alias correctly,
-    /// producing the same split as LATERAL VIEW syntax.
     #[test]
-    fn comma_lateral_posexplode_two_alias_matches_lateral_view() {
-        let comma_plan = parse(
-            "SELECT e.id, r.pos, r.val FROM emp e, LATERAL posexplode(e.tags) AS r(pos, val)",
-        )
-        .expect("comma LATERAL posexplode should parse");
-        let lv_plan = parse(
-            "SELECT e.id, r.pos, r.val FROM emp e LATERAL VIEW posexplode(e.tags) r AS pos, val",
-        )
-        .expect("LATERAL VIEW posexplode should parse");
-        assert_eq!(
-            comma_plan, lv_plan,
-            "comma-LATERAL and LATERAL VIEW posexplode must produce identical CommonAst"
-        );
+    fn bare_generator_table_uses_generate() {
+        let plan = parse("SELECT * FROM emp, explode(array(1, 2))").expect("generator table");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::Join { right, .. } = input.op else {
+            panic!("expected Join");
+        };
+        assert!(matches!(right.op, CommonOp::Generate { .. }));
     }
-
-    // ── Pass-17: LATERAL derived-table join lowering ────────────────────
 
     #[test]
     fn lateral_join_no_on_lowers_to_join_with_lateral_true() {
@@ -8261,7 +8050,7 @@ mod tests {
 
     #[test]
     fn plain_on_join_lowers_with_lateral_false() {
-        // Regression: a plain `JOIN ... ON` must not set lateral.
+        // A plain `JOIN ... ON` must not set lateral.
         let plan = parse("SELECT * FROM emp JOIN dept ON emp.dept_id = dept.dept_id")
             .expect("should parse");
         match project_input(plan).op {

@@ -44,7 +44,6 @@ class TestSQLExpressionsDifferential:
 
     def test_sql_with_temp_view(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with temp view - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -58,13 +57,11 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_with_temp_view", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_sql_with_where(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with WHERE clause - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -78,13 +75,11 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_with_where")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_sql_with_aggregation(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with aggregation - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -108,13 +103,11 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_with_aggregation", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_sql_with_join(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with JOIN - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -146,7 +139,6 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_with_join")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_reference.sql("DROP TABLE departments")
         spark_thunderduck.sql("DROP TABLE employees")
@@ -154,7 +146,6 @@ class TestSQLExpressionsDifferential:
 
     def test_filter_with_sql_expression_string(self, spark_reference, spark_thunderduck):
         """Test df.filter() with SQL expression string - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -163,7 +154,6 @@ class TestSQLExpressionsDifferential:
         spark_thunderduck.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_thunderduck.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
 
-        # Test simple comparison
         spark_df = spark_reference.table("employees")
         td_df = spark_thunderduck.table("employees")
 
@@ -171,18 +161,15 @@ class TestSQLExpressionsDifferential:
         td_result1 = td_df.filter("salary > 70000").agg(F.count("*").alias("cnt"))
         assert_dataframes_equal(spark_result1, td_result1, query_name="filter_simple", ignore_nullable=True)
 
-        # Test complex expression
         spark_result2 = spark_df.filter("salary > 60000 AND department = 'Engineering'").agg(F.count("*").alias("cnt"))
         td_result2 = td_df.filter("salary > 60000 AND department = 'Engineering'").agg(F.count("*").alias("cnt"))
         assert_dataframes_equal(spark_result2, td_result2, query_name="filter_complex", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_selectExpr_with_sql_expressions(self, spark_reference, spark_thunderduck):
         """Test df.selectExpr() with SQL expressions - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -194,19 +181,17 @@ class TestSQLExpressionsDifferential:
         spark_df = spark_reference.table("employees")
         td_df = spark_thunderduck.table("employees")
 
-        # Test arithmetic expression - cast to double to avoid decimal precision differences
+        # Cast to double to avoid decimal precision differences.
         spark_result = spark_df.selectExpr("name", "salary", "CAST(salary * 1.1 AS DOUBLE) as salary_with_raise").orderBy("name")
         td_result = td_df.selectExpr("name", "salary", "CAST(salary * 1.1 AS DOUBLE) as salary_with_raise").orderBy("name")
 
         assert_dataframes_equal(spark_result, td_result, query_name="selectExpr_arithmetic", epsilon=0.01, ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_selectExpr_with_sql_functions(self, spark_reference, spark_thunderduck):
         """Test df.selectExpr() with SQL functions - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -218,19 +203,16 @@ class TestSQLExpressionsDifferential:
         spark_df = spark_reference.table("employees")
         td_df = spark_thunderduck.table("employees")
 
-        # Test string functions
         spark_result = spark_df.selectExpr("id", "upper(name) as upper_name", "lower(department) as lower_dept").orderBy("id")
         td_result = td_df.selectExpr("id", "upper(name) as upper_name", "lower(department) as lower_dept").orderBy("id")
 
         assert_dataframes_equal(spark_result, td_result, query_name="selectExpr_string_functions")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_sql_case_expression(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with CASE expression - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -262,13 +244,11 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_case_expression", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_sql_with_subquery(self, spark_reference, spark_thunderduck):
         """Test spark.sql() with subquery - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -292,13 +272,11 @@ class TestSQLExpressionsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="sql_with_subquery")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_combined_sql_and_dataframe_api(self, spark_reference, spark_thunderduck):
         """Test combining spark.sql() with DataFrame operations - exact parity check."""
-        # Create test data
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
@@ -307,16 +285,13 @@ class TestSQLExpressionsDifferential:
         spark_thunderduck.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_thunderduck.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 60000, 'Sales')")
 
-        # Start with SQL
         spark_df = spark_reference.sql("SELECT * FROM employees WHERE department = 'Engineering'")
         td_df = spark_thunderduck.sql("SELECT * FROM employees WHERE department = 'Engineering'")
 
-        # Continue with DataFrame API using SQL expression
         spark_result = spark_df.filter("salary >= 75000").selectExpr("name", "salary * 12 as annual_salary").orderBy("name")
         td_result = td_df.filter("salary >= 75000").selectExpr("name", "salary * 12 as annual_salary").orderBy("name")
 
         assert_dataframes_equal(spark_result, td_result, query_name="combined_sql_dataframe")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")

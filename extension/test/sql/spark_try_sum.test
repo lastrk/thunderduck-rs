@@ -8,37 +8,33 @@
 
 require thdck_spark_funcs
 
-# normal integer sum -> BIGINT
+# Integer overflow returns NULL, while NULL inputs are skipped and empty groups
+# return NULL; DECIMAL results use DECIMAL(min(p+10,38), s).
 query I
 SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT),(2),(3)) t(v);
 ----
 6
 
-# overflow (two BIGINT max) -> NULL  (native SUM would widen to HUGEINT; Spark returns NULL)
 query I
 SELECT spark_try_sum(v) FROM (VALUES (9223372036854775807::BIGINT),(9223372036854775807::BIGINT)) t(v);
 ----
 NULL
 
-# NULLs skipped
 query I
 SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT),(NULL),(2)) t(v);
 ----
 3
 
-# empty group -> NULL
 query I
 SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT)) t(v) WHERE v > 100;
 ----
 NULL
 
-# return type BIGINT for integer input
 query T
 SELECT typeof(spark_try_sum(v)) FROM (VALUES (1::BIGINT)) t(v);
 ----
 BIGINT
 
-# DECIMAL sum -> DECIMAL(min(p+10,38), s)
 query I
 SELECT spark_try_sum(v) FROM (VALUES (1.5::DECIMAL(3,1)),(2.5::DECIMAL(3,1))) t(v);
 ----

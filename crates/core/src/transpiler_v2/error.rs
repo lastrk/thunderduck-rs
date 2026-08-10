@@ -1,5 +1,5 @@
-//! τ emission errors — Thunderduck-boundary category per ADR-022, plus the
-//! ADR-023 chunk 3b Spark-emulated re-surfacing carve-out.
+//! τ emission errors: Thunderduck-boundary rejects, Spark-emulated errors, and
+//! internal invariant failures (ADR-022).
 //!
 //! [`EmissionError::Unsupported`] is exclusively **Thunderduck-boundary**: no
 //! variant may ever signal a fallback path — under ADR-022 there is no
@@ -25,8 +25,8 @@
 /// emission arm for a Spark function name), and `ProtoShape` (input never
 /// reached [`CommonAst`]). [`EmissionError::SparkEmulated`] carries a
 /// Spark-emulated analyzer error re-surfaced with its Spark class token
-/// (ADR-023 chunk 3b). [`EmissionError::Internal`] carries a τ-internal
-/// invariant-violation message (review finding 5, 2026-07-13).
+/// [`EmissionError::Internal`] carries a τ-internal invariant-violation
+/// message.
 ///
 /// [`CommonAst`]: crate::transpiler_v2::ast::CommonAst
 #[derive(thiserror::Error, Debug)]
@@ -49,21 +49,29 @@ pub enum EmissionError {
     },
 
     /// A Spark-emulated analyzer error, re-surfaced with its Spark
-    /// error-class token leading the message (ADR-023 chunk 3b), bridged
+    /// error-class token leading the message, bridged
     /// from `AnalyzerError` by
     /// `analyzer::analyzer_error_to_emission_error`. Unlike
     /// [`Self::Unsupported`], this does not signal a Thunderduck-boundary
     /// gap: `class` is the real Spark error-class token (e.g.
     /// `"AMBIGUOUS_REFERENCE"`) so the client-side differential harness can
     /// key off it exactly as it would for Spark itself.
-    #[error("[{class}] {message}")]
+    #[error("{}{message}", class.map(|c| format!("[{c}] ")).unwrap_or_default())]
     SparkEmulated {
         /// The Spark error-class token (e.g. `"AMBIGUOUS_REFERENCE"`,
-        /// `"UNRESOLVED_COLUMN"`).
-        class: &'static str,
+        /// `"UNRESOLVED_COLUMN"`), when it has been established.
+        ///
+        /// `None` means "Spark rejects this input too, but τ has not
+        /// established which class it raises. A classless
+        /// Spark-emulated error renders a clean prefix-free message — it must
+        /// NOT invent a token, because the differential oracle keys on the
+        /// leading `[TOKEN]` and a fabricated one would silently compare as a
+        /// real class. Such errors still exit as `invalid_argument`: the
+        /// category is what determines the status, not the presence of a class.
+        class: Option<&'static str>,
         /// The human-readable message, without the analyzer's
         /// `[SPARK-EMULATED]` τ-internal prefix (the class token above
-        /// replaces it as the leading token).
+        /// replaces it as the leading token when present).
         message: String,
     },
 
@@ -75,7 +83,7 @@ pub enum EmissionError {
     /// input), this signals a genuine τ bug: some invariant the analyzer
     /// promised was broken. Kept ALWAYS-ON rather than a `debug_assert!`
     /// precisely because its failure mode is silently wrong SQL, not a loud
-    /// crash (review finding 5, `v2-review-findings-2026-07-13.md`).
+    /// crash.
     #[error("τ-internal invariant violation: {message}")]
     Internal {
         /// Description of the violated invariant and where it fired.
@@ -173,7 +181,7 @@ mod tests {
     #[test]
     fn spark_emulated_display_leads_with_class_token() {
         let e = EmissionError::SparkEmulated {
-            class: "AMBIGUOUS_REFERENCE",
+            class: Some("AMBIGUOUS_REFERENCE"),
             message: "column `id` is ambiguous, candidates: [\"l.id\", \"r.id\"]".to_owned(),
         };
         assert_eq!(

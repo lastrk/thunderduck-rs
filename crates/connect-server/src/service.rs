@@ -23,11 +23,6 @@ use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServ
 
 type BoxStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-// TODO: re-add a plan-depth guard using `CommonAst::depth()` once
-// the substrate carries a depth query. The previous `LogicalPlan::depth()`
-// inspection was removed when dispatch relocated to the τ boundary;
-// `MAX_PLAN_DEPTH` will return alongside that query.
-
 pub struct ThunderduckService {
     session_manager: Arc<thunderduck_core::runtime::SessionManager>,
 }
@@ -37,9 +32,7 @@ impl ThunderduckService {
         Self { session_manager }
     }
 
-    /// Fetch (or create) the session for `session_id`, mapping failures to
-    /// `Status::internal` — the identical error mapping both gRPC entry
-    /// points (`execute_plan`, `analyze_plan`) require.
+    /// Fetch or create a session, mapping failures to `Status::internal`.
     async fn session(
         &self,
         session_id: &str,
@@ -54,25 +47,12 @@ impl ThunderduckService {
 static SERVER_SESSION_ID: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
-// ── τ dispatch helpers ────────────────────────────────────────────
-
 /// Route a Spark Connect [`proto::Relation`] to the correct τ front-end and
 /// produce a [`CommonAst`].
 ///
-/// **Route by `RelType::Sql`** — Option (a) per plan §4: SQL text goes through
-/// `parser_v2`, structured relations through `V2RelationConverter`.
-/// `V2RelationConverter` refuses `RelType::Sql` with `UnsupportedProtoShape`, so
-/// intercepting here keeps the two front-ends peer. Shared by
-/// [`transpile_relation`] (ExecutePlan) and the `AnalyzePlan(Schema)` arm.
-///
-/// Splitting the conversion out of [`transpile_relation`] also lets the async
-/// dispatch layer interpose an eager pivot-value-discovery pass
-/// ([`resolve_implicit_pivots`]) between conversion and [`finalize`] — the
-/// discovery needs the live `DuckDbSession`, which τ's analyzer (per INV10)
-/// cannot reach.
-// `Status` is the standard gRPC error channel used across this whole file
-// (25+ signatures return `Result<_, Status>`); boxing it here alone would be
-// inconsistent with the rest of the layer for one allocation on the reject path.
+/// SQL relations use `parser_v2`; other relations use `V2RelationConverter`.
+/// Data-dependent schema discovery runs in the async layer because τ's analyzer
+/// cannot access the live session.
 #[allow(clippy::result_large_err)]
 pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<CommonAst, Status> {
     use proto::relation::RelType;
@@ -88,41 +68,21 @@ pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<Commo
     }
 }
 
-/// Catalog-aware wrapper around [`relation_to_common_ast`].
-///
-/// Intercepts `Relation { Catalog(..) }` BEFORE the normal τ pipeline and
-/// rewrites supported catalog operations into `CommonOp::Values` ASTs.
-/// Non-catalog relations fall through to [`relation_to_common_ast`].
-/// The resulting `CommonAst` then flows through the unchanged
-/// `resolve_implicit_pivots` → `finalize` pipeline.
+/// Intercept catalog relations before the normal τ pipeline.
 async fn relation_to_common_ast_with_session(
     relation: &proto::Relation,
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
 ) -> Result<CommonAst, Status> {
-    // Try catalog intercept first.
     if let Some(ast) = crate::catalog_ops::resolve_catalog_relation(relation, session).await? {
         return Ok(ast);
     }
-    // Normal pipeline.
     relation_to_common_ast(relation)
 }
 
 /// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
 /// it into DuckDB SQL + resolved schema via τ.
 ///
-/// Runs the eager data-dependent-schema discovery pass ([`resolve_implicit_pivots`]
-/// — values-less pivot/crosstab, schema-less Parquet/Delta `FileScan`) before
-/// `finalize`, exactly like the `execute_plan`/`analyze_plan` Root-relation
-/// arms — this is the shared entry point for the `Command` arms
-/// (`CreateDataframeView`, `SqlCommand`, `WriteOperation`) that don't inline
-/// that sequence themselves, so e.g. `spark.read.parquet(path)
-/// .createOrReplaceTempView(...)` gets the same schema discovery a bare
-/// `execute_plan` Root relation would.
-///
-/// `finalize` runs the analyzer + emission; it succeeds for every plan τ covers
-/// and returns a Thunderduck-boundary `Status` (`UnsupportedOp` /
-/// `UnsupportedProtoShape`) for shapes it does not. The emitted SQL feeds
-/// `execute_streaming_query`; the schema drives the outbound Arrow-schema stamp.
+/// Runs data-dependent schema discovery before finalization for command paths.
 pub(crate) async fn transpile_relation(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     relation: &proto::Relation,
@@ -133,17 +93,7 @@ pub(crate) async fn transpile_relation(
     Ok((common_ast, sql, schema))
 }
 
-/// Build the per-path `BaseTypes` overlay and run τ's fused emit-and-schema
-/// entry point in ONE analyzer pass.
-///
-/// Returns both the emitted DuckDB SQL and the analyzer's root
-/// `resolved_schema` — the schema drives the outbound Arrow-schema stamp in
-/// `execute_streaming_query` (see `arrow_schema_stamp::build_stamped_schema`).
-/// Fusing avoids the second `analyze()` call that pass 88's initial wiring
-/// incurred (perf review HIGH #1).
-///
-/// The catalog closure resolves empty-scan `TableScan` schemas from the
-/// session's temp-view cache (the runtime→analyzer bridge).
+/// Build the per-path `BaseTypes` overlay and emit SQL with its resolved schema.
 pub(crate) async fn finalize(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
@@ -155,10 +105,8 @@ pub(crate) async fn finalize(
 
 /// Run τ's analyzer on a `CommonAst` and return the root-node resolved schema.
 ///
-/// Used by `AnalyzePlan(Schema)` (E.0 addendum — τ's analyzer analyzer wiring for
-/// the schema-analyze surface). The `ExecutePlan` streaming-query path takes
-/// its schema from [`finalize`]'s fused return instead of re-running the
-/// analyzer.
+/// Used by `AnalyzePlan(Schema)`; `ExecutePlan` receives the schema from
+/// [`finalize`].
 pub(crate) async fn analyze_schema(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
@@ -170,13 +118,9 @@ pub(crate) async fn analyze_schema(
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
 ///
-/// Walks the plan ONCE via `empty_scan_tables`, resolves each collected
-/// empty-scan `TableScan` from the session's async temp-view schema cache
-/// (`get_view_schema`), then constructs the overlay directly from the
-/// resolved entries (`BaseTypes::from_entries`) — no second plan walk. The
-/// pre-fetched map stays the sole runtime→analyzer bridge (INV10).
-/// Short-circuits to `BaseTypes::empty()` when the plan carries no empty scan
-/// (ADR-012 request-handler seeding short-circuit).
+/// Collects empty-scan tables once and resolves them from the session's
+/// temp-view cache, the sole runtime→analyzer bridge. Plans without empty
+/// scans short-circuit to [`BaseTypes::empty`].
 async fn build_base_types(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
@@ -197,41 +141,24 @@ async fn build_base_types(
     BaseTypes::from_entries(map)
 }
 
-// ── Eager pivot-value discovery (Spark parity) ───────────────────────────────
-
 /// `spark.sql.pivotMaxValues` default (Spark 4.1.1). A values-less pivot whose
 /// pivot column has more than this many distinct values is a Spark-emulated
 /// compile error (`_LEGACY_ERROR_TEMP_1324`).
 const PIVOT_MAX_VALUES: usize = 10000;
 
-/// Eagerly resolve every values-less [`CommonOp::Pivot`] in `ast` by running
-/// Spark's own discovery query against the live session, mirroring
-/// `RelationalGroupedDataset.pivot(pivotColumn: Column)`:
-/// `df.select(pivotColumn).distinct().limit(maxValues + 1).sort(pivotColumn)`.
-///
-/// τ's analyzer is a pure, synchronous stage (INV10 forbids it importing
-/// `crate::runtime`), so it cannot run the data-dependent DISTINCT itself and
-/// punts an empty-values pivot with `PuntedOperator("Pivot[implicit-values]")`.
-/// This pass runs on the async dispatch layer — which holds the
-/// [`DuckDbSession`] — and rewrites each empty-values pivot into the
-/// explicit-values shape *before* [`finalize`]/[`analyze_schema`], so downstream
-/// is byte-identical to a user-supplied explicit-values pivot.
-///
-/// The walk is post-order (children first) so nested / multiple implicit pivots
-/// are all resolved.
+/// Resolve values-less pivots, crosstabs, and schema-less file scans before
+/// finalization. Their schemas depend on runtime data or catalog state, so the
+/// async service layer must resolve them before synchronous τ analysis.
 async fn resolve_implicit_pivots(
     ast: &mut CommonAst,
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
 ) -> Result<(), Status> {
     use thunderduck_core::transpiler_v2::CommonOp;
 
-    // Resolve children first — `CommonOp::children_mut` covers every variant
-    // exhaustively (leaf relations yield no child plan to descend into).
     for child in ast.op.children_mut() {
         Box::pin(resolve_implicit_pivots(child, session)).await?;
     }
 
-    // If THIS node is a values-less pivot, discover and stamp its values.
     if let CommonOp::Pivot {
         input,
         pivot_column,
@@ -244,18 +171,11 @@ async fn resolve_implicit_pivots(
         }
     }
 
-    // If THIS node is a crosstab, discover col2's distinct buckets from the
-    // live session and desugar it into a conditional-count `Aggregate` — the
-    // mirror image of the implicit-pivot rewrite above (col2's DISTINCT values
-    // are data-dependent, unknowable at plan time, so τ's pure analyzer punts
-    // and this async pass resolves it). See `analyzer::crosstab_to_aggregate`.
     if matches!(ast.op, CommonOp::Crosstab { .. }) {
         let op = std::mem::replace(&mut ast.op, CommonOp::SingleRow);
         let CommonOp::Crosstab { input, col1, col2 } = op else {
             unreachable!("guarded by the matches! above");
         };
-        // Reuse the pivot discovery query (`SELECT DISTINCT col2 ... ORDER BY 1
-        // ASC NULLS FIRST`); no NULL-filtering — a NULL is a real bucket.
         let col2_expr = thunderduck_core::transpiler_v2::Expression::UnresolvedColumn(
             thunderduck_core::transpiler_v2::expression::UnresolvedColumn {
                 name: col2.clone(),
@@ -263,6 +183,8 @@ async fn resolve_implicit_pivots(
                 plan_id: None,
             },
         );
+        // NULL is a real Spark crosstab bucket; retain it with DISTINCT and
+        // place it first with Spark's NULLS FIRST ordering.
         let distinct_values = discover_pivot_values(&input, &col2_expr, session).await?;
         ast.op = thunderduck_core::transpiler_v2::analyzer::crosstab_to_aggregate(
             *input,
@@ -272,11 +194,6 @@ async fn resolve_implicit_pivots(
         );
     }
 
-    // If THIS node is a schema-less FileScan (Parquet or Delta), discover the
-    // schema from the live session via `SELECT * FROM <reader>(...) LIMIT 0`
-    // and stamp the `schema` field to `Some(inferred)`. This is the same
-    // pattern as the pivot/crosstab arms above: a data-dependent schema that
-    // τ's pure synchronous analyzer (INV10) cannot resolve on its own.
     if let CommonOp::FileScan {
         format:
             format @ (thunderduck_core::transpiler_v2::ast::FileFormat::Parquet
@@ -293,12 +210,7 @@ async fn resolve_implicit_pivots(
     Ok(())
 }
 
-/// Run Spark's pivot-value discovery query for a single values-less pivot and
-/// return the discovered values as typed literals, sorted ascending with NULLs
-/// first (Spark's default ordering — the NULL bucket, if present, sorts first
-/// and is a legitimate pivot column named `"null"`; Spark's values-less
-/// overload does **not** null-filter, verified against
-/// `RelationalGroupedDataset.pivot` in Spark 4.x).
+/// Discover typed pivot values in Spark's ascending, NULLS FIRST order.
 async fn discover_pivot_values(
     input: &CommonAst,
     pivot_column: &thunderduck_core::transpiler_v2::Expression,
@@ -306,17 +218,11 @@ async fn discover_pivot_values(
 ) -> Result<Vec<thunderduck_core::transpiler_v2::Expression>, Status> {
     use thunderduck_core::transpiler_v2::CommonOp;
 
-    // Emit `SELECT <pivot_column> FROM <input>` via the pure τ path, then wrap
-    // it in the DISTINCT / ORDER BY / LIMIT that Spark's analyzer applies. The
-    // pivot's `input` subtree does not contain the pivot itself, so it emits
-    // independently.
     let discovery_project = CommonAst::new(CommonOp::Project {
         input: Box::new(input.clone()),
         projections: vec![pivot_column.clone()],
     });
     let (project_sql, _schema) = finalize(session, &discovery_project).await?;
-    // `.limit(maxValues + 1)` so we can detect (and reject) an over-cap column
-    // count exactly the way Spark does.
     let discovery_sql = format!(
         "SELECT DISTINCT * FROM ({project_sql}) AS __td_pivot_discover \
          ORDER BY 1 ASC NULLS FIRST LIMIT {}",
@@ -338,8 +244,6 @@ async fn discover_pivot_values(
         }
     }
 
-    // Spark-emulated (`_LEGACY_ERROR_TEMP_1324`): reject a pivot column with
-    // more distinct values than `spark.sql.pivotMaxValues`.
     if values.len() > PIVOT_MAX_VALUES {
         return Err(Status::invalid_argument(format!(
             "[_LEGACY_ERROR_TEMP_1324] The pivot column has more than {PIVOT_MAX_VALUES} distinct \
@@ -350,16 +254,7 @@ async fn discover_pivot_values(
     Ok(values)
 }
 
-/// Discover the schema of a file-backed relation by executing a zero-row
-/// `SELECT * FROM <reader>(...) LIMIT 0` against the live session. DuckDB
-/// returns an empty `RecordBatch` whose Arrow schema is the file's inferred
-/// schema; we convert that to τ's `StructType`.
-///
-/// Supports Parquet (`read_parquet`) and Delta Lake (`delta_scan`).
-/// This is the data-dependent discovery half of the schema-less FileScan
-/// support — same architectural pattern as [`discover_pivot_values`].
-// `Status` is the standard gRPC error channel across this file; boxing it
-// here alone would be inconsistent (see `relation_to_common_ast`).
+/// Discover a file-backed relation's schema with a zero-row reader query.
 #[allow(clippy::result_large_err)]
 async fn discover_file_schema(
     format: thunderduck_core::transpiler_v2::ast::FileFormat,
@@ -377,9 +272,6 @@ async fn discover_file_schema(
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
-    // The LIMIT 0 query always returns at least one batch (possibly with zero
-    // rows) whose schema reflects the file's columns. If DuckDB returns no
-    // batches at all (shouldn't happen), surface a clear error.
     let arrow_schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
         Status::internal("discover_file_schema: DuckDB returned no batches for LIMIT 0 query")
     })?;
@@ -395,8 +287,6 @@ async fn discover_file_schema(
 
     Ok(StructType::new(fields))
 }
-
-// ── gRPC service impl ─────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
 impl SparkConnectService for ThunderduckService {
@@ -428,10 +318,6 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                // Convert first, then run Spark's eager pivot-value discovery
-                // (needs the live session) BEFORE finalize — see
-                // `resolve_implicit_pivots`. `finalize` succeeds for every
-                // plan τ covers, so `execute_streaming_query` is live.
                 let mut common_ast =
                     relation_to_common_ast_with_session(&relation, &session).await?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
@@ -483,35 +369,13 @@ impl SparkConnectService for ThunderduckService {
                         ));
                     }
                 };
-                // Hold the session so the eager pivot-value discovery pass can
-                // reach it (see `resolve_implicit_pivots`); the session also
-                // carries the temp-view catalog the analyzer resolves
-                // `TableScan` schemas from (catalog bridge).
                 let session = self.session(&session_id).await?;
-                // E.0 addendum: route analyze_plan(Schema) through τ's
-                // analyzer. Parse the relation to CommonAst, then invoke
-                // `analyze_schema` — which runs the analyzer without
-                // calling `dispatch_op`. Errors surface via the same
-                // two-category bridge `finalize` uses (AnalyzerError →
-                // EmissionError → ConnectError → Status).
-                //
-                // ExecutePlan/AnalyzePlan symmetry: this path serializes τ's
-                // `resolved_schema` verbatim (via `data_type_to_proto`), so
-                // AnalyzePlan already surfaces the Spark-visible view.
-                // ExecutePlan achieves the same on the response path via
-                // `arrow_schema_stamp::build_stamped_schema` in
-                // `execute_streaming_query`. Do not modify this arm.
                 let mut common_ast =
                     relation_to_common_ast_with_session(&relation, &session).await?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
                 let struct_type = analyze_schema(&session, &common_ast).await?;
-                // ADR-022 boundary hygiene: `DataType::Unresolved` maps to
-                // `Kind::Unparsed { data_type_string: "unresolved" }` on the
-                // wire, which PySpark's `_parse_datatype_json_value` refuses
-                // with `PySparkValueError`. If τ's analyzer could not resolve
-                // any field's type, surface a Thunderduck-boundary
-                // `Status::unimplemented` rather than corrupt-serialize the
-                // response. See `.agent-output/diagnostic-unresolved-schema.md`.
+                // Unresolved serializes as proto Unparsed, which PySpark rejects;
+                // report the unsupported τ boundary instead.
                 if let Some(bad) = struct_type
                     .fields
                     .iter()
@@ -617,8 +481,6 @@ impl SparkConnectService for ThunderduckService {
     }
 }
 
-// ── Command dispatch ─────────────────────────────────────────────────────────
-
 async fn handle_command(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     session_id: &str,
@@ -644,14 +506,8 @@ async fn handle_command(
             .await
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
-            // Modern clients (PySpark 4.1.1) carry the query as a typed
-            // `RelType::Sql` relation in `sql_cmd.input`; older clients use the
-            // proto-deprecated `sql` text field. Synthesize a `RelType::Sql`
-            // relation for the latter so both paths echo a typed relation.
             let (sql_text, input_rel) = extract_sql_command_text_and_rel(sql_cmd)?;
 
-            // Try statement-level parse: DDL statements (CREATE TEMP VIEW)
-            // must be eagerly executed; pure queries echo a CachedRelation.
             handle_sql_command_dispatch(session, session_id, operation_id, &sql_text, input_rel)
                 .await
         }
@@ -667,15 +523,10 @@ async fn handle_command(
     }
 }
 
-// ── Response builders + streaming ────────────────────────────────────────────
-
 /// Build a schema-only `ExecutePlanResponse` from τ's `resolved_schema`.
 ///
-/// PySpark's Connect client short-circuits its `_from_arrow_schema` fallback
-/// (which cannot decode Arrow `Interval(*)` types) when the server has already
-/// sent a `schema` message; instead it uses `proto_schema_to_pyspark_data_type`,
-/// which has arms for all three Spark interval kinds. This frame is what makes
-/// intv-001 (CalendarInterval) and intv-003/intv-005 (DayTimeInterval) decode.
+/// The schema frame lets PySpark use its proto schema decoder, including for
+/// interval types that its Arrow-schema fallback cannot decode.
 fn build_schema_response(
     resolved_schema: &StructType,
     session_id: &str,
@@ -733,34 +584,9 @@ struct StreamingState {
 
 /// Execute a query via τ-emitted SQL and stream Arrow batches back.
 ///
-/// Per-batch pipeline:
-///
-/// 1. Emit ONE `ExecutePlanResponse.schema` frame (proto-schema, decoded on
-///    the client via `proto_schema_to_pyspark_data_type` — has arms for all
-///    three Spark interval kinds).
-/// 2. For each `thunderduck_core::runtime::StreamBatch::Batch(rb)`, in order:
-///    `arrow_interval_transcode::apply` returns `Vec<ArrayRef>` with
-///    DayTimeInterval columns rewritten from DuckDB's `Interval(MonthDayNano)`
-///    to Spark's `Duration(Microsecond)` (no intermediate `RecordBatch`); the
-///    wire `Arc<Schema>` is built ONCE from the first batch (via
-///    `arrow_schema_stamp::build_stamped_schema`) and reused verbatim on every
-///    subsequent batch (`Arc::clone` is refcount-only); a single
-///    `RecordBatch::try_new_with_options(stamped_schema, cols, ...)` call then
-///    constructs the outbound batch in one shot — no transcode→stamp→wrap
-///    chain of temporaries (perf finding MED-1,
-///    `.agent-output/004-perf-findings.md`) — before an `ArrowBatch` frame is
-///    emitted.
-/// 3. On `thunderduck_core::runtime::StreamBatch::Complete` — emit `ResultComplete`.
-/// 4. On `thunderduck_core::runtime::StreamBatch::Error(msg)` — reclassify via
-///    `ThunderduckError::DuckDb(msg).reclassified_spark_runtime()` so the
-///    ANSI Spark class token survives to the client, then yield the Status
-///    and terminate the stream (Q5 fix — the previous inline path skipped
-///    reclassification).
-///
-/// Concurrency model: transcode + stamp run on the tonic async task after the
-/// mpsc hop; DuckDB's `!Send` Connection stays on its dedicated session
-/// thread. The mpsc buffer is 4 batches so DuckDB blocks when the client is
-/// slow (backpressure) without wedging the session thread on every batch.
+/// A schema frame precedes batches. Transcoding and stamping run after the
+/// mpsc hop, while DuckDB's `!Send` connection remains on its session thread;
+/// the bounded channel provides backpressure.
 async fn execute_streaming_query(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     sql: &str,
@@ -817,40 +643,24 @@ fn post_transcode_schema(src: &Schema, cols: &[ArrayRef]) -> Schema {
 async fn streaming_step(
     mut s: StreamingState,
 ) -> Option<(Result<proto::ExecutePlanResponse, Status>, StreamingState)> {
-    // 1. Terminal: once the complete frame (or a terminal error) has been
-    //    yielded, unfold returns None.
     if s.sent_complete_frame {
         return None;
     }
-    // 2. Schema frame first (one-shot).
     if !s.sent_schema_frame {
         s.sent_schema_frame = true;
         let frame = build_schema_response(&s.resolved_schema, &s.session_id, &s.operation_id);
         return Some((Ok(frame), s));
     }
-    // 3. Pull the next thunderduck_core::runtime::StreamBatch from the session thread.
     match s.rx.recv().await {
         Some(thunderduck_core::runtime::StreamBatch::Batch(rb)) => {
-            // 3a. Transcode DayTimeInterval columns → Vec<ArrayRef>. No
-            // intermediate RecordBatch — the wire batch is built once below
-            // from `(stamped_schema, cols)`.
             let cols: Vec<ArrayRef> = match arrow_interval_transcode::apply(&rb, &s.plan) {
                 Ok(cols) => cols,
                 Err(e) => {
                     let status = Status::from(ConnectError::from(e));
-                    // Terminate after yielding the error.
                     s.sent_complete_frame = true;
                     return Some((Err(status), s));
                 }
             };
-            // 3b. Build the wire `Arc<Schema>` ONCE per query. On subsequent
-            // batches this branch is skipped and the cached Arc is reused.
-            //
-            // On `build_stamped_schema` failure (structural mismatch — a
-            // debug_assert!/tracing warn path) we cache the un-stamped
-            // post-transcode schema as a fallback so the query still returns
-            // rows. The fallback matches the pre-refactor behavior of
-            // yielding `rb_dt.clone()` at the wire boundary.
             if s.stamped_schema.is_none() {
                 let post_schema = post_transcode_schema(&rb.schema(), &cols);
                 let cached = match arrow_schema_stamp::build_stamped_schema(
@@ -867,7 +677,6 @@ async fn streaming_step(
                     .as_ref()
                     .expect("stamped_schema seeded above"),
             );
-            // 3c. One-shot construction of the wire RecordBatch.
             let opts = RecordBatchOptions::new()
                 .with_match_field_names(false)
                 .with_row_count(Some(rb.num_rows()));
@@ -879,7 +688,6 @@ async fn streaming_step(
                     return Some((Err(status), s));
                 }
             };
-            // 3d. Serialize + wrap.
             let frame = match batch_to_response(&rb_named, &s.session_id, &s.operation_id, s.seq) {
                 Ok(f) => f,
                 Err(e) => {
@@ -897,15 +705,12 @@ async fn streaming_step(
             Some((Ok(frame), s))
         }
         Some(thunderduck_core::runtime::StreamBatch::Error(msg)) => {
-            // Q5 fix — apply ADR-006 reclassification so a τ-emitted
-            // `[CLASS]` token survives to the client via `Status::internal`.
+            // Preserve Spark's error-class token across the gRPC status bridge.
             let err = ThunderduckError::DuckDb(msg).reclassified_spark_runtime();
             let status = Status::from(ConnectError::from(err));
             s.sent_complete_frame = true;
             Some((Err(status), s))
         }
-        // Session thread dropped the sender without sending Complete — treat
-        // as an unexpected terminate; surface a Thunderduck-boundary error.
         None => {
             let status = Status::internal("session stream closed unexpectedly (no Complete frame)");
             s.sent_complete_frame = true;
@@ -952,7 +757,6 @@ fn extract_sql_command_text_and_rel(
 ) -> Result<(String, proto::Relation), Status> {
     match sql_cmd.input {
         Some(input_rel) => {
-            // Modern: extract the text from the inner Sql relation.
             let text = match &input_rel.rel_type {
                 Some(proto::relation::RelType::Sql(sql)) => sql.query.clone(),
                 _ => {
@@ -999,11 +803,6 @@ async fn handle_sql_command_dispatch(
 
     match stmt {
         SqlStatement::Query(_) => {
-            // Eager-validate (parse + analyze) at `sql()` time so
-            // Spark-emulated errors surface eagerly, matching Spark's
-            // `AnalysisException`. The emitted SQL / resolved schema are
-            // discarded — the client re-transpiles the echoed relation on
-            // `.collect()` via the Root path.
             let _ = transpile_relation(session, &input_rel).await?;
             handle_sql_command_echo(session_id, operation_id, input_rel)
         }
@@ -1043,8 +842,6 @@ async fn handle_sql_ddl(
 
     type CacheEffect = thunderduck_core::runtime::SchemaCacheEffect;
 
-    // For body-bearing variants, finalize the body query first.
-    // CreateView also needs the resolved schema for the view cache.
     let (body_sql, view_schema): (Option<String>, Option<StructType>) = match ddl {
         DdlStatement::CreateView { query, .. } => {
             let mut body_ast = query.clone();
@@ -1061,11 +858,9 @@ async fn handle_sql_ddl(
         _ => (None, None),
     };
 
-    // Render the DDL to DuckDB SQL.
     let sql =
         render_ddl(ddl, body_sql.as_deref()).map_err(|e| Status::from(ConnectError::from(e)))?;
 
-    // Determine the schema-cache side effect.
     let effect = match ddl {
         DdlStatement::CreateTable {
             name,
@@ -1073,8 +868,6 @@ async fn handle_sql_ddl(
             if_not_exists,
         } => {
             if *if_not_exists {
-                // IF NOT EXISTS: DuckDB's DDL is a no-op when the table
-                // exists, so the cache must NOT overwrite the live schema.
                 CacheEffect::CacheIfAbsent {
                     name: name.clone(),
                     schema: columns.clone(),
@@ -1087,8 +880,6 @@ async fn handle_sql_ddl(
             }
         }
         DdlStatement::CreateView { name, .. } => {
-            // Cache the view's resolved schema so subsequent queries can
-            // resolve `SELECT * FROM <view>` via build_base_types.
             if let Some(schema) = view_schema {
                 CacheEffect::Cache {
                     name: name.clone(),
@@ -1105,12 +896,11 @@ async fn handle_sql_ddl(
         | DdlStatement::InsertValues { .. }
         | DdlStatement::InsertSelect { .. } => CacheEffect::None,
         DdlStatement::CreateTempView { .. } => {
-            // Should not reach here — handled by handle_sql_create_temp_view.
+            // Handled by handle_sql_create_temp_view.
             CacheEffect::None
         }
     };
 
-    // Execute with Spark error-class mapping.
     match session.execute_ddl(&sql, effect).await {
         Ok(()) => Ok(vec![result_complete_response(session_id, operation_id)]),
         Err(e) => Err(map_ddl_error(ddl, e)),
@@ -1153,7 +943,6 @@ fn map_ddl_error(
             if_not_exists,
             ..
         } => {
-            // DuckDB: "Catalog Error: Table with name \"x\" already exists!"
             if !if_not_exists && msg.contains("already exists") {
                 return Status::already_exists(format!(
                     "[TABLE_OR_VIEW_ALREADY_EXISTS] The table or view `{name}` \
@@ -1185,17 +974,11 @@ fn map_ddl_error(
         _ => {}
     }
 
-    // Fallback: surface the DuckDB error as internal.
     Status::from(ConnectError::from(err))
 }
 
 /// Handle a pure-query `SqlCommand` — echo the relation as a
 /// `SqlCommandResult` so the client can re-send it as a `Root` plan.
-// `Status` is the standard gRPC error channel used across this whole file
-// (39 signatures return `Result<_, Status>`); this handler is infallible today
-// but keeps the fallible shape shared by its sibling `handle_sql_*` handlers so
-// the dispatch match stays uniform. Boxing it here alone would be inconsistent
-// with the rest of the layer.
 #[allow(clippy::result_large_err)]
 fn handle_sql_command_echo(
     session_id: &str,
@@ -1221,9 +1004,6 @@ async fn handle_sql_create_temp_view(
     or_replace: bool,
     body: &CommonAst,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    // If `OR REPLACE` is false and the view exists, match Spark's error.
-    // (IF NOT EXISTS is unreachable for temp views — Spark rejects it at
-    // parse time and τ mirrors that rejection in lower_statement_or_ddl.)
     if !or_replace && session.get_view_schema(name).await.is_some() {
         return Err(Status::already_exists(format!(
             "[TEMP_TABLE_OR_VIEW_ALREADY_EXISTS] Cannot create the temporary \
@@ -1233,18 +1013,16 @@ async fn handle_sql_create_temp_view(
         )));
     }
 
-    // Finalize the body to get DuckDB SQL + resolved schema.
     let mut body_ast = body.clone();
     resolve_implicit_pivots(&mut body_ast, session).await?;
     let (sql, schema) = finalize(session, &body_ast).await?;
 
-    // Register using the existing machinery.
     handle_create_dataframe_view(
         session,
         session_id,
         operation_id,
         name,
-        false, // is_global — SQL CREATE TEMP VIEW is session-scoped
+        false, // SQL temporary views are session-scoped.
         sql,
         schema,
     )
@@ -1288,17 +1066,14 @@ async fn handle_write_operation(
     };
 
     match (format.as_str(), mode) {
-        // ── Delta append into a pre-existing table (ADR-017) ────────────
         ("delta", SaveMode::Append) => {
             write_delta_append(session, session_id, operation_id, source_sql, path).await
         }
 
-        // ── Parquet overwrite (single-file COPY) ────────────────────────
         ("parquet", SaveMode::Overwrite) => {
             write_parquet_overwrite(session, session_id, operation_id, source_sql, path).await
         }
 
-        // ── Delta typed rejections (ADR-017 gated) ──────────────────────
         ("delta", SaveMode::Overwrite) => Err(Status::unimplemented(
             "ADR-017: delta overwrite needs delete/truncate in duckdb-delta; \
              revisit when it ships delete",
@@ -1312,7 +1087,6 @@ async fn handle_write_operation(
              revisit when confirmed in a pinned build",
         )),
 
-        // ── Catch-all ───────────────────────────────────────────────────
         _ => Err(Status::unimplemented(format!(
             "WriteOperation format={format}, mode={} is not supported in Thunderduck",
             mode.as_str_name(),
@@ -1340,13 +1114,11 @@ async fn write_delta_append(
     let insert_sql = format!("INSERT INTO __td_dw.main.__td_dw {source_sql}");
     let detach_sql = "DETACH __td_dw";
 
-    // ATTACH the Delta table.
     session
         .execute(&attach_sql)
         .await
         .map_err(|e| Status::internal(format!("delta ATTACH failed: {e}")))?;
 
-    // INSERT source rows; on failure still DETACH to avoid a dangling catalog.
     let insert_result = session.execute(&insert_sql).await;
     if let Err(ref e) = insert_result {
         tracing::warn!(path, "delta INSERT failed, detaching: {e}");
@@ -1354,7 +1126,6 @@ async fn write_delta_append(
         return Err(Status::internal(format!("delta INSERT failed: {e}")));
     }
 
-    // DETACH the catalog.
     session
         .execute(detach_sql)
         .await
@@ -1381,8 +1152,6 @@ async fn write_parquet_overwrite(
 
     Ok(vec![result_complete_response(session_id, operation_id)])
 }
-
-// ── Response builders ────────────────────────────────────────────────────────
 
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
@@ -1418,15 +1187,12 @@ fn sql_command_result_response(
     }
 }
 
-// ── Config helpers (preserved) ────────────────────────────────────────────────
-
 /// Return the Spark default value for well-known config keys.
 ///
 /// PySpark calls `int()` or `bool()` on some config values, so we must return
 /// valid strings for integer and boolean configs rather than empty strings.
 fn spark_config_default(key: &str) -> &'static str {
     match key {
-        // Integer configs — PySpark calls int() on these
         "spark.sql.session.localRelationCacheThreshold" => "67108864",
         "spark.sql.session.localRelationChunkSizeRows" => "1000",
         "spark.sql.session.localRelationChunkSizeBytes" => "4194304",
@@ -1438,7 +1204,6 @@ fn spark_config_default(key: &str) -> &'static str {
         "spark.sql.broadcastTimeout" => "300",
         "spark.network.timeout" => "120",
         "spark.reducer.maxSizeInFlight" => "50331648",
-        // Boolean configs — PySpark calls bool() on these
         "spark.sql.execution.arrow.enabled" => "true",
         "spark.sql.execution.arrow.pyspark.enabled" => "true",
         "spark.sql.execution.arrow.pyspark.fallback.enabled" => "true",
@@ -1447,7 +1212,6 @@ fn spark_config_default(key: &str) -> &'static str {
         "spark.sql.repl.eagerEval.enabled" => "false",
         "spark.sql.adaptive.enabled" => "true",
         "spark.sql.ansi.enabled" => "false",
-        // Unknown keys — return empty string (safe for plain string usage)
         _ => "",
     }
 }
@@ -1463,8 +1227,7 @@ fn build_config_pairs(operation: Option<proto::config_request::Operation>) -> Ve
     use proto::config_request::operation::OpType;
     match operation.and_then(|op| op.op_type) {
         Some(OpType::Get(g)) => {
-            // Return Spark defaults for known integer/boolean configs that PySpark
-            // calls int() or bool() on. Unknown keys get empty string (safe for str usage).
+            // Clients parse several Spark defaults as bools or integers.
             g.keys
                 .into_iter()
                 .map(|k| {
@@ -1478,9 +1241,8 @@ fn build_config_pairs(operation: Option<proto::config_request::Operation>) -> Ve
         }
         Some(OpType::GetWithDefault(gd)) => gd.pairs,
         Some(OpType::GetOption(go)) => {
-            // value=None signals "not configured" → JVM client treats as missing →
-            // `getPlanCompressionOptions` catches `NoSuchElementException` and
-            // disables plan compression locally rather than crashing.
+            // None tells the JVM client the key is not configured, disabling
+            // plan compression through its missing-key fallback.
             go.keys
                 .into_iter()
                 .map(|k| proto::KeyValue {
@@ -1498,7 +1260,6 @@ fn build_config_pairs(operation: Option<proto::config_request::Operation>) -> Ve
                 value: Some("true".to_string()),
             })
             .collect(),
-        // Set / Unset / unspecified — acknowledge with empty pairs
         _ => vec![],
     }
 }
@@ -1563,8 +1324,6 @@ mod tests {
         })
     }
 
-    // ── Shared τ literal/column builders (pivot-discovery + crosstab tests) ──
-
     use thunderduck_core::transpiler_v2::expression::{
         Expression, Literal, LiteralValue, UnresolvedColumn,
     };
@@ -1605,10 +1364,6 @@ mod tests {
         })
     }
 
-    /// Regression for nubank/thunderduck#33: GetOption must emit one KeyValue per
-    /// requested key (value=None when not configured). spark-connect-client-jvm
-    /// 4.1.x calls this on every analyze; returning 0 pairs trips its
-    /// `require(pairs.size == 1)` precondition with IllegalArgumentException.
     #[test]
     fn get_option_emits_one_pair_per_key_with_unset_value() {
         use proto::config_request::operation::OpType;
@@ -1655,18 +1410,6 @@ mod tests {
         assert_eq!(pairs[0].value.as_deref(), Some("200"));
     }
 
-    // ── the τ dispatch site dispatch tests ──────────────────────────────────────────────
-    //
-    // At A.3, τ's `generate()` errors with `EmissionError::Unsupported`
-    // (kind: Op) on
-    // every input. These tests pin two properties of the dispatch shape:
-    //   1. Structurally-valid inputs reach τ (via `V2RelationConverter` or
-    //      `parser_v2`) and surface the emission boundary via
-    //      `Status::unimplemented` — not `Status::internal`.
-    //   2. `RelType::Sql` routes to `parser_v2`, never through
-    //      `V2RelationConverter` (which would return
-    //      `Unsupported { kind: ProtoShape, name: "RelType::Sql" }`).
-
     fn table_scan_relation(name: &str) -> proto::Relation {
         proto::Relation {
             common: None,
@@ -1692,11 +1435,6 @@ mod tests {
         }
     }
 
-    /// A structurally-valid `Project` relation reaches τ and surfaces either
-    /// τ's emission boundary (`Status::unimplemented`) or, since the input
-    /// table doesn't exist under the test's empty `BaseTypes` overlay, the
-    /// analyzer's Spark-emulated `TABLE_OR_VIEW_NOT_FOUND` re-surfaced per
-    /// ADR-023 chunk 3b (`Status::invalid_argument`) — never `internal`.
     #[tokio::test(flavor = "multi_thread")]
     async fn transpile_relation_project_returns_unsupported_op() {
         let session = test_session("test-transpile-project").await;
@@ -1721,14 +1459,6 @@ mod tests {
             "boundary/Spark-emulated errors must surface as Status::unimplemented or \
              Status::invalid_argument, not internal; got {err:?}"
         );
-        // τ's emission boundary is what should be surfaced — NOT
-        // `V2RelationConverter`'s `UnsupportedProtoShape` (the proto shape is
-        // supported). Since τ's analyzer, this can be either the τ analyzer's
-        // Spark-emulated error (unknown table `t` — the test uses an empty
-        // BaseTypes overlay, re-surfaced per ADR-023 chunk 3b leading
-        // `[TABLE_OR_VIEW_NOT_FOUND]`) or τ's `UnsupportedOp`
-        // (`<tau-analyzer-ok>` when the analyzer succeeds). Both signal we
-        // reached τ, not the proto-shape gate.
         let message = err.message();
         assert!(
             message.contains("unsupported operator")
@@ -1741,11 +1471,6 @@ mod tests {
     }
 
     /// `RelType::Sql` MUST route through `parser_v2`, not `V2RelationConverter`.
-    /// The failure mode we're guarding against: if dispatch fed `Sql` to
-    /// `V2RelationConverter`, the error would identify `RelType::Sql` as the
-    /// unsupported proto shape. Instead, `parser_v2` parses the SQL and τ's
-    /// `generate()` emits DuckDB SQL (τ's emission substrate wired the Project + SingleRow
-    /// arms — `SELECT 1` is a Project over SingleRow of a literal).
     #[tokio::test(flavor = "multi_thread")]
     async fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
         let session = test_session("test-transpile-sql-route").await;
@@ -1756,10 +1481,6 @@ mod tests {
                 ..Default::default()
             })),
         };
-        // τ's emission substrate wired Project + SingleRow arms — `SELECT 1` now succeeds.
-        // The routing anchor (SQL → parser_v2, not converter) is still enforced:
-        // a routing bug would have surfaced `RelType::Sql` as an
-        // `UnsupportedProtoShape` error before reaching τ's emission.
         let (_common_ast, sql, _schema) = transpile_relation(&session, &sql_rel)
             .await
             .expect("τ must emit SQL for `SELECT 1`");
@@ -1800,9 +1521,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn transpile_relation_unsupported_proto_shape_surfaces() {
         let session = test_session("test-transpile-unsupported-shape").await;
-        // ShowString is still in the converter's catch-all `other` arm — a
-        // deferred `RelType` that must surface as `UnsupportedProtoShape`.
-        // (Pass 83 wired `Sample` / `SampleBy`, which used to sit here.)
         let show = proto::Relation {
             common: None,
             rel_type: Some(proto::relation::RelType::ShowString(Box::new(
@@ -1826,57 +1544,25 @@ mod tests {
         );
     }
 
-    /// `finalize()` builds `BaseTypes::empty()` when the plan carries no
-    /// empty-scan (short-circuit anchor at the service layer — the substrate
-    /// test in `base_types::tests` already pins the closure-not-invoked
-    /// behavior). τ's emission substrate wired SingleRow emission — this test now asserts
-    /// that finalize returns the emitted SQL for a plan with no empty scan
-    /// (proving the short-circuit path builds `BaseTypes::empty()` without
-    /// blocking emission).
+    /// Plans without empty scans use `BaseTypes::empty()` and still emit SQL.
     #[tokio::test(flavor = "multi_thread")]
     async fn finalize_short_circuits_on_plans_without_empty_scan() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         let session = test_session("test-finalize-short-circuit").await;
-        // A `SingleRow` plan carries no `TableScan` → `empty_scan_tables` is
-        // empty → `BaseTypes::empty()` (no catalog lookup) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
         let (sql, _schema) = finalize(&session, &plan)
             .await
             .expect("τ must emit for SingleRow");
-        // Subquery-safe shape — see `emission::render_single_row`.
         assert_eq!(sql, "SELECT 1");
     }
 
-    // ── future τ work.0 smoke test ─────────────────────────────────────────────────
-    //
-    // Round-trips `SELECT 1` through the full gRPC path:
-    // `execute_plan` → `transpile_relation` (parser_v2 → τ finalize) →
-    // `execute_streaming_query` (session.execute_streaming + per-batch frames) →
-    // Arrow IPC stream. Verifies the E.0 wiring end-to-end at the service
-    // layer without spinning up a network gRPC server.
-
-    /// End-to-end smoke test for the future τ work.0 streaming-query wiring.
-    ///
-    /// Marked `#[ignore]` because τ's `SingleRow` renderer emits a
-    /// bare `SELECT` (see `emission.rs::render_single_row`), which becomes
-    /// `SELECT 1 FROM (SELECT) AS __td_proj` when wrapped by `render_project`
-    /// — DuckDB rejects the bare `SELECT` subquery with "Parser Error: SELECT
-    /// clause without selection list". This is a τ emission concern (owned by
-    /// τ's emission substrate / a later refinement), not an E.0 wiring defect: the E.0
-    /// path successfully submits SQL to the session, receives the DuckDB
-    /// error, and maps it through `ThunderduckError → ConnectError →
-    /// Status::internal`, as designed. The E.0 wiring is validated at the
-    /// corpus level via `tests/scripts/run-differential-tests.sh core`.
+    /// End-to-end streaming query through DuckDB and Arrow IPC.
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_plan_single_row_round_trips_through_duckdb() {
         use arrow::array::Int32Array;
         use arrow_ipc::reader::StreamReader;
         use std::io::Cursor;
 
-        // Arrange: build a service with a real SessionManager (same pattern
-        // as `crates/core/tests/runtime_integration.rs`). Inline paths for
-        // `thunderduck_core::runtime::*` — INV10 forbids `use
-        // thunderduck_core::runtime::` inside `service.rs`.
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(session_manager);
 
@@ -1896,15 +1582,12 @@ mod tests {
             ..Default::default()
         };
 
-        // Act: call execute_plan and drain the response stream.
         let resp = svc
             .execute_plan(Request::new(req))
             .await
             .expect("execute_plan must succeed");
         let frames = drain(resp).await;
 
-        // Assert: at least one ArrowBatch frame with non-empty data, and a
-        // trailing ResultComplete frame.
         assert!(!frames.is_empty(), "expected at least one response frame");
 
         let arrow_frame = find_arrow_batch(&frames).expect("expected an ArrowBatch frame");
@@ -1915,8 +1598,6 @@ mod tests {
 
         assert_trailing_result_complete(&frames);
 
-        // Decode the IPC stream — expect exactly one RecordBatch with one row
-        // and one Int32 column carrying `1`.
         let reader = StreamReader::try_new(Cursor::new(arrow_frame.data.as_slice()), None)
             .expect("StreamReader::try_new must succeed on valid IPC bytes");
         let batches: Vec<_> = reader
@@ -1933,13 +1614,6 @@ mod tests {
             .expect("expected Int32 column for `SELECT 1`");
         assert_eq!(col.value(0), 1);
     }
-
-    // ── Pass 95 — SqlCommand lazy-echo round-trip ───────────────────────────
-    //
-    // `spark.sql(...)` arrives as a `Command(SqlCommand)`. The command arm
-    // echoes the input `RelType::Sql` relation back in a `SqlCommandResult`
-    // frame (no `ArrowBatch`), followed by `ResultComplete`. PySpark
-    // re-executes the echoed relation lazily on `.collect()` via the Root path.
 
     /// Modern PySpark path: `SqlCommand { input: Some(RelType::Sql{query}) }`.
     /// The command arm echoes the input relation verbatim.
@@ -1976,13 +1650,11 @@ mod tests {
             .expect("execute_plan must succeed");
         let frames = drain(resp).await;
 
-        // No ArrowBatch frame — the command arm does not stream data.
         assert!(
             find_arrow_batch(&frames).is_none(),
             "command arm must not emit an ArrowBatch frame",
         );
 
-        // The SqlCommandResult frame echoes the original Sql relation.
         let cmd_result = frames
             .iter()
             .find_map(|f| match &f.response_type {
@@ -2001,7 +1673,6 @@ mod tests {
             other => panic!("expected RelType::Sql, got {other:?}"),
         }
 
-        // Final frame is ResultComplete.
         assert_trailing_result_complete(&frames);
     }
 
@@ -2060,12 +1731,6 @@ mod tests {
         assert_trailing_result_complete(&frames);
     }
 
-    // ── Pass 58 — ADR-022 boundary guard for unresolved schema ──────────────
-    //
-    // These tests pin the invariant that τ never proto-serializes a
-    // `DataType::Unresolved` field: the analyze_plan path must trip the
-    // guard and return `Status::unimplemented`.
-
     /// The guard predicate matches `contains_unresolved` recursively —
     /// a nested Unresolved (Array<Unresolved>) must trip it too.
     #[test]
@@ -2073,7 +1738,6 @@ mod tests {
         use thunderduck_core::types::StructField;
         let dt = DataType::Array(Box::new(DataType::Unresolved), true);
         assert!(dt.contains_unresolved());
-        // A struct containing a nested unresolved must also trip.
         let st = StructType::new(vec![StructField::nullable("a", dt)]);
         assert!(st.fields.iter().any(|f| f.data_type.contains_unresolved()));
     }
@@ -2118,13 +1782,8 @@ mod tests {
         );
     }
 
-    // ── Eager pivot-value discovery ─────────────────────────────────────────
-
-    /// The discovery pass rewrites a values-less `Pivot` into the sorted, typed
-    /// literal set discovered from the live session — including a legitimate
-    /// NULL bucket, which Spark's values-less overload does not null-filter and
-    /// which sorts first (nulls-first). Uses an inline `Values` input so the
-    /// test is self-contained (no temp-view registration needed).
+    /// Values-less pivots include a NULL bucket and sort discovered values
+    /// ascending.
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_implicit_pivots_discovers_sorted_typed_values_with_null_bucket() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
@@ -2136,9 +1795,6 @@ mod tests {
             .await
             .expect("session must be created");
 
-        // Inline data: pivot column `p` has distinct values {NULL, "b", "a"}
-        // across the rows — discovery must return them sorted ascending with
-        // NULL first.
         let values = CommonAst::new(CommonOp::Values {
             rows: vec![
                 vec![int_lit(1), str_lit("b")],
@@ -2168,7 +1824,6 @@ mod tests {
             CommonOp::Pivot { pivot_values, .. } => pivot_values,
             _ => panic!("expected Pivot"),
         };
-        // NULL bucket sorts first, then "a", then "b".
         assert_eq!(discovered.len(), 3, "expected NULL + two distinct values");
         assert!(
             matches!(
@@ -2192,14 +1847,8 @@ mod tests {
         assert_eq!(as_str(&discovered[2]), "b");
     }
 
-    /// End-to-end reproducer for misc-006 (`crosstab(col1, col2)`): the
-    /// discovery pass desugars a `Crosstab` into a conditional-count
-    /// `Aggregate` whose resolved schema is Spark's contingency table — col0 =
-    /// `CAST(col1 AS STRING)` named `{col1}_{col2}` (nullable), then one
-    /// `bigint` non-null count column per distinct col2 value, named by the
-    /// value's string form and sorted lexicographically. The emitted SQL must
-    /// also execute cleanly against DuckDB. Before the fix this punted with
-    /// `Crosstab[dynamic-values]` at τ's analyzer boundary.
+    /// Crosstab discovery produces a conditional-count aggregate with a
+    /// Spark-compatible schema and executable SQL.
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_implicit_pivots_desugars_crosstab_end_to_end() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
@@ -2210,7 +1859,6 @@ mod tests {
             .await
             .expect("session must be created");
 
-        // Inline data: dept_id ∈ {10, 20}, active ∈ {true, false}.
         let values = CommonAst::new(CommonOp::Values {
             rows: vec![
                 vec![int_lit(10), bool_lit(true)],
@@ -2229,7 +1877,6 @@ mod tests {
         resolve_implicit_pivots(&mut ast, &session)
             .await
             .expect("crosstab desugar must succeed");
-        // The Crosstab node is replaced by the conditional-count Aggregate.
         assert!(
             matches!(ast.op, CommonOp::Aggregate { .. }),
             "crosstab must desugar into an Aggregate; got {:?}",
@@ -2240,14 +1887,9 @@ mod tests {
             .await
             .expect("desugared crosstab must emit SQL");
 
-        // Spark-parity contingency schema: col0 + one count col per distinct
-        // col2 value, sorted lexicographically ('false' < 'true').
         assert_eq!(schema.fields.len(), 3);
         assert_eq!(schema.fields[0].name, "dept_id_active");
         assert_eq!(schema.fields[0].data_type, DataType::String);
-        // col0 nullability follows col1: the inline `dept_id` literals are
-        // non-null, so col0 is non-null here (the analyzer unit test covers the
-        // nullable-source case that matches misc-006's `emp.dept_id`).
         assert!(!schema.fields[0].nullable);
         assert_eq!(schema.fields[1].name, "false");
         assert_eq!(schema.fields[1].data_type, DataType::Long);
@@ -2256,16 +1898,12 @@ mod tests {
         assert_eq!(schema.fields[2].data_type, DataType::Long);
         assert!(!schema.fields[2].nullable);
 
-        // The emitted SQL must run against DuckDB without error.
         session
             .execute(&sql)
             .await
             .expect("desugared crosstab SQL must execute in DuckDB");
     }
 
-    /// Companion test: schemas without unresolved must pass the guard
-    /// (locks the false-positive contract — the guard must not fire for
-    /// fully-resolved schemas).
     #[test]
     fn boundary_guard_does_not_fire_for_fully_resolved_schema() {
         use thunderduck_core::types::StructField;
@@ -2282,12 +1920,6 @@ mod tests {
         );
     }
 
-    // ── Pass 96 — temp-view registration + catalog bridge ────────────────────
-    //
-    // These tests pin the two compounding fixes: (1) the catalog closure now
-    // resolves an empty-scan `TableScan` from the session's temp-view schema
-    // cache, and (2) `handle_create_dataframe_view` registers the view.
-
     fn sql_plan(query: &str) -> proto::Plan {
         proto::Plan {
             op_type: Some(proto::plan::OpType::Root(proto::Relation {
@@ -2300,10 +1932,7 @@ mod tests {
         }
     }
 
-    /// A registered temp view resolves through the analyzer's catalog bridge:
-    /// `create_temp_view_with_schema("emp", ...)` then `SELECT * FROM emp` on
-    /// the SAME session succeeds (no `UnknownTable`), yields an `ArrowBatch` +
-    /// trailing `ResultComplete`, and the stamped schema field names match.
+    /// A registered temp view resolves through the analyzer catalog bridge.
     #[tokio::test(flavor = "multi_thread")]
     async fn catalog_bridge_resolves_registered_view() {
         use arrow_ipc::reader::StreamReader;
@@ -2371,8 +2000,6 @@ mod tests {
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
 
-        // A light view body (`SELECT 1 AS id`) — Project over SingleRow, no
-        // Arrow LocalRelation payload to construct.
         let create = proto::Plan {
             op_type: Some(proto::plan::OpType::Command(proto::Command {
                 command_type: Some(proto::command::CommandType::CreateDataframeView(
@@ -2404,10 +2031,8 @@ mod tests {
         )
         .await;
         assert_eq!(frames.len(), 1, "command arm returns a lone frame");
-        // With exactly one frame, "trailing" == "lone".
         assert_trailing_result_complete(&frames);
 
-        // The view now resolves on the same session.
         let sel = proto::ExecutePlanRequest {
             session_id: "create-view-session".to_owned(),
             operation_id: Some("test-op-2".to_owned()),
@@ -2426,9 +2051,6 @@ mod tests {
         );
     }
 
-    /// Regression guard: a catalog-free plan (`SELECT 1`) still round-trips —
-    /// an empty `empty_scan_tables` result short-circuits `build_base_types` to
-    /// `BaseTypes::empty()` with zero session round-trips.
     #[tokio::test(flavor = "multi_thread")]
     async fn select_literal_makes_no_catalog_call_short_circuit() {
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
@@ -2452,10 +2074,7 @@ mod tests {
         assert_trailing_result_complete(&frames);
     }
 
-    // ── SQL CREATE TEMP VIEW via SqlCommand ─────────────────────────────
-
-    /// Helper: build an `ExecutePlanRequest` wrapping a `SqlCommand`
-    /// with the given SQL text.
+    /// Build an `ExecutePlanRequest` wrapping a `SqlCommand`.
     fn sql_command_plan(session_id: &str, sql: &str) -> proto::ExecutePlanRequest {
         proto::ExecutePlanRequest {
             session_id: session_id.to_owned(),
@@ -2482,16 +2101,13 @@ mod tests {
         }
     }
 
-    /// `spark.sql("CREATE TEMP VIEW v AS SELECT 1 AS id")` followed by
-    /// `spark.sql("SELECT * FROM v")` — the SQL DDL path registers the view
-    /// and the subsequent SELECT resolves it. End-to-end through `SqlCommand`.
+    /// SQL DDL registers a temp view that a subsequent query can resolve.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_create_temp_view_then_select() {
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
         let session_id = "sql-create-temp-view-session";
 
-        // Step 1: CREATE TEMP VIEW via SqlCommand.
         let create_req = sql_command_plan(session_id, "CREATE TEMP VIEW v AS SELECT 1 AS id");
         let frames = drain(
             svc.execute_plan(Request::new(create_req))
@@ -2499,12 +2115,9 @@ mod tests {
                 .expect("CREATE TEMP VIEW via SqlCommand must succeed"),
         )
         .await;
-        // DDL returns a lone ResultComplete (same shape as
-        // CreateDataframeView).
         assert_eq!(frames.len(), 1, "DDL returns exactly one frame");
         assert_trailing_result_complete(&frames);
 
-        // Step 2: SELECT from the view on the same session.
         let select_req = proto::ExecutePlanRequest {
             session_id: session_id.to_owned(),
             operation_id: Some("test-op-2".to_owned()),
@@ -2532,7 +2145,6 @@ mod tests {
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
         let session_id = "sql-replace-view-session";
 
-        // First creation.
         let req1 = sql_command_plan(session_id, "CREATE OR REPLACE TEMP VIEW w AS SELECT 1 AS a");
         let frames = drain(
             svc.execute_plan(Request::new(req1))
@@ -2542,7 +2154,6 @@ mod tests {
         .await;
         assert_eq!(frames.len(), 1);
 
-        // Replace with different body.
         let req2 = sql_command_plan(session_id, "CREATE OR REPLACE TEMP VIEW w AS SELECT 2 AS b");
         let frames = drain(
             svc.execute_plan(Request::new(req2))
@@ -2552,13 +2163,6 @@ mod tests {
         .await;
         assert_eq!(frames.len(), 1);
     }
-
-    // ── WriteOperation dispatch tests ──────────────────────────────────────
-    //
-    // These test the format/mode/save_type routing without a live DuckDB
-    // session. Typed rejections and unsupported shapes must surface as
-    // Status::unimplemented; valid shapes that need a session are tested via
-    // the differential corpus.
 
     /// Build a minimal `WriteOperation` proto for dispatch testing.
     fn write_op(format: &str, mode: i32, path: &str) -> proto::WriteOperation {

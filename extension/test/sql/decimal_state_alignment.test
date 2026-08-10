@@ -4,31 +4,12 @@
 
 require thdck_spark_funcs
 
-# ============================================================================
-# Why this file exists
-#
-# DuckDB stores aggregate states inline in its row layout and aligns their
-# offsets with AlignValue<T, val=8> — 8 bytes ONLY (see
-# duckdb/src/common/types/row/tuple_data_layout.cpp and
-# duckdb/src/include/duckdb/common/helper.hpp). A state holding a raw `__int128`
-# needs 16, so it lands misaligned in practice: instrumenting Operation() on a
-# build of this extension showed the state at `addr % 16 == 8` both for the
-# UNION ALL CTE below AND for a plain GROUP BY over DECIMAL.
-#
-# spark_sum / spark_avg / spark_try_sum therefore store `hugeint_t` and convert
-# to `__int128` only for stack-local arithmetic. The compile-time guard is
-# SPARK_ASSERT_STATE_ALIGNMENT in src/include/spark_aggregates.hpp — that is what
-# actually prevents a regression, because the runtime symptom is
-# optimizer- and ISA-dependent (aarch64 LDP/STP and x86 movdqu tolerate 8-byte
-# alignment, so a correct-looking result here does NOT prove the state is
-# aligned). These queries pin the observable results; the static_assert pins the
-# layout.
-# ============================================================================
+# DuckDB places aggregate states at 8-byte offsets, so raw __int128 members
+# would be over-aligned. These grouped, UNION, and window shapes exercise
+# distinct state allocation/merge paths; SPARK_ASSERT_STATE_LAYOUT is the guard.
+# Results alone cannot prove that an over-aligned state is safe.
 
-# ---------------------------------------------------------------------------
-# GROUP BY + UNION ALL in a CTE — the shape that triggers
-# CompressedMaterialization, from the original upstream bug report.
-# ---------------------------------------------------------------------------
+
 query III
 WITH u AS (SELECT * FROM (VALUES (1, 1.25::DECIMAL(9,2))) t(k,v)
            UNION ALL
@@ -37,10 +18,6 @@ SELECT k, spark_sum(v), spark_avg(v) FROM u GROUP BY k;
 ----
 1	3.75	1.875000
 
-# spark_try_sum on the same shape. This state (SparkTrySumDecimalState) is the
-# one the original upstream fix missed; before it was converted to hugeint_t it
-# passed `&state.value` — a misaligned `__int128*` — into
-# __builtin_add_overflow.
 query II
 WITH u AS (SELECT * FROM (VALUES (1, 1.25::DECIMAL(9,2))) t(k,v)
            UNION ALL
@@ -49,11 +26,6 @@ SELECT k, spark_try_sum(v) FROM u GROUP BY k;
 ----
 1	3.75
 
-# ---------------------------------------------------------------------------
-# Plain GROUP BY over DECIMAL — also misaligns (broader than the original
-# report, which only described the UNION ALL / CompressedMaterialization path).
-# Several groups, so several states at different row offsets.
-# ---------------------------------------------------------------------------
 statement ok
 CREATE TABLE align_t (k INTEGER, v DECIMAL(9,2));
 
@@ -73,19 +45,12 @@ FROM align_t GROUP BY k ORDER BY k;
 3	-3.50	-1.750000	-3.50
 4	0.01	0.010000	0.01
 
-# ---------------------------------------------------------------------------
-# Negative accumulators specifically: these are the values whose hugeint_t
-# `upper` half is negative, i.e. the ones that went through the signed-shift UB
-# in HugeintToInt128 (left-shifting a negative int64_t by 64).
-# ---------------------------------------------------------------------------
 query III
 SELECT spark_sum(v), spark_avg(v), spark_try_sum(v)
 FROM (VALUES (-5.00::DECIMAL(9,2)),(-7.50::DECIMAL(9,2)),(2.25::DECIMAL(9,2))) t(v);
 ----
 -10.25	-3.416667	-10.25
 
-# Full-width DECIMAL(38,0), negative, exercising the high half of the 128-bit
-# accumulator.
 query I
 SELECT spark_sum(v) FROM (VALUES
   ((-99999999999999999999999999999999999999)::DECIMAL(38,0)),
@@ -93,10 +58,6 @@ SELECT spark_sum(v) FROM (VALUES
 ----
 -99999999999999999999999999999999999998
 
-# ---------------------------------------------------------------------------
-# Windowed DECIMAL aggregates — a different state-allocation path from the
-# grouped one, and the path the Rust host's spark_avg_decimal_probe pins.
-# ---------------------------------------------------------------------------
 query IIII
 SELECT k, spark_sum(v) OVER (PARTITION BY k), spark_avg(v) OVER (PARTITION BY k),
        spark_try_sum(v) OVER (PARTITION BY k)
@@ -106,15 +67,6 @@ FROM align_t WHERE k = 1 ORDER BY v;
 1	4.00	1.333333	4.00
 1	4.00	1.333333	4.00
 
-# ---------------------------------------------------------------------------
-# spark_try_sum still returns NULL on overflow — the hugeint_t conversion must
-# not have broken overflow tracking. Both paths are covered:
-#
-#   1. __builtin_add_overflow on the 128-bit accumulator: 2 * (10^38 - 1)
-#      ~= 2.0e38 exceeds INT128_MAX (~1.70e38), so the add itself overflows.
-#   2. the Abs128(value) >= 10^result_precision limit check in Finalize: the sum
-#      fits in __int128 but exceeds the result precision.
-# ---------------------------------------------------------------------------
 query I
 SELECT spark_try_sum(v) FROM (VALUES
   ((99999999999999999999999999999999999999)::DECIMAL(38,0)),
@@ -122,8 +74,8 @@ SELECT spark_try_sum(v) FROM (VALUES
 ----
 NULL
 
-# Sum = 1.6e38: fits in __int128 (max ~1.70e38) but exceeds 10^38, so this
-# exercises the Finalize limit branch rather than the add-overflow branch.
+# The first case overflows __int128 during accumulation; the next fits there
+# but exceeds the DECIMAL(38,0) precision bound during Finalize.
 query I
 SELECT spark_try_sum(v) FROM (VALUES
   ((80000000000000000000000000000000000000)::DECIMAL(38,0)),
@@ -131,8 +83,7 @@ SELECT spark_try_sum(v) FROM (VALUES
 ----
 NULL
 
-# NULL handling is unchanged by the state rewrite: NULLs are skipped, and an
-# all-NULL input yields NULL rather than 0.
+# NULL inputs are skipped and an all-NULL aggregate returns NULL.
 query III
 SELECT spark_sum(v), spark_avg(v), spark_try_sum(v)
 FROM (VALUES (1.25::DECIMAL(9,2)),(NULL),(2.50::DECIMAL(9,2))) t(v);

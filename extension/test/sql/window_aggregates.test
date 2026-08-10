@@ -4,7 +4,6 @@
 
 require thdck_spark_funcs
 
-# Setup test data
 statement ok
 CREATE TABLE window_test (id INTEGER, grp TEXT, val DECIMAL(10,2));
 
@@ -13,9 +12,8 @@ INSERT INTO window_test VALUES
     (1, 'A', 10.50), (2, 'A', 20.30), (3, 'A', 30.20),
     (4, 'B', 5.00),  (5, 'B', 15.00), (6, 'B', NULL);
 
-# ---------------------------------------------------------------------------
-# spark_sum DECIMAL: running total (ORDER BY)
-# ---------------------------------------------------------------------------
+# Running, partitioned, and sliding windows exercise aggregate update/combine/
+# finalize paths; the NULL row is skipped by both Spark aggregates.
 query II
 SELECT id, spark_sum(val) OVER (ORDER BY id) AS running_sum
 FROM window_test ORDER BY id;
@@ -27,9 +25,6 @@ FROM window_test ORDER BY id;
 5	81.00
 6	81.00
 
-# ---------------------------------------------------------------------------
-# spark_sum DECIMAL: partition sum
-# ---------------------------------------------------------------------------
 query III
 SELECT id, grp, spark_sum(val) OVER (PARTITION BY grp) AS grp_sum
 FROM window_test ORDER BY id;
@@ -41,9 +36,6 @@ FROM window_test ORDER BY id;
 5	B	20.00
 6	B	20.00
 
-# ---------------------------------------------------------------------------
-# spark_sum DECIMAL: sliding window (1 preceding, 1 following)
-# ---------------------------------------------------------------------------
 query II
 SELECT id, spark_sum(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sliding_sum
 FROM window_test ORDER BY id;
@@ -55,9 +47,6 @@ FROM window_test ORDER BY id;
 5	20.00
 6	15.00
 
-# ---------------------------------------------------------------------------
-# spark_sum INTEGER: running total
-# ---------------------------------------------------------------------------
 query II
 SELECT id, spark_sum(id) OVER (ORDER BY id) AS running_sum
 FROM window_test ORDER BY id;
@@ -69,9 +58,6 @@ FROM window_test ORDER BY id;
 5	15
 6	21
 
-# ---------------------------------------------------------------------------
-# spark_avg DECIMAL: running average
-# ---------------------------------------------------------------------------
 query II
 SELECT id, spark_avg(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_avg
 FROM window_test ORDER BY id;
@@ -83,9 +69,6 @@ FROM window_test ORDER BY id;
 5	16.200000
 6	16.200000
 
-# ---------------------------------------------------------------------------
-# spark_avg DECIMAL: partition average
-# ---------------------------------------------------------------------------
 query III
 SELECT id, grp, spark_avg(val) OVER (PARTITION BY grp) AS grp_avg
 FROM window_test ORDER BY id;
@@ -97,9 +80,6 @@ FROM window_test ORDER BY id;
 5	B	10.000000
 6	B	10.000000
 
-# ---------------------------------------------------------------------------
-# spark_avg DECIMAL: sliding window
-# ---------------------------------------------------------------------------
 query II
 SELECT id, spark_avg(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS sliding_avg
 FROM window_test ORDER BY id;
@@ -111,17 +91,11 @@ FROM window_test ORDER BY id;
 5	10.000000
 6	15.000000
 
-# ---------------------------------------------------------------------------
-# spark_sum DECIMAL: all-NULL partition returns NULL
-# ---------------------------------------------------------------------------
 query I
 SELECT spark_sum(val) OVER () FROM (SELECT NULL::DECIMAL(10,2) AS val);
 ----
 NULL
 
-# ---------------------------------------------------------------------------
-# spark_avg DECIMAL: all-NULL partition returns NULL
-# ---------------------------------------------------------------------------
 query I
 SELECT spark_avg(val) OVER () FROM (SELECT NULL::DECIMAL(10,2) AS val);
 ----

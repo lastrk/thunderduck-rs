@@ -9,8 +9,8 @@
 //! turns a [`TypedAst`] into a DuckDB SQL string. Every [`CommonOp`] variant
 //! is wired end-to-end (leaves, Project/Filter/Sort/Limit, Aggregate incl.
 //! Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA family, Pivot /
-//! Crosstab, Stat family, TableFunction, ...) except `Unnest`, whose emission
-//! arm still returns a Thunderduck-boundary `EmissionError` per ADR-022;
+//! Crosstab, Stat family, TableFunction, ...) except `Unnest`, which the
+//! analyzer rejects as a Thunderduck-boundary `PuntedOperator` per ADR-022;
 //! shapes τ has not implemented surface the same way.
 
 pub mod analyzer;
@@ -22,6 +22,7 @@ pub mod emission;
 pub mod error;
 pub mod expression;
 pub mod function_catalog;
+pub mod generator;
 pub mod invariants;
 pub mod macros;
 /// Re-export, not a module: [`name_fold`](crate::types::name_fold) moved to
@@ -46,6 +47,7 @@ pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
+pub use generator::{Generator, GeneratorKind};
 pub use schema::{Attribute, ExprId, ResolvedSchema};
 pub use statement::{render_ddl, DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;
@@ -127,10 +129,9 @@ mod tests {
     #[test]
     fn generate_surfaces_analyzer_error_not_pipeline_marker() {
         // A plan referencing an unknown table must surface the analyzer's
-        // Spark-emulated error re-clothed with its Spark class token
-        // (ADR-023 chunk 3b), not the legacy `analyzer-spark-emulated`
-        // marker — `UnknownTable` has a known `spark_class()`
-        // (`TABLE_OR_VIEW_NOT_FOUND`).
+        // Spark-emulated error re-clothed with its Spark class token;
+        // `UnknownTable` has a known `spark_class()`
+        // (`TABLE_OR_VIEW_NOT_FOUND`) — rather than any τ-boundary marker.
         let plan = CommonAst::new(CommonOp::TableScan {
             table: "no_such_table".to_owned(),
         });
@@ -138,7 +139,7 @@ mod tests {
         let result = generate(&plan, &base_types);
         match result {
             Err(EmissionError::SparkEmulated { class, message }) => {
-                assert_eq!(class, "TABLE_OR_VIEW_NOT_FOUND");
+                assert_eq!(class, Some("TABLE_OR_VIEW_NOT_FOUND"));
                 assert!(
                     !message.contains("[SPARK-EMULATED]"),
                     "message must not double the internal prefix, got: {message}",
@@ -155,11 +156,11 @@ mod tests {
 
     #[test]
     fn generate_surfaces_ambiguous_column_with_spark_class_leading() {
-        // ADR-023 chunk 3b must-have: an ambiguous-column plan surfaces
+        // An ambiguous-column plan surfaces
         // `EmissionError::SparkEmulated { class: "AMBIGUOUS_REFERENCE", .. }`
         // whose Display leads with the exact Spark error-class token, so the
         // client-side differential harness's `spark_error_class` extracts
-        // `AMBIGUOUS_REFERENCE` (flips join-023 / jn-024, F11).
+        // `AMBIGUOUS_REFERENCE`.
         use crate::transpiler_v2::ast::JoinType;
         use crate::transpiler_v2::expression::UnresolvedColumn;
         use crate::types::{DataType, StructField, StructType};
@@ -203,7 +204,7 @@ mod tests {
         let err = generate(&plan, &base_types).expect_err("ambiguous column must error");
         match err {
             EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "AMBIGUOUS_REFERENCE");
+                assert_eq!(class, Some("AMBIGUOUS_REFERENCE"));
                 let display = EmissionError::SparkEmulated {
                     class,
                     message: message.clone(),

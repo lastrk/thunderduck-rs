@@ -91,3 +91,6 @@ playground/logs/
 # pyspark run (the differential harness and ad-hoc Spark-parity checks both do).
 /derby.log
 /metastore_db/
+
+# IDEs
+.idea/

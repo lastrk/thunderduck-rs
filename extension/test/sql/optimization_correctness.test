@@ -1,13 +1,10 @@
 # name: test/sql/optimization_correctness.test
-# description: Tests verifying correctness of optimization code paths (P1-P9)
+# description: Tests DECIMAL division optimization paths (P1-P9)
 # group: [sql]
 
 require thdck_spark_funcs
 
-# ===========================================================================
-# P1: Pow10 hoisted out of per-row loop
-# Verify the precomputed pow10_val is applied consistently across all rows.
-# ===========================================================================
+# P1: hoist one power-of-ten factor for the whole batch; every row shares it.
 
 statement ok
 CREATE TABLE p1_batch (id INTEGER, a DECIMAL(10,2), b DECIMAL(10,2));
@@ -25,8 +22,6 @@ INSERT INTO p1_batch VALUES
     (9, 90.00, 3.00),
     (10, 100.00, 3.00);
 
-# DECIMAL(10,2)/DECIMAL(10,2): scale_adj=13, result type DECIMAL(23,13)
-# All rows use the same scale_adj; verify consistent scaling across the batch
 query II
 SELECT id, spark_decimal_div(a, b) FROM p1_batch ORDER BY id;
 ----
@@ -41,135 +36,100 @@ SELECT id, spark_decimal_div(a, b) FROM p1_batch ORDER BY id;
 9	30.0000000000000
 10	33.3333333333333
 
-# Scale is identical for every row (hoisted pow10 applied uniformly)
 query I
 SELECT COUNT(DISTINCT typeof(spark_decimal_div(a, b))) FROM p1_batch;
 ----
 1
 
-# ===========================================================================
-# P2: Full power-of-10 table (10^0 through 10^38)
-# Exercises table entries for various scale_adj values.
-# ===========================================================================
 
-# scale_adj=11 (exercises table[11] = 10^11)
-# DECIMAL(10,0)/DECIMAL(10,0): result_scale=max(6,0+10+1)=11, prec=21, scale_adj=11
+# P2: exercise representative 10^scale_adj table entries and adjusted scales.
 query I
 SELECT spark_decimal_div(1::DECIMAL(10,0), 3::DECIMAL(10,0));
 ----
 0.33333333333
 
-# scale_adj=6 (exercises table[6] = 10^6)
-# DECIMAL(5,0)/DECIMAL(5,0): result_scale=max(6,0+5+1)=6, prec=11, scale_adj=6
 query I
 SELECT spark_decimal_div(1::DECIMAL(5,0), 7::DECIMAL(5,0));
 ----
 0.142857
 
-# scale_adj=18 (exercises table[18] = 10^18)
-# DECIMAL(20,0)/DECIMAL(20,0): result_scale=21->adjusted to 18, scale_adj=18
 query I
 SELECT spark_decimal_div(1::DECIMAL(20,0), 3::DECIMAL(20,0));
 ----
 0.333333333333333333
 
-# scale_adj=8 (exercises table[8] = 10^8)
-# DECIMAL(30,0)/DECIMAL(30,0): scale_adj=8
 query I
 SELECT spark_decimal_div(1::DECIMAL(30,0), 3::DECIMAL(30,0));
 ----
 0.33333333
 
-# Verify identity: 100/1 with scale_adj=6
 query I
 SELECT spark_decimal_div(100::DECIMAL(38,0), 1::DECIMAL(5,0));
 ----
 100.000000
 
-# ===========================================================================
-# P3: __builtin_mul_overflow correctness
-# Tests both fast path (no overflow) and slow path (overflow to 256-bit).
-# ===========================================================================
 
-# Fast path: small values, no overflow
+# P3: cover the 128-bit fast path and the 256-bit product path. The 32-digit
+# numerator multiplied by 10^8 exceeds unsigned __int128.
 query I
 SELECT spark_decimal_div(10::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 10.000000
 
-# Fast path: medium values below overflow threshold
 query I
 SELECT spark_decimal_div(1000000000000000000000000000000::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 1000000000000000000000000000000.000000
 
-# Slow path: values that overflow 128 bits (32 nines * 10^8 > 2^128)
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 1.00::DECIMAL(5,2));
 ----
 99999999999999999999999999999999.000000
 
-# Slow path: division with rounding
 query I
 SELECT spark_decimal_div(99999999999999999999999999999998::DECIMAL(38,0), 3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333332.666667
 
-# Slow path: negative values
 query I
 SELECT spark_decimal_div(-99999999999999999999999999999999::DECIMAL(38,0), 2.00::DECIMAL(5,2));
 ----
 -49999999999999999999999999999999.500000
 
-# Zero numerator (no overflow possible)
 query I
 SELECT spark_decimal_div(0::DECIMAL(38,0), 5.00::DECIMAL(5,2));
 ----
 0.000000
 
-# ===========================================================================
-# P4: 256-bit division algorithm (Div256By128)
-# Tests the slow path division thoroughly with various quotient/remainder
-# combinations to verify the 256-bit division produces correct results.
-# ===========================================================================
 
-# Exact division on slow path (no remainder)
+# P4: cover 256-bit division with exact, non-half, half, and signed results.
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333333.000000
 
-# Slow path with small remainder (should NOT round up: 2*1 < 7)
-# 99999999999999999999999999999999 / 7.00: scale_adj=8
-# (99999999999999999999999999999999 * 10^8) / 700
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 7.00::DECIMAL(5,2));
 ----
 14285714285714285714285714285714.142857
 
-# Slow path: exact half division
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), 2.00::DECIMAL(5,2));
 ----
 49999999999999999999999999999999.500000
 
-# Slow path: both operands negative (result positive)
 query I
 SELECT spark_decimal_div(-99999999999999999999999999999999::DECIMAL(38,0), -3.00::DECIMAL(5,2));
 ----
 33333333333333333333333333333333.000000
 
-# Slow path: positive / negative (result negative)
 query I
 SELECT spark_decimal_div(99999999999999999999999999999999::DECIMAL(38,0), -2.00::DECIMAL(5,2));
 ----
 -49999999999999999999999999999999.500000
 
-# ===========================================================================
-# P5: Vector-constant specialization
-# Tests division where one operand is a constant literal across all rows.
-# ===========================================================================
 
+# P5: exercise vector/constant specialization in both operand positions.
 statement ok
 CREATE TABLE p5_data (id INTEGER, val DECIMAL(10,2));
 
@@ -177,7 +137,6 @@ statement ok
 INSERT INTO p5_data VALUES
     (1, 10.00), (2, 20.00), (3, 30.00), (4, 40.00), (5, 50.00);
 
-# Column / constant (common case: e.g. price / tax_rate)
 query II
 SELECT id, spark_decimal_div(val, 3.00::DECIMAL(10,2)) FROM p5_data ORDER BY id;
 ----
@@ -187,7 +146,6 @@ SELECT id, spark_decimal_div(val, 3.00::DECIMAL(10,2)) FROM p5_data ORDER BY id;
 4	13.3333333333333
 5	16.6666666666667
 
-# Constant / column
 query II
 SELECT id, spark_decimal_div(100.00::DECIMAL(10,2), val) FROM p5_data ORDER BY id;
 ----
@@ -197,12 +155,8 @@ SELECT id, spark_decimal_div(100.00::DECIMAL(10,2), val) FROM p5_data ORDER BY i
 4	2.5000000000000
 5	2.0000000000000
 
-# ===========================================================================
-# P6: Branch prediction (__builtin_expect)
-# Tests unlikely paths (div-by-zero, overflow) mixed with likely paths
-# to verify correct behavior on both sides of predicted branches.
-# ===========================================================================
 
+# P6: mix likely divisions with zero divisors and cover the no-scaling path.
 statement ok
 CREATE TABLE p6_mixed (id INTEGER, a DECIMAL(10,2), b DECIMAL(10,2));
 
@@ -214,7 +168,6 @@ INSERT INTO p6_mixed VALUES
     (4, 40.00, 0.00),
     (5, 50.00, 11.00);
 
-# Mix of normal divisions and div-by-zero (unlikely branch)
 query II
 SELECT id, spark_decimal_div(a, b) FROM p6_mixed ORDER BY id;
 ----
@@ -224,40 +177,26 @@ SELECT id, spark_decimal_div(a, b) FROM p6_mixed ORDER BY id;
 4	NULL
 5	4.5454545454545
 
-# No-scaling path (pow10_val == 0): DECIMAL(38,18) / DECIMAL(3,0)
-# result_scale=max(6, 18+3+1)=22 -> adjusted
-# result_precision=(38-18)+0+22=42 -> capped to 38
-# int_digits=42-22=20, min_scale=min(22,6)=6, 38-20=18
-# adjusted_scale=max(18,6)=18, scale_adj=18-18+0=0
 query I
 SELECT spark_decimal_div(1.000000000000000000::DECIMAL(38,18), 3::DECIMAL(3,0));
 ----
 0.333333333333333333
 
-# ===========================================================================
-# P7: constexpr power-of-10 table
-# Already implemented in P2. Verify the constexpr table produces correct
-# values by testing boundary entries.
-# ===========================================================================
 
-# First entry (10^0 = 1): identity division
+# P7: exercise power-of-ten table boundary entries, including 10^0.
 query I
 SELECT spark_decimal_div(7.00::DECIMAL(10,2), 7.00::DECIMAL(10,2));
 ----
 1.0000000000000
 
-# Large scale_adj entry: DECIMAL(5,0)/DECIMAL(5,0) uses 10^6
 query I
 SELECT spark_decimal_div(22::DECIMAL(5,0), 7::DECIMAL(5,0));
 ----
 3.142857
 
-# ===========================================================================
-# P8: __restrict pointer qualifiers
-# Tests that input and output vectors are processed correctly when
-# reading from two input vectors and writing to a result vector.
-# ===========================================================================
 
+# P8: exercise restricted input/output pointers over 50 rows and check that
+# vector results remain non-NULL and deterministic.
 statement ok
 CREATE TABLE p8_vectors (a DECIMAL(10,2), b DECIMAL(10,2));
 
@@ -266,13 +205,11 @@ INSERT INTO p8_vectors
     SELECT (i * 7.13)::DECIMAL(10,2), (i * 3.17 + 1)::DECIMAL(10,2)
     FROM range(1, 51) t(i);
 
-# Verify all 50 rows produce non-NULL results (no aliasing corruption)
 query I
 SELECT COUNT(*) FROM p8_vectors WHERE spark_decimal_div(a, b) IS NOT NULL;
 ----
 50
 
-# Verify results are deterministic (same query twice)
 query I
 SELECT COUNT(*) FROM (
     SELECT spark_decimal_div(a, b) AS r1 FROM p8_vectors
@@ -282,67 +219,53 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# ===========================================================================
-# P9: Branchless rounding and sign application
-# Tests all four sign combinations and rounding edge cases to verify
-# correct behavior regardless of branchless/branching implementation.
-# ===========================================================================
 
-# Positive / positive, rounds up (2*remainder >= divisor)
+# P9: cover ROUND_HALF_UP ties, non-ties, and all four sign combinations.
 query I
 SELECT spark_decimal_div(10.00::DECIMAL(10,2), 3.00::DECIMAL(10,2));
 ----
 3.3333333333333
 
-# Positive / positive, exact (no rounding needed)
 query I
 SELECT spark_decimal_div(10.00::DECIMAL(10,2), 2.00::DECIMAL(10,2));
 ----
 5.0000000000000
 
-# Negative / positive
 query I
 SELECT spark_decimal_div(-10.00::DECIMAL(10,2), 3.00::DECIMAL(10,2));
 ----
 -3.3333333333333
 
-# Positive / negative
 query I
 SELECT spark_decimal_div(10.00::DECIMAL(10,2), -3.00::DECIMAL(10,2));
 ----
 -3.3333333333333
 
-# Negative / negative (result positive)
 query I
 SELECT spark_decimal_div(-10.00::DECIMAL(10,2), -3.00::DECIMAL(10,2));
 ----
 3.3333333333333
 
-# Exact half: 1/2 = 0.5 (remainder == half of divisor, rounds up)
 query I
 SELECT spark_decimal_div(1.00::DECIMAL(10,2), 2.00::DECIMAL(10,2));
 ----
 0.5000000000000
 
-# Just below half: 1/3 = 0.333... (remainder < half, no round up)
 query I
 SELECT spark_decimal_div(1.00::DECIMAL(10,2), 3.00::DECIMAL(10,2));
 ----
 0.3333333333333
 
-# Just above half: 2/3 = 0.666... (remainder > half, rounds up)
 query I
 SELECT spark_decimal_div(2.00::DECIMAL(10,2), 3.00::DECIMAL(10,2));
 ----
 0.6666666666667
 
-# Negative with rounding: -2/3 rounds away from zero
 query I
 SELECT spark_decimal_div(-2.00::DECIMAL(10,2), 3.00::DECIMAL(10,2));
 ----
 -0.6666666666667
 
-# Large negative / large positive with rounding
 query I
 SELECT spark_decimal_div(-999999.99::DECIMAL(10,2), 7.00::DECIMAL(10,2));
 ----

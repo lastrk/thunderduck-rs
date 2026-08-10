@@ -7,17 +7,16 @@
 //! and NO `thunderduck_core::types::TypeInferenceEngine`. See
 //! `inv10_no_disallowed_imports_from_transpiler_v2`.
 //!
-//! **Anti-SQL anchor (§2.1):** `arrow_val_to_literal()` uses exhaustive
+//! `arrow_val_to_literal()` uses exhaustive
 //! typed dispatch on the Arrow value's data type and NEVER emits an
 //! `Ok("NULL")` catch-all. Unhandled Arrow types return
-//! [`EmissionError::Unsupported`] with `kind: ProtoShape`. This is mechanically enforced
-//! by `arrow_val_no_catch_all_ok_null_source_grep`.
+//! [`EmissionError::Unsupported`] with `kind: ProtoShape` for unhandled types.
 //!
-//! **No `Sql` opaque variant (§2.2):** `RelType::Sql` surfaces as
+//! `RelType::Sql` surfaces as
 //! [`EmissionError::Unsupported`] (`kind: ProtoShape`) — the SparkSQL path belongs to
 //! `parser_v2`.
 //!
-//! **First-class plan_id (§2.3):** `CommonOp::Join` carries
+//! `CommonOp::Join` carries
 //! `left_plan_ids: Vec<i64>` / `right_plan_ids: Vec<i64>`; every
 //! `UnresolvedColumn` produced by the expression converter carries
 //! `plan_id: Option<i64>` sourced from `UnresolvedAttribute::plan_id`.
@@ -45,6 +44,7 @@ use thunderduck_core::transpiler_v2::expression::{
     StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
     UpdateFieldsExpression, WindowFunction,
 };
+use thunderduck_core::transpiler_v2::generator::Generator;
 use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::types::{DataType, StructField, StructType};
@@ -52,59 +52,29 @@ use thunderduck_core::types::{DataType, StructField, StructType};
 use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
 use crate::proto::spark::connect as proto;
 
-/// Normalize a decimal literal's `(precision, scale)` to what Spark's
-/// `LiteralValueProtoConverter.decodeDecimal` would compute on the server
-/// side. PySpark sends a `Decimal` proto carrying the raw value string plus
-/// (optionally) the wire-supplied `precision`/`scale`; Spark reconciles the
-/// two by taking the **maximum** of the value-derived shape and the
-/// wire-supplied shape, then clamping to `DecimalType.MAX_PRECISION = 38`.
-///
-/// Algorithm (mirrors Spark line-for-line):
-/// 1. Parse `value` → `(vp, vs)` where `vs` is the fractional-digit count
-///    and `vp = max(int_digits_excluding_leading_zeros + vs, vs, 1)` — this
-///    matches `Decimal.set(BigDecimal)` bumping `_precision` up to
-///    `max(bigDecimal.precision, bigDecimal.scale)`.
-/// 2. `p_wire = server_precision.unwrap_or(vp)`.
-/// 3. `s_wire = server_scale.unwrap_or(vs)`.
-/// 4. `p_out = min(38, max(vp, p_wire))` — DecimalType.MAX_PRECISION clamp.
-/// 5. `s_out = max(vs, s_wire)`.
-/// 6. If `s_out > p_out` bump `p_out = min(s_out, 38)` to preserve the
-///    `precision >= scale` invariant on malformed wire input.
-///
-/// Sources: Apache Spark 4.1.1
-/// `sql/connect/common/src/main/scala/org/apache/spark/sql/connect/common/LiteralValueProtoConverter.scala:555-571`
-/// and `sql/api/src/main/scala/org/apache/spark/sql/types/Decimal.scala:138-151`.
-///
-/// Corpus anchor: `cond-004` — Spark widens
-/// `coalesce(Decimal(10,2), lit(Decimal("0.00")))` to `Decimal(10,2)`.
-/// PySpark sends `(value="0.00", precision=10, scale=0)`; value-derived is
-/// `(2, 2)`; the max-of-value-and-wire rule yields `(10, 2)`, which unifies
-/// with `Decimal(10,2)` as-is.
+/// Normalize a decimal literal as Spark's Connect decoder does. Derive the
+/// shape from `value`, default absent wire fields to that shape, take the
+/// component-wise maxima, clamp precision to 38, then repair malformed input
+/// so `precision >= scale`. See Spark 4.1.1
+/// `LiteralValueProtoConverter.decodeDecimal` and `Decimal.set(BigDecimal)`.
 fn normalize_decimal_literal(
     value: &str,
     server_precision: Option<u8>,
     server_scale: Option<u8>,
 ) -> (u8, u8) {
-    // Step 1: value-derived (vp, vs) — shared, unclamped computation in
-    // `transpiler_v2::expression::decimal_value_precision_scale`.
     let (vp, vs) = decimal_value_precision_scale(value);
 
-    // Steps 2-3: wire fields default to the value-derived shape.
     let p_wire = server_precision.unwrap_or(vp);
     let s_wire = server_scale.unwrap_or(vs);
 
-    // Steps 4-5: max-of-value-and-wire, clamped to MAX_PRECISION = 38.
     let mut p_out = vp.max(p_wire).min(38);
     let s_out = vs.max(s_wire);
 
-    // Step 6: preserve `precision >= scale` on malformed wire input.
     if s_out > p_out {
         p_out = s_out.min(38);
     }
     (p_out, s_out)
 }
-
-// ── Public API ─────────────────────────────────────────────────────────────
 
 /// τ's protobuf → [`CommonAst`] converter.
 pub struct V2RelationConverter {
@@ -169,9 +139,6 @@ impl V2RelationConverter {
             RelType::Sample(s) => self.convert_sample(s),
             RelType::SampleBy(s) => self.convert_sample_by(s),
             RelType::Range(r) => self.convert_range(r),
-            // Cosmetic ops per Spark 4 semantics — semantically no-op.
-            // Thunderduck ignores them and continues with the input relation
-            // (ADR-001 "result-irrelevant cosmetic" carve-out).
             RelType::Hint(h) => self.convert_input(h.input.as_deref(), "Hint"),
             RelType::RepartitionByExpression(r) => {
                 self.convert_input(r.input.as_deref(), "RepartitionByExpression")
@@ -258,9 +225,6 @@ impl V2RelationConverter {
     fn convert_unpivot(&mut self, u: &proto::Unpivot) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(u.input.as_deref(), "Unpivot")?;
 
-        // Extract id column names — the τ AST stores column names. Anything
-        // richer than a bare `UnresolvedAttribute` is a Thunderduck-boundary
-        // shape.
         let mut ids: Vec<String> = Vec::with_capacity(u.ids.len());
         for e in &u.ids {
             ids.push(extract_column_name(e).require_proto(
@@ -269,8 +233,6 @@ impl V2RelationConverter {
             )?);
         }
 
-        // Extract value column names; None ⇒ analyzer expands to all non-id
-        // input columns per Spark's default.
         let values: Vec<String> = match u.values.as_ref() {
             Some(v) => {
                 let mut out = Vec::with_capacity(v.values.len());
@@ -310,10 +272,7 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::StatFreqItems`. The proto's `support` is optional; the
-    /// PySpark client default is `0.01` (per
-    /// `pyspark/sql/dataframe.py::freqItems`) which τ substitutes when the
-    /// field is None.
+    /// Convert `proto::StatFreqItems`, defaulting omitted support to `0.01`.
     fn convert_freq_items(&mut self, f: &proto::StatFreqItems) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(f.input.as_deref(), "FreqItems")?;
         let support = f.support.unwrap_or(0.01);
@@ -324,8 +283,7 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::Sample`. Proto `deterministic_order` (physical hint) is
-    /// dropped at τ conversion.
+    /// Convert `proto::Sample`; physical ordering hints are ignored.
     fn convert_sample(&mut self, s: &proto::Sample) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(s.input.as_deref(), "Sample")?;
         Ok(CommonAst::new(CommonOp::Sample {
@@ -337,9 +295,7 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::StatSampleBy`. Each stratum must decode as an
-    /// `Expression::Literal`; anything else is a loud proto-shape error
-    /// (defensive per the connect-server val() lesson in CLAUDE.md gotcha #9).
+    /// Convert `proto::StatSampleBy`; strata must be literals.
     fn convert_sample_by(&mut self, s: &proto::StatSampleBy) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(s.input.as_deref(), "SampleBy")?;
         let col_proto = s
@@ -370,22 +326,12 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::Range` into a `CommonOp::TableFunction { name: "range" }`.
-    ///
-    /// Proto fields: `start` (optional, default 0), `end` (required), `step`
-    /// (required, client-side default 1). `num_partitions` is a distribution
-    /// hint irrelevant to a single-node engine and is silently dropped (same
-    /// "cosmetic carve-out" precedent as the `Repartition` / `Hint` arms).
-    ///
-    /// The resulting `TableFunction` node carries three `Expression::Literal`
-    /// `Long` args in `(start, end, step)` order — the same shape the SQL
-    /// front-end produces for `SELECT * FROM range(...)`.
+    /// Convert `proto::Range` into a `range` table function.
     fn convert_range(&mut self, r: &proto::Range) -> Result<CommonAst, EmissionError> {
         let long_lit = |v: i64| -> Expression { lit(LiteralValue::Long(v), DataType::Long) };
         let start = long_lit(r.start.unwrap_or(0));
         let end = long_lit(r.end);
         let step = long_lit(r.step);
-        // num_partitions is silently ignored (single-node engine).
         Ok(CommonAst::new(CommonOp::TableFunction {
             name: "range".to_owned(),
             args: vec![start, end, step],
@@ -393,9 +339,7 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::StatCrosstab`. The analyzer rejects this variant as a
-    /// Thunderduck-boundary punt (`Crosstab[dynamic-values]`) — output
-    /// columns are `DISTINCT(col2)` which is unknowable at plan time.
+    /// Convert `proto::StatCrosstab`; schema discovery occurs in the service.
     fn convert_crosstab(&mut self, c: &proto::StatCrosstab) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(c.input.as_deref(), "Crosstab")?;
         Ok(CommonAst::new(CommonOp::Crosstab {
@@ -405,23 +349,8 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::StatCov` (`df.stat.cov(col1, col2)`).
-    ///
-    /// Desugars to a global `Aggregate` (no grouping) whose single aggregate
-    /// expression is `covar_samp(COALESCE(col1, 0), COALESCE(col2, 0))`.
-    /// Both DuckDB and Spark expose `covar_samp` natively; τ's type inference
-    /// already registers the name (returns `Double`, always nullable).
-    ///
-    /// **NULL semantics (Spark parity):** Spark's `StatFunctions.calculateCovImpl`
-    /// calls `ds.na.fill(0L)` before aggregating — NULLs in numeric columns
-    /// are replaced with zero, so rows with a NULL in one column still
-    /// participate in the covariance (contributing zero for the missing value).
-    /// DuckDB's bare `covar_samp` skips NULL pairs entirely, which produces a
-    /// different result when NULLs are present.  Wrapping each column ref in
-    /// `COALESCE(col, 0)` aligns DuckDB with Spark.
-    ///
-    /// PySpark wire contract: single row, single column; the client extracts
-    /// `table[0][0].as_py()` — column name is immaterial.
+    /// Convert `proto::StatCov`, replacing NULL numeric inputs with zero to
+    /// match Spark's `na.fill(0L)` behavior.
     fn convert_cov(&mut self, c: &proto::StatCov) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(c.input.as_deref(), "StatCov")?;
         let col1 = coalesce_zero(&c.col1);
@@ -439,17 +368,8 @@ impl V2RelationConverter {
         )))
     }
 
-    /// Convert `proto::StatCorr` (`df.stat.corr(col1, col2)`).
-    ///
-    /// Desugars to a global `Aggregate` with `corr(col1, col2)`.  Spark only
-    /// supports the Pearson correlation coefficient; the PySpark client
-    /// validates this client-side, but the proto carries an optional `method`
-    /// field — τ rejects non-Pearson methods as a Spark-emulated error (they
-    /// would also fail Spark-side).
-    ///
-    /// PySpark wire contract: single row, single column (`table[0][0].as_py()`).
+    /// Convert `proto::StatCorr`; only Pearson correlation is supported.
     fn convert_corr(&mut self, c: &proto::StatCorr) -> Result<CommonAst, EmissionError> {
-        // Validate method if present.
         if let Some(ref method) = c.method {
             if !method.eq_ignore_ascii_case("pearson") {
                 return Err(EmissionError::Unsupported {
@@ -477,34 +397,12 @@ impl V2RelationConverter {
         )))
     }
 
-    /// Convert `proto::StatApproxQuantile` (`df.stat.approxQuantile(...)`).
-    ///
-    /// Spark uses a Greenwald-Khanna sketch whose accuracy depends on
-    /// `relative_error`.  On small datasets (the corpus witnesses) the sketch
-    /// returns exact order statistics (actual data elements).  τ maps to
-    /// DuckDB's exact `quantile_disc` (discrete sample value) which matches
-    /// the small-data behavior; `relative_error` is intentionally ignored
-    /// because exact computation subsumes any accuracy parameter.
-    ///
-    /// PySpark wire contract: single row, single column of type
-    /// `Array(Array(Double))`.  Outer array has one element per input column;
-    /// inner array has one element per probability.  The client decodes as
-    /// `[q.as_py() for q in table[0][0]]`.
-    ///
-    /// Desugars to a global `Aggregate` whose single aggregate expression is
-    /// a nested `ArrayLiteral`:
-    /// ```text
-    /// [[percentile_approx(col1, p1), percentile_approx(col1, p2), ...],
-    ///  [percentile_approx(col2, p1), percentile_approx(col2, p2), ...]]
-    /// ```
-    /// Each `percentile_approx` call flows through the existing
-    /// `render_aggregate` emission arm which maps to `quantile_disc`.
+    /// Convert `proto::StatApproxQuantile` to nested `quantile_disc` arrays.
     fn convert_approx_quantile(
         &mut self,
         a: &proto::StatApproxQuantile,
     ) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(a.input.as_deref(), "StatApproxQuantile")?;
-        // Build per-column inner arrays: [percentile_approx(col, p1), ... , percentile_approx(col, pN)]
         let per_col_arrays: Vec<Expression> = a
             .cols
             .iter()
@@ -529,7 +427,6 @@ impl V2RelationConverter {
                 })
             })
             .collect();
-        // Outer array wrapping per-column arrays.
         let outer = Expression::ArrayLiteral(ArrayLiteralExpression {
             elements: per_col_arrays,
             element_type: DataType::Array(Box::new(DataType::Double), true),
@@ -542,30 +439,7 @@ impl V2RelationConverter {
         )))
     }
 
-    /// Convert `proto::ToSchema` (Spark `df.to(schema)`).
-    ///
-    /// Desugars to `CommonOp::Project` whose projections are, per target field
-    /// in TARGET ORDER: `Alias(Cast(UnresolvedColumn(name), target_type), name)`.
-    ///
-    /// The unconditional CAST is intentional — the converter is untyped; a
-    /// same-type CAST is a no-op for value, wire type, and nullability
-    /// (expression.rs:732 — non-try Cast preserves child nullability for
-    /// non-string sources).
-    ///
-    /// # Deviations from Spark 4.1.1 `Dataset.to`
-    ///
-    /// The following behaviours are deliberately out of scope (all unexercised
-    /// by the corpus tests):
-    ///
-    /// - **Missing nullable target column**: Spark null-fills columns present
-    ///   in the target schema but absent in the source; τ lets the unresolved
-    ///   column propagate to the analyzer, which surfaces a resolution error.
-    /// - **Analysis-time diagnostics**: Spark raises
-    ///   `NULLABLE_COLUMN_OR_FIELD`, `INVALID_COLUMN_OR_FIELD_DATA_TYPE`,
-    ///   or `AMBIGUOUS_COLUMN_OR_FIELD` during analysis; τ does not emulate
-    ///   these error classes.
-    /// - **Nested struct/array/map reconciliation**: Spark recursively
-    ///   reconciles nested complex types; τ applies a flat top-level CAST only.
+    /// Convert `proto::ToSchema` into a projection of casts in target order.
     fn convert_to_schema(&mut self, ts: &proto::ToSchema) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(ts.input.as_deref(), "ToSchema")?;
         let schema_proto = ts
@@ -608,8 +482,6 @@ impl V2RelationConverter {
 
     fn convert_deduplicate(&mut self, d: &proto::Deduplicate) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(d.input.as_deref(), "Deduplicate")?;
-        // `all_columns_as_keys=true` → dedupe on all columns (empty on_columns).
-        // Otherwise use column_names.
         let on_columns = if d.all_columns_as_keys.unwrap_or(false) {
             Vec::new()
         } else {
@@ -637,7 +509,6 @@ impl V2RelationConverter {
         wcr: &proto::WithColumnsRenamed,
     ) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(wcr.input.as_deref(), "WithColumnsRenamed")?;
-        // Proto 3.4+ uses `rename_columns_map` (repeated Rename with existing/new).
         let mut renames: Vec<(String, String)> = Vec::new();
         for r in &wcr.renames {
             renames.push((r.col_name.clone(), r.new_col_name.clone()));
@@ -675,10 +546,6 @@ impl V2RelationConverter {
 
     fn convert_drop(&mut self, d: &proto::Drop) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(d.input.as_deref(), "Drop")?;
-        // Spark's `df.drop(col1, col2, ...)` may arrive via `column_names`
-        // (raw strings, most common) or `columns` (Expression references).
-        // For Column references we accept only bare `UnresolvedAttribute`
-        // shapes; anything more elaborate is a Thunderduck-boundary.
         let mut drop_names: Vec<String> = d.column_names.clone();
         for col_expr in &d.columns {
             use proto::expression::ExprType;
@@ -712,7 +579,6 @@ impl V2RelationConverter {
         let mut assignments: Vec<(String, thunderduck_core::transpiler_v2::Expression)> =
             Vec::with_capacity(wc.aliases.len());
         for alias in &wc.aliases {
-            // Proto contract: exactly one name part for a scalar column.
             let name = single_name_part(
                 &alias.name,
                 "WithColumns::Alias::multi_name",
@@ -736,23 +602,11 @@ impl V2RelationConverter {
             Some(i) => self.convert(i)?,
             None => CommonAst::new(CommonOp::SingleRow),
         };
-        // Spark's `F.posexplode(arr).alias("pos", "val")` arrives as a single
-        // proto `Alias(name=[pos, val], expr=UnresolvedFunction("posexplode", [arr]))`.
-        // A one-slot projection needs to yield two SELECT-list expressions
-        // (position + value). Detect the multi-name posexplode Alias here and
-        // expand into two synthetic FunctionCall projections that
-        // `emission::render_function_call` renders as `generate_subscripts(arr, 1) - 1`
-        // and `UNNEST(arr)` respectively. Corpus: arr-017.
-        let mut projections: Vec<Expression> = Vec::with_capacity(p.expressions.len());
-        for e in &p.expressions {
-            if let Some(pair) = self.expr.try_convert_posexplode_multi_alias(e)? {
-                let (pos_proj, val_proj) = pair;
-                projections.push(pos_proj);
-                projections.push(val_proj);
-            } else {
-                projections.push(self.expr.convert(e)?);
-            }
-        }
+        let projections = p
+            .expressions
+            .iter()
+            .map(|expression| self.expr.convert(expression))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(CommonAst::new(CommonOp::Project {
             input: Box::new(input),
             projections,
@@ -809,9 +663,6 @@ impl V2RelationConverter {
     fn convert_aggregate(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
         use proto::aggregate::GroupType;
         use thunderduck_core::transpiler_v2::ast::GroupingKind;
-        // Pass 60: PIVOT is a first-class CommonOp — not an Aggregate.
-        // Bail into the dedicated pivot conversion before the GroupType
-        // discriminator collapses into GroupingKind (which has no Pivot arm).
         if a.group_type() == GroupType::Pivot {
             return self.convert_pivot(a);
         }
@@ -825,12 +676,6 @@ impl V2RelationConverter {
         let input = self.convert_input(a.input.as_deref(), "Aggregate")?;
         let grouping = self.expr.convert_all(&a.grouping_expressions)?;
         let agg_exprs = self.expr.convert_all(&a.aggregate_expressions)?;
-        // N7: `grouped_aggregate` builds the output list as `grouping ++
-        // agg_exprs` (Spark's DataFrame `.groupBy(...).agg(...)` semantics)
-        // and always leaves `grouping_sets`/`having` empty — the DataFrame
-        // `groupingSets` path stays a boundary error (ADR-022) and HAVING is
-        // a SparkSQL-only concept (DataFrame post-agg filtering is a
-        // separate Filter over the Aggregate).
         Ok(CommonAst::new(grouped_aggregate(
             input,
             grouping,
@@ -839,13 +684,8 @@ impl V2RelationConverter {
         )))
     }
 
-    /// Convert `Aggregate` protos whose `group_type` is `PIVOT` into a
-    /// [`CommonOp::Pivot`]. Grouping expressions map 1:1; the pivot column
-    /// and (optional) pivot value literals live in the proto `pivot` sub-msg.
-    /// Aggregate expressions come from `aggregate_expressions`. Empty
-    /// `pivot_values` is legal — signals "eager discovery" per Spark
-    /// semantics; DuckDB PIVOT will auto-materialise distinct values at
-    /// execution.
+    /// Convert a PIVOT aggregate into [`CommonOp::Pivot`]. Empty values request
+    /// service-layer discovery.
     fn convert_pivot(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
         let pivot_proto = a.pivot.as_ref().require_proto(
             "Aggregate::Pivot::missing_pivot",
@@ -919,15 +759,8 @@ impl V2RelationConverter {
             }
             _ => (None, vec![]),
         };
-        // Prefer the Spark-visible JSON schema (from `_schema.json()`) over
-        // the Arrow-derived schema. PySpark's client dedups struct field
-        // names for the Arrow wire (`_deduplicate_field_names`) but sends the
-        // ORIGINAL Spark schema in `lr.schema` — the JSON path preserves
-        // duplicate field names (e.g. `arrays_zip("tags","tags")` →
-        // `Struct<tags, tags>`), which the round-trip through
-        // `sparkSession.createDataFrame(rows, df.schema)` needs to match
-        // Spark's reference behaviour on arr-012. Fall back to the Arrow
-        // schema only when no `lr.schema` is provided.
+        // Prefer Spark's logical schema: Arrow IPC may deduplicate field names
+        // and does not preserve Spark's nullability contract.
         let schema = match lr.schema.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(s) => parse_type_str_to_struct(s),
             None => arrow_schema.unwrap_or_else(StructType::empty),
@@ -966,7 +799,6 @@ impl V2RelationConverter {
         let right = self.convert(right_proto)?;
         let mut left_plan_ids: Vec<i64> = left_ids.into_iter().collect();
         let mut right_plan_ids: Vec<i64> = right_ids.into_iter().collect();
-        // Deterministic ordering — HashSet iteration is unstable.
         left_plan_ids.sort_unstable();
         right_plan_ids.sort_unstable();
         Ok(CommonAst::new(CommonOp::Join {
@@ -975,21 +807,13 @@ impl V2RelationConverter {
             join_type,
             condition,
             using_columns: j.using_columns.clone(),
-            // Spark Connect's `Join.JoinType` proto has no NATURAL variant —
-            // the DataFrame front-end can never produce a NATURAL join; only
-            // the SparkSQL front-end (`v2_lowering.rs`) can set this true.
             natural: false,
-            // Spark 4.x's `LateralJoin` proto relation is deferred to a
-            // future pass — the DataFrame front-end has no equivalent syntax
-            // for explicit `JOIN LATERAL (subquery)` yet.
             lateral: false,
             left_plan_ids,
             right_plan_ids,
         }))
     }
 }
-
-// ── Private expression converter ───────────────────────────────────────────
 
 struct V2ExpressionConverter;
 
@@ -1020,10 +844,6 @@ impl V2ExpressionConverter {
             ExprType::Alias(alias) => self.convert_alias(alias),
             ExprType::Cast(cast) => self.convert_cast(cast),
             ExprType::UnresolvedStar(star) => {
-                // Spark's `select("address.*")` sends `unparsed_target = "address.*"`
-                // (including the trailing `.*`). The analyzer wants just the
-                // qualifier (`"address"`) — strip the star suffix. A bare `*`
-                // arrives as `None`. Corpus witness: `struct-008`.
                 let qualifier = star.unparsed_target.as_ref().map(|s| {
                     if let Some(base) = s.strip_suffix(".*") {
                         base.to_owned()
@@ -1083,21 +903,9 @@ impl V2ExpressionConverter {
                 }))
             }
             ExprType::ExpressionString(es) => {
-                // Spark's `F.expr("<sql>")` / `df.selectExpr("<sql>")` — a
-                // raw SparkSQL expression fragment. Route through τ's
-                // SparkSQL parser so the analyzer can type-resolve the
-                // resulting expression (RawSql passthrough would leak an
-                // `Unresolved` DataType into `analyze_plan(Schema)` and
-                // PySpark would reject the response with
-                // `PySparkValueError: data type unparsed`).
                 thunderduck_core::parser_v2::SparkSqlParserV2::parse_expression(&es.expression)
             }
             ExprType::UpdateFields(uf) => {
-                // Spark Connect chains withField / dropFields as nested
-                // `UpdateFields` protos — each carries one op and points at
-                // its predecessor via `struct_expression`. Flatten into a
-                // single [`UpdateFieldsExpression`] with an ordered
-                // `updates: Vec<(String, Option<Expression>)>`.
                 let (base_proto, ops) = flatten_update_fields(uf);
                 let base_proto = base_proto.require_proto(
                     "UpdateFields::struct_expression::None",
@@ -1135,14 +943,6 @@ impl V2ExpressionConverter {
             "SortOrder has no child expression",
         )?;
         let expr = self.convert(child)?;
-        // Mirrors Spark's `SparkConnectPlanner.scala::transformSortOrder`,
-        // which decodes the proto with catch-all defaults (not a
-        // derive-from-direction rule — that rule is `SortOrder.scala`'s
-        // `defaultNullOrdering`, which only applies where Spark constructs a
-        // `SortOrder` from SQL text without an explicit ordering; the SQL
-        // front-end's `lower_order_by_expr` already matches that separately).
-        // The proto decoder's unspecified-field defaults are Descending /
-        // NullsLast, not Ascending / NullsFirst.
         let direction = match so.direction() {
             ProtoSD::Ascending => SortDirection::Ascending,
             _ => SortDirection::Descending,
@@ -1220,9 +1020,6 @@ impl V2ExpressionConverter {
                     }),
                     Some(PB::Value(v)) => {
                         let expr = self.convert(v)?;
-                        // Spark encodes offsets as signed
-                        // numeric literals: negative = PRECEDING,
-                        // positive = FOLLOWING. Match here.
                         if let Expression::Literal(l) = &expr {
                             use thunderduck_core::transpiler_v2::expression::LiteralValue as LV;
                             let sign: Option<i64> = match &l.value {
@@ -1312,7 +1109,6 @@ impl V2ExpressionConverter {
         if name == "*" {
             return Ok(Expression::Star(StarExpression { qualifier: None }));
         }
-        // §2.3: plan_id is first-class (Option<i64>), not string-encoded.
         if let Some(plan_id) = attr.plan_id {
             let col_name = name.split('.').next_back().unwrap_or(name).to_owned();
             return Ok(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -1341,9 +1137,6 @@ impl V2ExpressionConverter {
         &mut self,
         func: &proto::expression::UnresolvedFunction,
     ) -> Result<Expression, EmissionError> {
-        // N5: FunctionCall.name is the canonical, ASCII-lowercase substrate
-        // identity from this point on — Spark's as-written spelling survives
-        // only via the N8 alias / pretty-name overlay, never in `name` itself.
         let name = func.function_name.to_ascii_lowercase();
         let args = self.convert_all(&func.arguments)?;
         if args.len() == 2 {
@@ -1390,7 +1183,6 @@ impl V2ExpressionConverter {
                 }));
             }
         }
-        // CASE WHEN emitted as function "when" with alternating pairs
         if name == "when" && !args.is_empty() {
             let mut branches: Vec<(Expression, Expression)> = Vec::new();
             let mut iter = args.into_iter();
@@ -1406,7 +1198,6 @@ impl V2ExpressionConverter {
                 else_expr,
             }));
         }
-        // IN list emitted as function "in" with (expr, v1, v2, ...) arguments
         if name == "in" && args.len() >= 2 {
             let mut args = args;
             let expr = args.remove(0);
@@ -1415,6 +1206,17 @@ impl V2ExpressionConverter {
                 list: args,
                 negated: false,
             }));
+        }
+        if Generator::is_function(&name) {
+            if func.is_distinct {
+                bail_boundary_proto!(
+                    format!("{name}::distinct"),
+                    "DISTINCT is not valid on a generator function",
+                );
+            }
+            return Ok(Expression::Generator(
+                Generator::from_function(&name, args).expect("generator name checked"),
+            ));
         }
         Ok(Expression::FunctionCall(FunctionCall {
             name,
@@ -1432,6 +1234,10 @@ impl V2ExpressionConverter {
             .as_deref()
             .require_proto("Alias::missing_expr", "Alias has no inner expression")?;
         let expr = self.convert(inner)?;
+        if let Expression::Generator(mut generator) = expr {
+            generator.aliases = alias.name.clone();
+            return Ok(Expression::Generator(generator));
+        }
         let name = alias
             .name
             .first()
@@ -1441,107 +1247,6 @@ impl V2ExpressionConverter {
             expr: Box::new(expr),
             alias: name,
         }))
-    }
-
-    /// If `e` is `Alias(name=[a, b], expr=posexplode(arr))` (or
-    /// `posexplode_outer`), return the two synthetic projections
-    /// `Alias(posexplode_pos(arr), a)` and `Alias(posexplode_val(arr), b)`.
-    /// Otherwise return `Ok(None)` — the caller falls back to normal
-    /// single-expression conversion. Corpus: arr-017.
-    ///
-    /// Encapsulated here (in the expression converter) so `convert_project`
-    /// can splice the two-projection expansion without knowing the proto shape.
-    ///
-    /// **`F.inline` / `F.inline_outer` boundary (Pass 90).** Unlike
-    /// `posexplode`, inline/inline_outer are NOT split at the converter — the
-    /// N-column widening depends on the resolved `Array<Struct<...>>` schema,
-    /// which is only available inside the analyzer. Inline projections reach
-    /// the analyzer as a plain `FunctionCall("inline"|"inline_outer", [arr])`
-    /// and are expanded by `analyzer::expand_inline_projections` (τ's Project
-    /// pre-pass, next to `expand_regex_projections`). Corpus: inl-001, inl-002.
-    ///
-    /// **`F.json_tuple` boundary (Pass 91).** Same shape: `json_tuple(json,
-    /// k1, ..., kN)` reaches the analyzer as a plain `FunctionCall` and is
-    /// expanded by `analyzer::expand_json_tuple_projections` into N synthetic
-    /// `Alias(json_tuple_field(json, "<ki>"), "c<i>")` projections
-    /// (positional `c0, c1, ...` names, matching Spark's
-    /// `Generator.elementSchema`). Multi-alias `json_tuple(...).alias(a, b)`
-    /// is a follow-up — corpus witness (json-002) uses positional names.
-    /// Corpus: json-002.
-    fn try_convert_posexplode_multi_alias(
-        &mut self,
-        e: &proto::Expression,
-    ) -> Result<Option<(Expression, Expression)>, EmissionError> {
-        use proto::expression::ExprType;
-        let Some(ExprType::Alias(alias)) = e.expr_type.as_ref() else {
-            return Ok(None);
-        };
-        // Only two-name aliases participate; single-name aliases route through
-        // the normal `convert_alias` path.
-        if alias.name.len() != 2 {
-            return Ok(None);
-        }
-        let Some(inner) = alias.expr.as_deref() else {
-            return Ok(None);
-        };
-        let Some(ExprType::UnresolvedFunction(func)) = inner.expr_type.as_ref() else {
-            return Ok(None);
-        };
-        let name_lower = func.function_name.to_ascii_lowercase();
-        // `posexplode(arr).alias(pos, val)` → two synthetic projections
-        // `posexplode_pos(arr) AS pos` + `posexplode_val(arr) AS val`.
-        //
-        // `explode(map).alias(k, v)` → two synthetic projections
-        // `map_explode_key(m) AS k` + `map_explode_val(m) AS v`. Spark's
-        // `explode` on a MAP fans out one row per key/value pair; the
-        // two-name Alias is Spark's signal that the operand is a MAP (arrays
-        // reject two-name aliases). Emission converts the synthetic
-        // `map_explode_key/val(m)` names to `UNNEST(map_keys/map_values(m))`.
-        //
-        // Corpus: arr-017 (posexplode), map-007 (map explode).
-        let is_pos = matches!(name_lower.as_str(), "posexplode" | "posexplode_outer");
-        let is_map_explode = matches!(name_lower.as_str(), "explode" | "explode_outer");
-        if !is_pos && !is_map_explode {
-            return Ok(None);
-        }
-        if func.arguments.len() != 1 {
-            bail_boundary_proto!(
-                format!("{}::arity", name_lower),
-                format!(
-                    "`{}` with a two-name Alias requires exactly 1 argument, got {}",
-                    func.function_name,
-                    func.arguments.len()
-                ),
-            );
-        }
-        let arg = self.convert(&func.arguments[0])?;
-        let a_name = alias.name[0].clone();
-        let b_name = alias.name[1].clone();
-        let (a_fn_name, b_fn_name) = if is_pos {
-            ("posexplode_pos", "posexplode_val")
-        } else {
-            ("map_explode_key", "map_explode_val")
-        };
-        let a_fn = Expression::FunctionCall(FunctionCall {
-            name: a_fn_name.to_owned(),
-            args: vec![arg.clone()],
-            distinct: false,
-        });
-        let b_fn = Expression::FunctionCall(FunctionCall {
-            name: b_fn_name.to_owned(),
-            args: vec![arg],
-            distinct: false,
-        });
-        Ok(Some((
-            Expression::Alias(AliasExpression {
-                expr: Box::new(a_fn),
-                alias: a_name,
-            }),
-            Expression::Alias(AliasExpression {
-                expr: Box::new(b_fn),
-                alias: b_name,
-            }),
-        )))
     }
 
     fn convert_cast(
@@ -1570,8 +1275,6 @@ impl V2ExpressionConverter {
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
 /// Extract a column name from a proto `Expression` if it's a bare
 /// `UnresolvedAttribute`. Returns `None` for anything more elaborate — the
 /// caller decides whether to surface a Thunderduck-boundary error.
@@ -1584,11 +1287,7 @@ fn extract_column_name(expr: &proto::Expression) -> Option<String> {
     }
 }
 
-/// Wrap a column reference in `COALESCE(col, 0)` — fills NULLs with zero.
-///
-/// Used by [`V2RelationConverter::convert_cov`] to match Spark's
-/// `StatFunctions.calculateCovImpl` semantics, which calls `na.fill(0L)`
-/// before `covar_samp`.
+/// Wrap a column reference in `COALESCE(col, 0)` for covariance semantics.
 fn coalesce_zero(col_name: &str) -> Expression {
     Expression::FunctionCall(FunctionCall {
         name: "coalesce".to_owned(),
@@ -1607,16 +1306,12 @@ fn null_literal() -> Expression {
     })
 }
 
-/// Construct an [`Expression::Literal`] from a value / data-type pair —
-/// collapses the `Expression::Literal(Literal { value, data_type })`
-/// constructor boilerplate at every typed literal dispatch arm.
+/// Construct a typed literal expression.
 fn lit(value: LiteralValue, data_type: DataType) -> Expression {
     Expression::Literal(Literal { value, data_type })
 }
 
-/// Require `parts` to carry exactly one name part, returning it owned.
-/// Anything else is a `ProtoShape`-kinded [`EmissionError::Unsupported`]
-/// with the caller's `name` / `reason` strings.
+/// Require exactly one name part.
 fn single_name_part(parts: &[String], name: &str, reason: &str) -> Result<String, EmissionError> {
     match parts {
         [n] => Ok(n.clone()),
@@ -1639,15 +1334,7 @@ pub(crate) fn arrow_field_to_struct_field(f: &Field) -> Result<StructField, Emis
     })
 }
 
-/// Convert Spark Connect `ExprType::UnresolvedRegex` into τ's
-/// `Expression::UnresolvedRegex`. Mirrors Java Thunderduck's
-/// `RegexColumnExpression.stripBackticks`: if `col_name` begins with a single
-/// `` ` `` AND ends with a single `` ` `` (and has room for both), the
-/// backticks are stripped; otherwise `col_name` passes through verbatim.
-///
-/// The pattern MUST be a Rust `regex` crate expression once the analyzer's
-/// `expand_regex_projections` pre-pass receives it — invalid patterns surface
-/// as `AnalyzerError::Other` (Spark-emulated).
+/// Convert an unresolved regex, stripping one pair of surrounding backticks.
 fn convert_unresolved_regex(ur: &proto::expression::UnresolvedRegex) -> Expression {
     let pattern = strip_regex_backticks(&ur.col_name);
     Expression::UnresolvedRegex(UnresolvedRegexExpression {
@@ -1766,14 +1453,7 @@ fn literal_kind(lt: &proto::expression::literal::LiteralType) -> &'static str {
     }
 }
 
-/// Flatten a chain of nested `UpdateFields` protos into `(base, ops)`.
-///
-/// Spark Connect emits `df.col("s").withField("a", va).withField("b", vb)` as
-/// `UpdateFields(field="b", value=Some(vb), struct=UpdateFields(field="a",
-/// value=Some(va), struct=<col "s">))`. The outermost proto is the *most
-/// recent* op; the innermost `struct_expression` that is NOT an `UpdateFields`
-/// is the base struct. Returns ops in **application order** — the innermost
-/// (oldest) op is index 0, the outermost (newest) is last.
+/// Flatten nested `UpdateFields` protos into `(base, ops)` application order.
 fn flatten_update_fields(
     outer: &proto::expression::UpdateFields,
 ) -> (
@@ -1825,7 +1505,6 @@ fn classify_file_format(
     if let Some(k) = kind {
         return Ok(k);
     }
-    // Fall back to path extension.
     if lower.ends_with(".parquet") {
         Ok(FileFormat::Parquet)
     } else if lower.ends_with(".csv") || lower.ends_with(".tsv") {
@@ -1846,35 +1525,15 @@ fn classify_file_format(
 }
 
 fn parse_type_str_to_struct(s: &str) -> StructType {
-    // PySpark sends the LocalRelation `schema` field as a JSON-serialized
-    // Spark type when the client calls `createDataFrame(rows, schema)` —
-    // `_schema.json()` emits `{"type":"struct","fields":[…]}`. Delegate JSON
-    // parsing to the shared helper in `json_schema`. This path
-    // preserves duplicate struct field names (`Struct<tags, tags>` from
-    // `arrays_zip`), which the Arrow-IPC-derived schema lacks because
-    // PySpark's client dedups struct field names before wire serialization.
     let trimmed = s.trim();
+    // LocalRelation uses Spark's JSON schema; reader APIs may supply DDL.
     if trimmed.starts_with('{') {
-        // A `{`-leading schema is ALWAYS decoded as JSON — `parse_json_schema`
-        // is total (invalid JSON or a missing `"fields"` array yields the
-        // empty struct), so a JSON-shaped string never falls through to the
-        // DDL parser below. Returning the (possibly empty) result verbatim
-        // preserves that long-standing behavior.
         return super::json_schema::parse_json_schema(trimmed);
     }
-    // Fallback: Spark DDL schema parser — accepts both the `struct<...>`
-    // wrapper form (`struct<id:bigint,name:string>`) and the bare field-list
-    // form PySpark sends for `DataFrameReader.schema("id INT, name STRING")`.
-    // Pass-2 widening: the legacy fallback routed through `parse_type_str`,
-    // which had no struct arm — its `DataType::Struct` match was unreachable
-    // and every DDL-string schema silently became `StructType::empty()`.
-    // Untranslatable DDL still degrades to the empty struct (legacy shape).
     thunderduck_core::types::spark_ddl::parse_spark_schema(s).unwrap_or_else(StructType::empty)
 }
 
-/// Parse an Arrow IPC stream once, returning both the schema and the row
-/// literals. Consolidating both extractions eliminates a duplicated Arrow
-/// schema parse and `StreamReader` construction (perf OPT-1).
+/// Parse an Arrow IPC stream once, returning its schema and row literals.
 fn arrow_ipc_to_schema_and_rows(
     data: &[u8],
 ) -> Result<(StructType, Vec<Vec<Expression>>), EmissionError> {
@@ -1898,7 +1557,6 @@ fn arrow_ipc_to_schema_and_rows(
             name: "LocalRelation::arrow_ipc_collect".to_owned(),
             reason: format!("Arrow IPC collect error: {e}"),
         })?;
-    // OPT-2: known row count → single bounded allocation.
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     let mut rows: Vec<Vec<Expression>> = Vec::with_capacity(total_rows);
     for batch in &batches {
@@ -1931,11 +1589,6 @@ pub(crate) fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, Emission
             precision: *p,
             scale: *s as u8,
         },
-        // Interval types — round-trip through `createDataFrame(rows, schema)`.
-        // Spark 4.1 sends `DayTimeIntervalType` as Arrow `Duration(Microsecond)`,
-        // `YearMonthIntervalType` as Arrow `Interval(YEAR_MONTH)`, and
-        // `CalendarIntervalType` as Arrow `Interval(MonthDayNano)`. Corpus:
-        // intv-001, intv-003, intv-005.
         ArrowDT::Duration(TimeUnit::Microsecond) => DataType::DayTimeInterval,
         ArrowDT::Interval(IntervalUnit::YearMonth) => DataType::YearMonthInterval,
         ArrowDT::Interval(IntervalUnit::MonthDayNano) => DataType::Interval,
@@ -1982,11 +1635,8 @@ pub(crate) fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, Emission
 
 /// Convert a single Arrow cell into an [`Expression::Literal`].
 ///
-/// **§2.1 loud-fail contract:** every unhandled Arrow data type returns
-/// [`EmissionError::Unsupported`] (`kind: ProtoShape`). There is NO `Ok("NULL")` or
-/// `Ok(null_literal())` catch-all — silent NULL substitution would turn every
-/// unhandled type into wrong-answer data corruption (see the DECIMAL bug
-/// documented in `local_relation_to_values_sql`).
+/// Unhandled Arrow data types return [`EmissionError::Unsupported`] rather than
+/// silently becoming NULL literals.
 pub(crate) fn arrow_val_to_literal(
     array: &dyn Array,
     row: usize,
@@ -2132,19 +1782,11 @@ pub(crate) fn arrow_val_to_literal(
                 fields: out,
             }))
         }
-        // ── Interval Arrow values ────────────────────────────────────────
-        // `createDataFrame(rows_with_intervals, schema)` from PySpark re-sends
-        // interval cells as their Arrow wire form. τ has no `LiteralValue`
-        // variant for intervals; wrap the DuckDB `INTERVAL` literal SQL as
-        // `RawSql` with a data-type hint so the analyzer stamps the correct
-        // shape. Emission of `RawSql` is a verbatim string passthrough
-        // (`emission.rs::render_expr`), which suits DuckDB's native INTERVAL
-        // syntax exactly. Corpus: intv-001 / intv-003 / intv-005.
+        // τ has no interval LiteralValue, so preserve the Arrow interval with
+        // typed RawSql using DuckDB's interval constructors.
         ArrowDT::Duration(TimeUnit::Microsecond) => {
             let a = downcast::<DurationMicrosecondArray>(array)?;
             let micros: i64 = a.value(row);
-            // DuckDB has no `make_interval`; use `to_microseconds(BIGINT)` which
-            // returns an INTERVAL representing the given microseconds.
             let sql = format!("to_microseconds(CAST({micros} AS BIGINT))");
             Ok(Expression::RawSql(RawSqlExpression {
                 sql,
@@ -2166,8 +1808,6 @@ pub(crate) fn arrow_val_to_literal(
             let a = downcast::<IntervalMonthDayNanoArray>(array)?;
             let v = a.value(row);
             let micros = v.nanoseconds / 1_000;
-            // Compose the three components — DuckDB INTERVAL arithmetic
-            // preserves the MonthDayNano semantics DuckDB uses internally.
             let sql = format!(
                 "(to_months(CAST({m} AS INTEGER)) + to_days(CAST({d} AS INTEGER)) + to_microseconds(CAST({us} AS BIGINT)))",
                 m = v.months,
@@ -2180,8 +1820,6 @@ pub(crate) fn arrow_val_to_literal(
                 nullable: Some(false),
             }))
         }
-        // §2.1 loud-fail: NO Ok(null_literal()) catch-all here. Every
-        // unhandled Arrow type surfaces as `UnsupportedProtoShape`.
         other => bail_boundary_proto!(
             format!("arrow_value::{other:?}"),
             "V2RelationConverter Arrow value dispatch has no arm for this type",
@@ -2219,8 +1857,8 @@ fn format_decimal128(unscaled: i128, scale: i8) -> String {
     }
 }
 
-/// Walk a proto [`proto::Relation`] tree and collect every
-/// [`proto::RelationCommon::plan_id`] value.
+/// Collect plan IDs through relation shapes whose output preserves join-column
+/// resolution. New plan-carrying wrappers must be added here explicitly.
 fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut HashSet<i64>) {
     if let Some(common) = &rel.common {
         if let Some(id) = common.plan_id {
@@ -2228,7 +1866,6 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut HashSet<i64>) {
         }
     }
     use proto::relation::RelType;
-    // Deliberately partial traversal — only these operator shapes are walked.
     let children: [Option<&proto::Relation>; 2] = match &rel.rel_type {
         Some(RelType::Filter(f)) => [f.input.as_deref(), None],
         Some(RelType::Project(p)) => [p.input.as_deref(), None],
@@ -2247,8 +1884,6 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut HashSet<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Builder helpers (readability) ──────────────────────────────────────
 
     fn rel(rt: proto::relation::RelType) -> proto::Relation {
         proto::Relation {
@@ -2328,8 +1963,6 @@ mod tests {
         }
     }
 
-    // ── Invoke helpers ─────────────────────────────────────────────────────
-
     /// Convert a relation whose conversion must succeed.
     fn convert_ok(relation: &proto::Relation) -> CommonAst {
         V2RelationConverter::new()
@@ -2350,8 +1983,6 @@ mod tests {
             other => panic!("expected UnsupportedProtoShape, got {other:?}"),
         }
     }
-
-    // ── Round-trip tests ───────────────────────────────────────────────────
 
     #[test]
     fn convert_project_round_trip() {
@@ -2413,12 +2044,7 @@ mod tests {
         }
     }
 
-    /// `convert_sort_order`'s `Unspecified`-field defaults must mirror Spark's
-    /// `SparkConnectPlanner.scala::transformSortOrder` proto decoder, not
-    /// `SortOrder.scala`'s direction-derived default (that rule is the SQL
-    /// front-end's `lower_order_by_expr`, a separate code path). Real PySpark
-    /// clients always stamp both fields explicitly, so this is unit-test-only
-    /// (unreachable via the DataFrame corpus).
+    /// Unspecified sort-order fields use Spark Connect's decoder defaults.
     #[test]
     fn convert_sort_order_unspecified_defaults_match_spark_connect_planner() {
         use proto::expression::sort_order::{NullOrdering as ProtoNO, SortDirection as ProtoSD};
@@ -2590,9 +2216,6 @@ mod tests {
 
     #[test]
     fn convert_aggregate_pivot_without_pivot_sub_message_rejects_loudly() {
-        // Pass 60: PIVOT is now first-class, but a proto whose group_type is
-        // PIVOT yet carries no `pivot` sub-message is malformed — reject
-        // with a specific UnsupportedProtoShape rather than silently defaulting.
         let input = table_scan_rel("t");
         let a = rel(proto::relation::RelType::Aggregate(Box::new(
             proto::Aggregate {
@@ -2612,9 +2235,6 @@ mod tests {
 
     #[test]
     fn convert_aggregate_pivot_with_explicit_values_round_trips_to_common_op_pivot() {
-        // Pass 60 anchor for grp-004: PIVOT with explicit value literals maps
-        // 1:1 into CommonOp::Pivot — grouping / pivot_column / pivot_values /
-        // aggregates all preserved.
         let input = table_scan_rel("emp");
         let true_lit = proto::expression::Literal {
             data_type: None,
@@ -2659,8 +2279,6 @@ mod tests {
 
     #[test]
     fn convert_aggregate_pivot_without_values_produces_empty_pivot_values() {
-        // Pass 60 anchor for grp-005: PIVOT with empty values → analyzer /
-        // emission handle "eager discovery" downstream.
         let input = table_scan_rel("emp");
         let pivot_sub = proto::aggregate::Pivot {
             col: Some(unresolved_attr("dept_id")),
@@ -2729,10 +2347,6 @@ mod tests {
         }
     }
 
-    // ── parse_type_str_to_struct — DDL fallback (pass-2 fix) ────────────────
-    // The legacy fallback routed through `parse_type_str`, which had no
-    // struct arm — DDL-string schemas silently became `StructType::empty()`.
-
     #[test]
     fn parse_type_str_to_struct_parses_struct_wrapper_ddl() {
         let st = super::parse_type_str_to_struct("struct<id:bigint,name:string>");
@@ -2745,8 +2359,6 @@ mod tests {
 
     #[test]
     fn parse_type_str_to_struct_parses_bare_field_list_ddl() {
-        // The shape `DataFrameReader.schema("id INT, name STRING")` sends for
-        // a Read::DataSource schema string.
         let st = super::parse_type_str_to_struct("id bigint, name string");
         assert_eq!(st.fields.len(), 2);
         assert_eq!(st.fields[0].name, "id");
@@ -2757,8 +2369,6 @@ mod tests {
 
     #[test]
     fn parse_type_str_to_struct_untranslatable_input_degrades_to_empty() {
-        // Legacy shape preserved: scalar type strings and garbage are not
-        // schemas — they yield the empty struct, not a panic/error.
         assert_eq!(super::parse_type_str_to_struct("int"), StructType::empty());
         assert_eq!(
             super::parse_type_str_to_struct("not a schema at all!"),
@@ -2784,7 +2394,6 @@ mod tests {
 
     #[test]
     fn convert_join_populates_left_plan_ids_and_right_plan_ids() {
-        // §2.3 anchor.
         let left = table_scan_rel_with_plan_id("a", 100);
         let right = table_scan_rel_with_plan_id("b", 200);
         let j = rel(proto::relation::RelType::Join(Box::new(proto::Join {
@@ -2813,7 +2422,6 @@ mod tests {
     fn convert_join_condition_unresolved_column_plan_id_first_class() {
         let left = table_scan_rel_with_plan_id("a", 100);
         let right = table_scan_rel_with_plan_id("b", 200);
-        // Condition references a column with plan_id → should NOT string-encode.
         let cond = unresolved_attr_with_plan_id("id", 100);
         let j = rel(proto::relation::RelType::Join(Box::new(proto::Join {
             left: Some(Box::new(left)),
@@ -2843,7 +2451,6 @@ mod tests {
 
     #[test]
     fn convert_sql_relation_returns_unsupported_proto_shape() {
-        // §2.2 anchor.
         let s = rel(proto::relation::RelType::Sql(proto::Sql {
             query: "SELECT 1".to_owned(),
             ..Default::default()
@@ -2859,11 +2466,8 @@ mod tests {
         convert_proto_shape_err(&c_rel);
     }
 
-    // ── Arrow value dispatch tests ─────────────────────────────────────────
-
     #[test]
     fn arrow_val_to_literal_decimal128_produces_literal_decimal_not_null() {
-        // §2.1 anchor: unscaled 10025 at scale=2 → 100.25, never NULL.
         use arrow::array::Decimal128Array;
         let arr = Decimal128Array::from(vec![Some(10025i128)])
             .with_precision_and_scale(5, 2)
@@ -2960,7 +2564,6 @@ mod tests {
 
     #[test]
     fn arrow_val_decimal256_returns_unsupported_proto_shape() {
-        // Decimal256 is intentionally missing from the dispatch table — loud fail.
         use arrow::array::Decimal256Array;
         use arrow::datatypes::i256;
         let arr = Decimal256Array::from(vec![Some(i256::from_i128(1_000_000i128))])
@@ -2976,32 +2579,20 @@ mod tests {
         ));
     }
 
-    /// §2.1 source-file grep: the converter MUST NOT carry an `Ok("NULL")`
-    /// (or equivalent catch-all) line. Silent NULL substitution is the exact
-    /// bug pattern this test blocks.
     #[test]
     fn arrow_val_no_catch_all_ok_null_source_grep() {
-        // Resolve the source path via CARGO_MANIFEST_DIR since tests may run
-        // from either the workspace root or the crate root depending on
-        // invocation.
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR must be set under cargo test");
         let path =
             std::path::Path::new(&manifest_dir).join("src/converter/v2_relation_converter.rs");
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read own source file {}: {e}", path.display()));
-        // Build the forbidden needle at runtime so this test's own source
-        // (`r#"Ok(\"NULL\")"#`) does not match itself when the grep runs.
-        // Concatenating four fragments keeps every fragment shorter than
-        // the full needle.
         let needle: String = ["Ok(", "\"", "NULL", "\")"].concat();
         for (n, line) in src.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with("//") {
                 continue;
             }
-            // Skip this test's own body (contains the needle-construction
-            // above and the assertion below — both would trip the grep).
             if trimmed.contains("let needle:") || trimmed.contains("!trimmed.contains(&needle)") {
                 continue;
             }
@@ -3014,14 +2605,8 @@ mod tests {
         }
     }
 
-    // ── Unpivot conversion (piv-004 / piv-005) ─────────────────────────────
-
     #[test]
     fn convert_unpivot_round_trip_maps_proto_fields_to_common_op() {
-        // Anchor: piv-004 shape — ids=[id], values=[age, salary], names
-        // "metric"/"value". The proto → AST mapping must preserve column
-        // names exactly (`extract_column_name` accepts bare
-        // UnresolvedAttribute only).
         let input = table_scan_rel("emp");
         let unpivot = rel(proto::relation::RelType::Unpivot(Box::new(
             proto::Unpivot {
@@ -3055,9 +2640,6 @@ mod tests {
 
     #[test]
     fn convert_unpivot_absent_values_carries_empty_list_for_analyzer_expansion() {
-        // When the proto omits the `values` field, Spark's default is "all
-        // non-id columns". τ leaves `values` empty in the AST and expects
-        // the analyzer to materialise the expansion.
         let input = table_scan_rel("emp");
         let unpivot = rel(proto::relation::RelType::Unpivot(Box::new(
             proto::Unpivot {
@@ -3074,8 +2656,6 @@ mod tests {
             _ => panic!("expected Unpivot"),
         }
     }
-
-    // ── Describe / Summary conversion (Pass 80) ───────────────────────────
 
     #[test]
     fn convert_describe_preserves_input_and_cols() {
@@ -3143,8 +2723,6 @@ mod tests {
         )));
         convert_proto_shape_err(&summary);
     }
-
-    // ── FreqItems / Crosstab (Pass 82) ────────────────────────────────────
 
     #[test]
     fn convert_freq_items_defaults_support_to_pyspark_0_01_when_proto_none() {
@@ -3214,8 +2792,6 @@ mod tests {
         }
     }
 
-    // ── StatCov / StatCorr / ApproxQuantile converters ─────────────────────
-
     #[test]
     fn convert_cov_desugars_to_global_aggregate_with_covar_samp() {
         let input = table_scan_rel("emp");
@@ -3237,7 +2813,6 @@ mod tests {
                     Expression::FunctionCall(f) => {
                         assert_eq!(f.name, "covar_samp");
                         assert_eq!(f.args.len(), 2);
-                        // Each arg should be coalesce(col, 0) per Spark's na.fill(0L).
                         for arg in &f.args {
                             match arg {
                                 Expression::FunctionCall(inner) => {
@@ -3343,7 +2918,6 @@ mod tests {
             } => {
                 assert!(grouping.is_empty(), "approxQuantile is a global aggregate");
                 assert_eq!(aggregates.len(), 1);
-                // Outer array wraps one inner array (single column).
                 match &aggregates[0] {
                     Expression::ArrayLiteral(outer) => {
                         assert_eq!(outer.elements.len(), 1, "one col → one inner array");
@@ -3382,13 +2956,8 @@ mod tests {
         convert_proto_shape_err(&aq);
     }
 
-    // ── Sample / SampleBy converters (Pass 83) ────────────────────────────
-
     #[test]
     fn convert_sample_maps_bounds_and_seed() {
-        // samp-001 anchor — PySpark `df.sample(0.5, seed=11)` ships as
-        // `Sample { lower_bound: 0.0, upper_bound: 0.5, with_replacement:
-        // Some(false), seed: Some(11) }`.
         let input = table_scan_rel("emp");
         let s = rel(proto::relation::RelType::Sample(Box::new(proto::Sample {
             input: Some(Box::new(input)),
@@ -3419,7 +2988,6 @@ mod tests {
 
     #[test]
     fn convert_sample_by_extracts_literal_strata() {
-        // samp-002 anchor — three literal strata + fractions, seed=11.
         fn int_lit(v: i32) -> proto::expression::Literal {
             proto::expression::Literal {
                 data_type: None,
@@ -3496,12 +3064,6 @@ mod tests {
         }
     }
 
-    // ── normalize_decimal_literal (Spark parity, LiteralValueProtoConverter) ─
-
-    /// cond-004 anchor: PySpark sends `(value="0.00", precision=10, scale=0)`.
-    /// Value-derived is `(2, 2)`; max-of-value-and-wire yields `(10, 2)`,
-    /// matching what Spark's `LiteralValueProtoConverter.decodeDecimal`
-    /// computes.
     #[test]
     fn normalize_decimal_literal_cond004_anchor_pyspark_zero_dot_zero_zero() {
         assert_eq!(
@@ -3510,8 +3072,6 @@ mod tests {
         );
     }
 
-    /// Wire precision/scale smaller than the value-derived shape: `max`
-    /// selects the value-derived side (`(5, 2)` vs `(3, 1)` → `(5, 2)`).
     #[test]
     fn normalize_decimal_literal_wire_smaller_than_value_takes_value_side() {
         assert_eq!(
@@ -3520,28 +3080,20 @@ mod tests {
         );
     }
 
-    /// Wire absent on both fields: falls back to the value-derived shape
-    /// (`(5, 2)` for `"123.45"`).
     #[test]
     fn normalize_decimal_literal_wire_absent_uses_value_derived() {
         assert_eq!(normalize_decimal_literal("123.45", None, None), (5, 2));
     }
 
-    /// Zero-value edge: `"0"` has no fractional digits and no non-zero
-    /// integer digits; the `.max(1)` guard on `vp` yields `(1, 0)`.
     #[test]
     fn normalize_decimal_literal_zero_value_no_wire_yields_one_zero() {
         assert_eq!(normalize_decimal_literal("0", None, None), (1, 0));
     }
 
-    /// Invariant safety: malformed wire (`p_wire < s_wire`) is clamped so
-    /// `precision >= scale` still holds post-normalization.
     #[test]
     fn normalize_decimal_literal_malformed_wire_clamps_to_preserve_invariant() {
         assert_eq!(normalize_decimal_literal("0", Some(3), Some(5)), (5, 5));
     }
-
-    // ── Pass 85 — UnresolvedRegex conversion ────────────────────────────────
 
     #[test]
     fn convert_unresolved_regex_strips_matching_backticks() {
@@ -3568,7 +3120,6 @@ mod tests {
         let out = super::convert_unresolved_regex(&ur);
         match out {
             Expression::UnresolvedRegex(r) => {
-                // Bare (no wrapping backticks) — passes through as-is.
                 assert_eq!(r.pattern, "col_.*");
                 assert_eq!(r.plan_id, Some(1234));
             }
@@ -3576,9 +3127,6 @@ mod tests {
         }
     }
 
-    // ── Range ─────────────────────────────────────────────────────────────
-
-    /// Build a `proto::Range` with the given fields.
     fn range_proto(
         start: Option<i64>,
         end: i64,
@@ -3593,8 +3141,6 @@ mod tests {
         }))
     }
 
-    /// Assert that a `CommonOp::TableFunction` carries `name = "range"` and
-    /// return the args for further inspection.
     fn assert_range_table_fn(ast: &CommonAst) -> &[Expression] {
         match &ast.op {
             CommonOp::TableFunction {
@@ -3610,7 +3156,6 @@ mod tests {
         }
     }
 
-    /// Extract the i64 value from an `Expression::Literal(Long(v))`.
     fn long_val(expr: &Expression) -> i64 {
         match expr {
             Expression::Literal(Literal {
@@ -3623,7 +3168,6 @@ mod tests {
 
     #[test]
     fn convert_range_default_start() {
-        // spark.range(5) — start absent → default 0, step = 1
         let r = range_proto(None, 5, 1, None);
         let ast = convert_ok(&r);
         let args = assert_range_table_fn(&ast);
@@ -3635,7 +3179,6 @@ mod tests {
 
     #[test]
     fn convert_range_explicit_start_end_step() {
-        // spark.range(2, 10, 3)
         let r = range_proto(Some(2), 10, 3, None);
         let ast = convert_ok(&r);
         let args = assert_range_table_fn(&ast);
@@ -3647,7 +3190,6 @@ mod tests {
 
     #[test]
     fn convert_range_num_partitions_ignored() {
-        // spark.range(0, 100, 1, numPartitions=8) — partitions silently dropped
         let r = range_proto(Some(0), 100, 1, Some(8));
         let ast = convert_ok(&r);
         let args = assert_range_table_fn(&ast);
@@ -3657,9 +3199,6 @@ mod tests {
         assert_eq!(long_val(&args[2]), 1);
     }
 
-    // ── ToSchema ─────────────────────────────────────────────────────────────
-
-    /// Build a proto `DataType` wrapping a `Struct` with the given fields.
     fn struct_data_type_proto(fields: Vec<(&str, proto::data_type::Kind)>) -> proto::DataType {
         let struct_fields = fields
             .into_iter()
@@ -3680,8 +3219,6 @@ mod tests {
 
     #[test]
     fn convert_to_schema_reordered_struct_produces_project_with_aliased_casts() {
-        // Target schema: (b: String, a: Integer) — reversed vs hypothetical
-        // source (a, b). The projections must follow TARGET order.
         let schema = struct_data_type_proto(vec![
             ("b", proto::data_type::Kind::String(Default::default())),
             ("a", proto::data_type::Kind::Integer(Default::default())),
@@ -3698,7 +3235,6 @@ mod tests {
         };
         assert_eq!(projections.len(), 2);
 
-        // First projection: CAST(b AS STRING) AS b
         let Expression::Alias(a0) = &projections[0] else {
             panic!("expected Alias, got {:?}", projections[0]);
         };
@@ -3713,7 +3249,6 @@ mod tests {
         };
         assert_eq!(u0.name, "b");
 
-        // Second projection: CAST(a AS INTEGER) AS a
         let Expression::Alias(a1) = &projections[1] else {
             panic!("expected Alias, got {:?}", projections[1]);
         };
@@ -3730,7 +3265,6 @@ mod tests {
 
     #[test]
     fn convert_to_schema_non_struct_schema_produces_boundary_error() {
-        // schema = Long (not a struct) → must fail.
         let r = rel(proto::relation::RelType::ToSchema(Box::new(
             proto::ToSchema {
                 input: Some(Box::new(table_scan_rel("t"))),

@@ -11,6 +11,7 @@
 //! refactor. τ keeps the wrapper minimal.
 
 use super::expression::{Expression, Literal, SortOrder};
+use super::generator::Generator;
 use crate::types::StructType;
 
 /// τ's canonical plan tree — a single wrapper around a [`CommonOp`] variant.
@@ -35,18 +36,17 @@ impl CommonAst {
 /// Every variant below is analyzed and emitted end-to-end (relational core,
 /// Aggregate incl. Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA
 /// family, Unpivot, Pivot / Crosstab, Stat family, TableFunction, ...) with
-/// one exception: `Unnest`, whose emission arm is still a
-/// Thunderduck-boundary [`super::EmissionError::Unsupported`] per ADR-022.
+/// one exception: `Unnest`, which the analyzer rejects as a
+/// Thunderduck-boundary `PuntedOperator` per ADR-022.
 /// Plan shapes with no variant here surface as
 /// [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) from the
 /// front-ends. There is **no** opaque `Sql` variant — parser_v2 owns SQL
-/// text (Open Decision 1 Option 1b).
+/// text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommonOp {
-    // ── Relational (structured) ──────────────────────────────────────────
     /// `SELECT projections FROM input`.
     ///
-    /// # N8 — output-list entries are `NamedExpression`s post-analysis
+    /// After analysis, computed entries are wrapped in named aliases.
     ///
     /// The analyzer's `Project` arm wraps every resolved entry that is not
     /// already a bare `ColumnReference`, `Star`, or `Alias` in a fresh
@@ -103,7 +103,7 @@ pub enum CommonOp {
     /// `grouping_kind` / `grouping_sets`. Pivot is a separate variant
     /// ([`CommonOp::Pivot`]).
     ///
-    /// # N7 — `aggregates` IS the complete output list, by construction
+    /// `aggregates` is the complete output list, by construction.
     ///
     /// `aggregates` always carries the full output projection: for the
     /// SparkSQL front-end (`lower_aggregate_select`) it's the whole SELECT
@@ -116,9 +116,7 @@ pub enum CommonOp {
     /// flag and no fold-at-read-time — see [`grouped_aggregate`] for the
     /// DataFrame-shaped constructor.
     ///
-    /// # N8 — `aggregates` entries are `NamedExpression`s post-analysis
-    ///
-    /// Same wrap the analyzer's `Project` arm applies (see
+    /// As with `Project`, the analyzer wraps computed entries in aliases (see
     /// [`CommonOp::Project`]'s doc): every resolved `aggregates` entry that
     /// is not already a bare `ColumnReference`, `Star`, or `Alias` is wrapped
     /// in a fresh `Alias` carrying its schema output name. `grouping` is
@@ -129,7 +127,7 @@ pub enum CommonOp {
         input: Box<CommonAst>,
         /// The grouping expressions (may be empty for global aggregation).
         grouping: Vec<Expression>,
-        /// The complete output list — see variant-level doc (N7).
+        /// The complete output list.
         aggregates: Vec<Expression>,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
         /// GroupingSets (Pivot lives elsewhere).
@@ -144,12 +142,10 @@ pub enum CommonOp {
         /// the DataFrame path (models post-agg filtering as a separate Filter
         /// over the Aggregate). Resolved against the aggregate INPUT schema
         /// (aggregate exprs + grouping keys bind to input columns). Does NOT
-        /// resolve SELECT output-alias refs (`HAVING s > x`) — no corpus
-        /// witness; future merged-scope enhancement.
+        /// resolve SELECT output-alias refs (`HAVING s > x`).
         having: Option<Expression>,
     },
 
-    // ── Leaves ───────────────────────────────────────────────────────────
     /// A relation with exactly one row and zero columns — the identity for
     /// `SELECT literal` with no `FROM`.
     SingleRow,
@@ -175,7 +171,7 @@ pub enum CommonOp {
 
     /// A `createDataFrame` payload — Arrow-IPC rows parsed into
     /// `Expression::Literal` values. **No synthesized SQL** — the emission
-    /// arm is responsible for rendering (per §2.1 anti-SQL anchor).
+    /// arm is responsible for rendering.
     LocalRelation {
         /// The declared schema (may include columns not present in `rows`).
         schema: StructType,
@@ -214,7 +210,6 @@ pub enum CommonOp {
         with_ordinality: bool,
     },
 
-    // ── Set operations ─────────────────────────────────────────
     /// A n-ary set operation: UNION / INTERSECT / EXCEPT.
     ///
     /// **τ's analyzer adds this variant.** Set-op widening (analyzer's downward
@@ -432,7 +427,6 @@ pub enum CommonOp {
         renames: Vec<(String, String)>,
     },
 
-    // ── Column-list extensions ───────────────────────────────────────────
     /// `df.drop(col1, col2, ...)` — remove named columns from the input.
     /// Analyzer produces an output schema equal to input minus the named
     /// columns (case-insensitive per Spark). Missing names are silently
@@ -460,7 +454,6 @@ pub enum CommonOp {
         assignments: Vec<(String, Expression)>,
     },
 
-    // ── Sampling (Pass 83) ───────────────────────────────────────────────
     /// `df.sample(fraction, seed)` / `df.sample(withReplacement, fraction, seed)`.
     /// Schema-preserving.
     ///
@@ -504,26 +497,11 @@ pub enum CommonOp {
         seed: Option<i64>,
     },
 
-    /// `LATERAL VIEW [OUTER] generator(arg) table_alias AS col1[, col2, ...]`.
-    ///
-    /// Spark models this as a correlated unary operator: the generator
-    /// expression references columns from the input relation (`e.tags`), and
-    /// its output columns are appended (not replaced) to the input schema
-    /// under the specified `table_alias`. Lowering folds the `OUTER` flag
-    /// into the canonical generator name (`explode_outer`) and splits
-    /// `posexplode` into `posexplode_pos`/`posexplode_val` — so `columns`
-    /// always carries fully-canonical `FunctionCall` expressions.
-    ///
-    /// ADR-003 pre-authorizes this variant; composition of existing nodes
-    /// fails concretely (see architecture-pass-11 justification).
-    LateralView {
-        /// The correlated input relation.
+    /// Append the rows and columns produced by a generator to its input.
+    Generate {
         input: Box<CommonAst>,
-        /// The table alias (e.g. `t` in `LATERAL VIEW explode(e.tags) t AS tag`).
-        table_alias: String,
-        /// Per-output-column `(alias, generator FunctionCall)` pairs. Non-empty
-        /// invariant; all co-project in a single inner SELECT at emission.
-        columns: Vec<(String, Expression)>,
+        generator: Generator,
+        qualifier: Option<String>,
     },
 
     /// `WITH RECURSIVE name(cols) AS (anchor UNION ALL recursive_term)
@@ -550,7 +528,6 @@ pub enum CommonOp {
         recursive_term: Box<CommonAst>,
     },
 
-    // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///
     /// `left_plan_ids` / `right_plan_ids` carry the set of proto `plan_id`s
@@ -616,7 +593,7 @@ macro_rules! common_op_children {
             | CommonOp::Crosstab { input, .. }
             | CommonOp::Sample { input, .. }
             | CommonOp::SampleBy { input, .. }
-            | CommonOp::LateralView { input, .. } => vec![input.$as_child()],
+            | CommonOp::Generate { input, .. } => vec![input.$as_child()],
             CommonOp::RecursiveCte {
                 anchor,
                 recursive_term,
@@ -724,7 +701,7 @@ pub enum GroupingKind {
     GroupingSets,
 }
 
-/// N7: construct a DataFrame-shaped [`CommonOp::Aggregate`] with Spark's
+/// Construct a DataFrame-shaped [`CommonOp::Aggregate`] with Spark's
 /// `RelationalGroupedDataset.toDF` layout — the output list is `grouping ++
 /// agg_exprs`, built here so `aggregates` IS the complete output list by
 /// construction (no per-front-end flag, no fold-at-read-time).
@@ -790,7 +767,6 @@ mod tests {
     use super::super::expression::{Literal, LiteralValue};
     use super::*;
     use crate::types::{DataType, StructField};
-
     #[test]
     fn common_ast_single_row_constructs() {
         let plan = CommonAst::new(CommonOp::SingleRow);
@@ -835,7 +811,6 @@ mod tests {
                 right_plan_ids,
                 ..
             } => {
-                // Anchor: plan_ids are `Vec<i64>`, not `Vec<String>` (§2.3).
                 assert_eq!(left_plan_ids, vec![1i64, 2]);
                 assert_eq!(right_plan_ids, vec![3i64]);
             }
@@ -845,8 +820,7 @@ mod tests {
 
     #[test]
     fn common_op_local_relation_carries_expression_literals() {
-        // Anti-SQL anchor (§2.1): LocalRelation rows are Expression::Literal,
-        // never raw SQL text.
+        // LocalRelation rows are expression literals, never raw SQL text.
         let schema = StructType::new(vec![StructField::nullable("x", DataType::Integer)]);
         let row = vec![Expression::Literal(Literal {
             value: LiteralValue::Int(1),
@@ -867,7 +841,6 @@ mod tests {
 
     #[test]
     fn common_op_setop_construction() {
-        // Anchor: SetOp variant + SetOpKind enum land
         let child_a = CommonAst::new(CommonOp::SingleRow);
         let child_b = CommonAst::new(CommonOp::SingleRow);
         let plan = CommonAst::new(CommonOp::SetOp {
@@ -897,9 +870,6 @@ mod tests {
 
     #[test]
     fn common_op_unpivot_carries_ids_values_and_output_names() {
-        // Anchor: Unpivot variant lands with `ids` + `values` as column names,
-        // plus explicit variable/value column names for the two new output
-        // columns.
         let plan = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
@@ -926,9 +896,6 @@ mod tests {
 
     #[test]
     fn common_op_pivot_carries_grouping_pivot_column_values_and_aggregates() {
-        // Anchor (Pass 60): Pivot variant lands with `grouping`,
-        // `pivot_column`, `pivot_values` (empty ⇒ implicit / DuckDB-eager),
-        // and `aggregates`.
         use super::super::expression::{Literal, LiteralValue, UnresolvedColumn};
         let group = Expression::UnresolvedColumn(UnresolvedColumn {
             name: "dept_id".to_owned(),
@@ -979,8 +946,6 @@ mod tests {
 
     #[test]
     fn common_op_pivot_empty_values_signals_implicit_discovery() {
-        // Anchor (Pass 60): empty `pivot_values` ⇒ DuckDB PIVOT eagerly
-        // discovers distinct values at runtime (grp-005 semantics).
         use super::super::expression::UnresolvedColumn;
         let plan = CommonAst::new(CommonOp::Pivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
@@ -1073,9 +1038,6 @@ mod tests {
 
     #[test]
     fn common_op_sample_carries_bounds_and_flags() {
-        // Pass 83 anchor — samp-001: `df.sample(0.5, seed=11)` lowers to
-        // `Sample { lower_bound: 0.0, upper_bound: 0.5, with_replacement: false,
-        // seed: Some(11) }`.
         let plan = CommonAst::new(CommonOp::Sample {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             lower_bound: 0.0,
@@ -1102,9 +1064,6 @@ mod tests {
 
     #[test]
     fn common_op_sample_by_carries_col_and_fractions() {
-        // Pass 83 anchor — samp-002: `df.sampleBy("dept_id", {10:0.5, 20:0.5,
-        // 30:1.0}, seed=11)` lowers with a resolved-later column expression
-        // and Vec<(Literal, f64)> fractions.
         use super::super::expression::UnresolvedColumn;
         let dept_lit = |v: i32| Literal {
             value: LiteralValue::Int(v),
@@ -1156,8 +1115,6 @@ mod tests {
             _ => panic!("expected FileScan"),
         }
     }
-
-    // ── N7: grouped_aggregate fold ───────────────────────────────────────
 
     #[test]
     fn grouped_aggregate_folds_grouping_ahead_of_agg_exprs() {

@@ -47,9 +47,8 @@ pub(super) fn derive_struct_field_name(arg: &Expression, i: usize) -> String {
 /// positional integer string `"0"`, `"1"`, ... (0-indexed) — Spark uses
 /// integer strings, not `col{i+1}`, for `arrays_zip` specifically. Shared by
 /// `expression::function_call_data_type` (schema side) and
-/// `emission::render_function_call` (SQL side); the two MUST agree or the
-/// wire schema desyncs from the emitted struct fields. Corpus anchor:
-/// `arr-012`.
+/// `emission::render_function_call` (SQL side); the two must agree or the
+/// wire schema desynchronizes from the emitted struct fields.
 pub(super) fn derive_zip_field_name(arg: &Expression, i: usize) -> String {
     match arg {
         Expression::Alias(a) => a.alias.clone(),

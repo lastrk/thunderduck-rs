@@ -19,14 +19,12 @@ class TestTempViewBasics:
         """Test creating a simple temporary view and querying it"""
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Load data and create temp views on both
         ref_df = spark_reference.read.parquet(lineitem_path)
         ref_df.createOrReplaceTempView("lineitem")
 
         td_df = spark_thunderduck.read.parquet(lineitem_path)
         td_df.createOrReplaceTempView("lineitem")
 
-        # Query the views
         ref_result = spark_reference.sql("SELECT COUNT(*) as cnt FROM lineitem")
         td_result = spark_thunderduck.sql("SELECT COUNT(*) as cnt FROM lineitem")
 
@@ -36,14 +34,12 @@ class TestTempViewBasics:
         """Test creating temp view from filtered DataFrame"""
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Load and filter data on both
         ref_df = spark_reference.read.parquet(lineitem_path).filter("l_quantity > 40")
         ref_df.createOrReplaceTempView("high_quantity")
 
         td_df = spark_thunderduck.read.parquet(lineitem_path).filter("l_quantity > 40")
         td_df.createOrReplaceTempView("high_quantity")
 
-        # Query the filtered views
         ref_result = spark_reference.sql("SELECT COUNT(*) as cnt FROM high_quantity")
         td_result = spark_thunderduck.sql("SELECT COUNT(*) as cnt FROM high_quantity")
 
@@ -54,15 +50,12 @@ class TestTempViewBasics:
         orders_path = str(tpch_data_dir / "orders.parquet")
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Create views on Spark Reference
         spark_reference.read.parquet(orders_path).createOrReplaceTempView("orders")
         spark_reference.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
 
-        # Create views on Thunderduck
         spark_thunderduck.read.parquet(orders_path).createOrReplaceTempView("orders")
         spark_thunderduck.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
 
-        # Query joining both views
         join_query = """
             SELECT COUNT(*) as cnt
             FROM orders o
@@ -77,7 +70,6 @@ class TestTempViewBasics:
         """Test replacing an existing temporary view"""
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Create initial views on both
         ref_df1 = spark_reference.read.parquet(lineitem_path)
         ref_df1.createOrReplaceTempView("test_view")
 
@@ -91,7 +83,6 @@ class TestTempViewBasics:
         td_df2 = td_df1.filter("l_quantity > 45")
         td_df2.createOrReplaceTempView("test_view")
 
-        # Query replaced views
         ref_result = spark_reference.sql("SELECT COUNT(*) as cnt FROM test_view")
         td_result = spark_thunderduck.sql("SELECT COUNT(*) as cnt FROM test_view")
 
@@ -105,7 +96,6 @@ class TestTPCHWithTempViews:
         """Test TPC-H Q1 using temporary view"""
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Create temp views on both
         spark_reference.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
         spark_thunderduck.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
 
@@ -135,12 +125,10 @@ class TestTPCHWithTempViews:
 
     def test_tpch_q3_with_temp_views(self, spark_reference, spark_thunderduck, tpch_data_dir):
         """Test TPC-H Q3 using multiple temporary views"""
-        # Create temp views on Spark Reference
         spark_reference.read.parquet(str(tpch_data_dir / "customer.parquet")).createOrReplaceTempView("customer")
         spark_reference.read.parquet(str(tpch_data_dir / "orders.parquet")).createOrReplaceTempView("orders")
         spark_reference.read.parquet(str(tpch_data_dir / "lineitem.parquet")).createOrReplaceTempView("lineitem")
 
-        # Create temp views on Thunderduck
         spark_thunderduck.read.parquet(str(tpch_data_dir / "customer.parquet")).createOrReplaceTempView("customer")
         spark_thunderduck.read.parquet(str(tpch_data_dir / "orders.parquet")).createOrReplaceTempView("orders")
         spark_thunderduck.read.parquet(str(tpch_data_dir / "lineitem.parquet")).createOrReplaceTempView("lineitem")
@@ -172,7 +160,6 @@ class TestTPCHWithTempViews:
         """Test TPC-H Q6 using temporary view"""
         lineitem_path = str(tpch_data_dir / "lineitem.parquet")
 
-        # Create temp views on both
         spark_reference.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
         spark_thunderduck.read.parquet(lineitem_path).createOrReplaceTempView("lineitem")
 

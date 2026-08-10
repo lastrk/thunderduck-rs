@@ -5,10 +5,8 @@
 
 namespace duckdb {
 
-// ---------------------------------------------------------------------------
-// hugeint_t <-> __int128 conversion
-// ---------------------------------------------------------------------------
-
+// Rebuild the signed value from raw bits; casting the upper half to unsigned
+// avoids shifting a negative signed integer (which is undefined in C++).
 inline __int128 HugeintToInt128(const hugeint_t &h) {
 	unsigned __int128 result = (static_cast<unsigned __int128>(static_cast<uint64_t>(h.upper)) << 64) | h.lower;
 	return static_cast<__int128>(result);
@@ -21,59 +19,43 @@ inline hugeint_t Int128ToHugeint(__int128 v) {
 	return result;
 }
 
-// ---------------------------------------------------------------------------
-// Absolute value for signed __int128
-// ---------------------------------------------------------------------------
-
+// Convert before negating so the absolute value of INT128_MIN is representable.
 inline unsigned __int128 Abs128(__int128 x) {
 	return x < 0 ? -static_cast<unsigned __int128>(x) : static_cast<unsigned __int128>(x);
 }
-
-// ---------------------------------------------------------------------------
-// 256-bit unsigned integer (two 128-bit halves)
-// ---------------------------------------------------------------------------
 
 struct uint256_t {
 	unsigned __int128 hi;
 	unsigned __int128 lo;
 };
 
-// Multiply two unsigned 128-bit values, producing a 256-bit result.
-// Uses schoolbook multiplication with 64-bit limbs.
+// Multiplies two unsigned 128-bit values using 64-bit limbs.
 inline uint256_t Mul128(unsigned __int128 a, unsigned __int128 b) {
 	uint64_t a_lo = static_cast<uint64_t>(a);
 	uint64_t a_hi = static_cast<uint64_t>(a >> 64);
 	uint64_t b_lo = static_cast<uint64_t>(b);
 	uint64_t b_hi = static_cast<uint64_t>(b >> 64);
 
-	// Four partial products (each fits in unsigned __int128)
 	unsigned __int128 p0 = static_cast<unsigned __int128>(a_lo) * b_lo;
 	unsigned __int128 p1 = static_cast<unsigned __int128>(a_lo) * b_hi;
 	unsigned __int128 p2 = static_cast<unsigned __int128>(a_hi) * b_lo;
 	unsigned __int128 p3 = static_cast<unsigned __int128>(a_hi) * b_hi;
 
-	// Accumulate middle terms
 	unsigned __int128 mid = p1 + p2;
 	unsigned __int128 mid_carry = (mid < p1) ? (static_cast<unsigned __int128>(1) << 64) : 0;
 
-	// Low 128 bits
 	unsigned __int128 lo = p0 + (mid << 64);
 	unsigned __int128 lo_carry = (lo < p0) ? 1 : 0;
 
-	// High 128 bits
 	unsigned __int128 hi = p3 + (mid >> 64) + mid_carry + lo_carry;
 
 	return {hi, lo};
 }
 
-// Divide a 256-bit unsigned value by a 128-bit unsigned divisor.
-// Returns quotient (must fit in 128 bits) and sets *remainder.
-//
-// Uses Knuth's Algorithm D with 64-bit "digits" for the main path,
-// replacing the 128-iteration bit-by-bit binary long division.
-// Special fast paths for num.hi == 0 and den < 2^64.
+// Divides the widened DECIMAL product by a 128-bit divisor using Knuth's
+// Algorithm D; the quotient must fit in 128 bits.
+// *remainder receives the remainder.
 inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsigned __int128 *remainder) {
-	// Fast path: high part is zero -> simple 128-bit division
 	if (num.hi == 0) {
 		unsigned __int128 quot = num.lo / den;
 		if (remainder) {
@@ -84,20 +66,16 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 
 	D_ASSERT(num.hi < den); // quotient must fit in 128 bits
 
-	// Fast path: divisor fits in 64 bits -> 3-digit by 1-digit division
 	if (static_cast<uint64_t>(den >> 64) == 0) {
 		uint64_t d = static_cast<uint64_t>(den);
-		// num.hi < den < 2^64, so num.hi fits in 64 bits
 		uint64_t hi_lo = static_cast<uint64_t>(num.hi);
 		uint64_t lo_hi = static_cast<uint64_t>(num.lo >> 64);
 		uint64_t lo_lo = static_cast<uint64_t>(num.lo);
 
-		// First digit: [hi_lo, lo_hi] / d
 		unsigned __int128 tmp = (static_cast<unsigned __int128>(hi_lo) << 64) | lo_hi;
 		uint64_t q1 = static_cast<uint64_t>(tmp / d);
 		uint64_t r1 = static_cast<uint64_t>(tmp % d);
 
-		// Second digit: [r1, lo_lo] / d
 		tmp = (static_cast<unsigned __int128>(r1) << 64) | lo_lo;
 		uint64_t q0 = static_cast<uint64_t>(tmp / d);
 		uint64_t r0 = static_cast<uint64_t>(tmp % d);
@@ -108,16 +86,13 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 		return (static_cast<unsigned __int128>(q1) << 64) | q0;
 	}
 
-	// Knuth's Algorithm D: normalize so top bit of divisor is set
 	uint64_t den_hi = static_cast<uint64_t>(den >> 64);
 	int shift = __builtin_clzll(den_hi);
 
-	// Normalize divisor
 	unsigned __int128 den_norm = den << shift;
 	uint64_t d1 = static_cast<uint64_t>(den_norm >> 64);
 	uint64_t d0 = static_cast<uint64_t>(den_norm);
 
-	// Normalize numerator (256-bit left shift by 'shift')
 	unsigned __int128 n_hi, n_lo;
 	if (shift > 0) {
 		n_hi = (num.hi << shift) | (num.lo >> (128 - shift));
@@ -127,19 +102,15 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 		n_lo = num.lo;
 	}
 
-	// Split into 64-bit limbs: n = [n3, n2, n1, n0]
 	uint64_t n3 = static_cast<uint64_t>(n_hi >> 64);
 	uint64_t n2 = static_cast<uint64_t>(n_hi);
 	uint64_t n1 = static_cast<uint64_t>(n_lo >> 64);
 	uint64_t n0 = static_cast<uint64_t>(n_lo);
 
-	// First quotient digit: q1 = floor([n3, n2, n1] / [d1, d0])
-	// Estimate: qhat = floor([n3, n2] / d1)
 	unsigned __int128 tmp = (static_cast<unsigned __int128>(n3) << 64) | n2;
 	uint64_t qhat = static_cast<uint64_t>(tmp / d1);
 	uint64_t rhat = static_cast<uint64_t>(tmp % d1);
 
-	// Refine: while qhat * d0 > [rhat, n1]
 	while (static_cast<unsigned __int128>(qhat) * d0 > ((static_cast<unsigned __int128>(rhat) << 64) | n1)) {
 		qhat--;
 		rhat += d1;
@@ -148,12 +119,10 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 		}
 	}
 
-	// Compute partial remainder: [n3,n2,n1] - qhat * [d1,d0]
 	unsigned __int128 hi_part = tmp - static_cast<unsigned __int128>(qhat) * d1;
 	unsigned __int128 rem_hi_lo = (hi_part << 64) | n1;
 	unsigned __int128 sub = static_cast<unsigned __int128>(qhat) * d0;
 
-	// Check for borrow and correct
 	if (rem_hi_lo < sub) {
 		qhat--;
 		rem_hi_lo += den_norm;
@@ -162,7 +131,6 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 
 	uint64_t q1 = qhat;
 
-	// Second quotient digit: q0 = floor([rem1, n0] / [d1, d0])
 	uint64_t rem1_hi = static_cast<uint64_t>(rem1 >> 64);
 	uint64_t rem1_lo = static_cast<uint64_t>(rem1);
 
@@ -190,7 +158,6 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 
 	uint64_t q0 = qhat;
 
-	// Un-normalize remainder
 	if (remainder) {
 		*remainder = rem_final >> shift;
 	}
@@ -198,17 +165,10 @@ inline unsigned __int128 Div256By128(uint256_t num, unsigned __int128 den, unsig
 	return (static_cast<unsigned __int128>(q1) << 64) | q0;
 }
 
-// ---------------------------------------------------------------------------
-// Power-of-10 lookup for unsigned __int128 (up to 10^38)
-// ---------------------------------------------------------------------------
-
-// Helper to construct unsigned __int128 from high and low 64-bit halves.
 inline constexpr unsigned __int128 MakeUint128(uint64_t hi, uint64_t lo) {
 	return (static_cast<unsigned __int128>(hi) << 64) | lo;
 }
 
-// O(1) lookup table covering 10^0 through 10^38.
-// D_ASSERT guards against out-of-range exponents.
 inline unsigned __int128 Pow10_128(uint32_t exp) {
 	// clang-format off
 	static constexpr unsigned __int128 table[] = {

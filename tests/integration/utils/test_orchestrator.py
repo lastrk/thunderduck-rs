@@ -30,9 +30,7 @@ from .exceptions import (
 from .port_utils import is_port_listening
 
 
-# =============================================================================
 # Timing Infrastructure
-# =============================================================================
 
 @dataclass
 class TimingStats:
@@ -145,9 +143,7 @@ class TimingCollector:
         return "\n".join(lines)
 
 
-# =============================================================================
 # Server Supervision
-# =============================================================================
 
 class ServerSupervisor:
     """Manages server processes with health monitoring."""
@@ -194,7 +190,6 @@ class ServerSupervisor:
         except Exception as e:
             raise ServerStartupError(f"[{self.name}] Failed to start process: {e}")
 
-        # Start monitoring thread
         self._stop_monitoring.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_output, daemon=True)
         self._monitor_thread.start()
@@ -202,7 +197,6 @@ class ServerSupervisor:
         # Wait for server to be ready (port listening)
         start_time = time.time()
         while time.time() - start_time < timeout:
-            # Check if process died
             if self.process.poll() is not None:
                 logs = self.get_logs(tail=50)
                 raise ServerStartupError(
@@ -211,7 +205,6 @@ class ServerSupervisor:
                     f"stderr: {logs.get('stderr', [])[-10:]}"
                 )
 
-            # Check if port is listening
             if self._is_port_listening():
                 print(f"[{self.name}] Server ready on port {self.port}")
                 return True
@@ -341,9 +334,6 @@ class ServerSupervisor:
         return self.start(timeout=timeout)
 
 
-# =============================================================================
-# Test Orchestrator
-# =============================================================================
 
 class TestOrchestrator:
     """Central coordinator for differential tests.
@@ -427,7 +417,6 @@ class TestOrchestrator:
             str(Path(self.workspace_dir) / 'tests' / 'scripts' / 'start-server.sh')
         ]
 
-        # Start Spark Reference
         self.spark_supervisor = ServerSupervisor(
             name="SparkReference",
             port=self.spark_port,
@@ -436,7 +425,6 @@ class TestOrchestrator:
         )
         self.spark_supervisor.start(timeout=self.server_startup_timeout)
 
-        # Start Thunderduck
         self.thunderduck_supervisor = ServerSupervisor(
             name="Thunderduck",
             port=self.thunderduck_port,
@@ -456,7 +444,6 @@ class TestOrchestrator:
         # Print timing summary
         print(self.timings.get_summary())
 
-        # Stop active sessions
         for session in self._active_sessions:
             try:
                 session.stop()
@@ -464,7 +451,6 @@ class TestOrchestrator:
                 pass
         self._active_sessions.clear()
 
-        # Stop servers
         if self.thunderduck_supervisor:
             self.thunderduck_supervisor.stop()
         if self.spark_supervisor:
@@ -815,11 +801,9 @@ class TestOrchestrator:
 
         report_content = "\n".join(lines)
 
-        # Write to file
         with open(report_path, 'w') as f:
             f.write(report_content)
 
-        # Also print to stderr
         print(report_content, file=sys.stderr)
 
         print(f"\nFailure report written to: {report_path}", file=sys.stderr)

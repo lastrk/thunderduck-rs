@@ -149,9 +149,7 @@ def _create_date_data(spark, view_name="dt_data"):
     return df
 
 
-# =============================================================================
 # String Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -382,9 +380,7 @@ class TestStringFunctions_Differential:
         assert_dataframes_equal(ref, td, "decode_roundtrip", ignore_nullable=True)
 
 
-# =============================================================================
 # Collection Functions
-# =============================================================================
 
 
 @pytest.mark.differential

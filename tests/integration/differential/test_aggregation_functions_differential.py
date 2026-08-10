@@ -22,9 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # Collect Functions (collect_list, collect_set)
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -173,9 +171,7 @@ class TestCollectFunctions:
         assert_dataframes_equal(ref, td, "collect_set_with_nulls", ignore_nullable=True)
 
 
-# =============================================================================
 # Count Distinct Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -287,9 +283,7 @@ class TestCountDistinct:
         assert_dataframes_equal(ref, td, "count_distinct_global", ignore_nullable=True)
 
 
-# =============================================================================
 # First/Last Functions
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -377,9 +371,7 @@ class TestFirstLastFunctions:
         assert_dataframes_equal(ref, td, "first_with_nulls", ignore_nullable=True)
 
 
-# =============================================================================
 # Combined Aggregations
-# =============================================================================
 
 
 @pytest.mark.differential

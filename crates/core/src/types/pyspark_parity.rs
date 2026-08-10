@@ -1,9 +1,8 @@
 //! PySpark parity helpers shared across τ's emission substrate and the
 //! `connect-server` outbound Arrow schema stamp.
 //!
-//! **INV10-safe.** Value-level `Vec<String>` in/out — no τ types cross this
-//! boundary, so both the τ emission substrate and the non-τ arrow schema
-//! stamp can consume it verbatim.
+//! Value-level `Vec<String>` helpers shared by τ emission and the outbound
+//! Arrow schema stamp.
 
 use std::collections::HashMap;
 
@@ -55,13 +54,12 @@ pub fn dedup_names(names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The SUBSTRATE name-plane uniquify: rename entries so the
-/// result is GUARANTEED unique within the list (collision-safe), deterministic,
-/// and stable in appearance order. Unlike [`dedup_names`] (which reproduces
+/// Rename entries to unique, deterministic names in appearance order. Unlike
+/// [`dedup_names`] (which reproduces
 /// PySpark's wire `_dedup_names` convention and is NOT collision-safe, e.g.
 /// `["a","a","a_0"] -> ["a_0","a_1","a_0"]`), this is for INTERNAL emitted-SQL
-/// names only (subquery SELECT-list aliases) and must never
-/// touch `resolved_schema` or the outbound wire stamp (ADR-005 dup-name parity).
+/// names only (subquery SELECT-list aliases) and must not touch `resolved_schema`
+/// or the outbound wire stamp (ADR-005 dup-name parity).
 /// An already-unique input is returned unchanged. On collision the suffix
 /// counter keeps advancing past any name already present in the (original or
 /// so-far-emitted) set, mirroring Calcite's `SqlValidatorUtil.uniquify`.
@@ -87,30 +85,23 @@ mod tests {
 
     #[test]
     fn dedup_names_examples() {
-        // Documented example from the PySpark parity source.
         assert_eq!(
             dedup_names(&["tags", "tags", "id"]),
             vec!["tags_0", "tags_1", "id"]
         );
 
-        // Names unique across the list are passed through unchanged.
         assert_eq!(dedup_names(&["a", "b", "c"]), vec!["a", "b", "c"]);
 
-        // Empty input.
         let empty: Vec<String> = dedup_names(&[]);
         assert!(empty.is_empty());
 
-        // A single repeated name gets `_0`, `_1`, ... in appearance order.
         assert_eq!(dedup_names(&["x", "x", "x"]), vec!["x_0", "x_1", "x_2"]);
 
-        // Case sensitivity: PySpark dedup is case-sensitive.
         assert_eq!(dedup_names(&["A", "a", "A"]), vec!["A_0", "a", "A_1"]);
     }
 
     #[test]
     fn uniquify_guarantees_unique_output() {
-        // The exact adversarial case where `dedup_names` fails:
-        // dedup_names(["a","a","a_0"]) == ["a_0","a_1","a_0"] (duplicate "a_0").
         let out = uniquify(&["a", "a", "a_0"]);
         let unique: std::collections::HashSet<_> = out.iter().collect();
         assert_eq!(
@@ -135,7 +126,6 @@ mod tests {
             3,
             "expected a stable distinct triple: {out:?}"
         );
-        // Deterministic: repeated calls yield the same result.
         assert_eq!(uniquify(&["x", "x", "x"]), out);
     }
 
@@ -147,8 +137,6 @@ mod tests {
 
     #[test]
     fn dedup_names_is_not_collision_safe_contrast() {
-        // Documents WHY `uniquify` exists as a separate function: `dedup_names`
-        // reproduces PySpark's wire convention, which is not collision-safe.
         let out = dedup_names(&["a", "a", "a_0"]);
         assert_eq!(out, vec!["a_0", "a_1", "a_0"]);
         let unique: std::collections::HashSet<_> = out.iter().collect();

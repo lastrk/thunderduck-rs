@@ -9,62 +9,17 @@
 #include "decimal_division.hpp"
 #include <cmath>
 
-// ============================================================================
-// Aggregate-state layout invariants
-//
-// DuckDB stores aggregate states inline in its row format. Two properties of a
-// state type must hold, and NEITHER is checked by anything downstream in a
-// release build:
-//
-// 1. alignof(STATE) <= 8. State offsets are aligned with AlignValue<T, val=8> —
-//    8 bytes ONLY (duckdb/src/common/types/row/tuple_data_layout.cpp:109,128 and
-//    duckdb/src/include/duckdb/common/helper.hpp:186). A state needing stronger
-//    alignment lands at a misaligned address in practice (observed at
-//    addr % 16 == 8 for a plain GROUP BY over DECIMAL), and every access to an
-//    over-aligned member is undefined behavior. So an aggregate state must never
-//    contain a raw `__int128` (alignof 16): store `hugeint_t` (alignof 8) and
-//    convert to `__int128` only for stack-local arithmetic, via
-//    HugeintToInt128 / Int128ToHugeint.
-//
-// 2. sizeof(STATE) % 8 == 0. `sizeof(STATE)` becomes the row layout's
-//    payload_size (AggregateFunction::StateSize<STATE>,
-//    duckdb/src/include/duckdb/function/aggregate_function.hpp:350), and
-//    row_width advances by it. An oddly-sized state is fine itself but pushes the
-//    NEXT aggregate's state — and every state in every later row — to a
-//    misaligned offset, i.e. it corrupts a neighbour rather than itself. DuckDB
-//    only D_ASSERTs this (tuple_data_layout.cpp:120), and D_ASSERT is plain
-//    `assert` (common/assert.hpp:27), a no-op under NDEBUG — so shipped release
-//    builds check nothing.
-//
-// Neither violation is reliably observable at runtime: the symptom is optimizer-
-// and ISA-dependent (aarch64 LDP/STP and x86 movdqu tolerate 8-byte alignment),
-// so misaligned code can still produce correct results and no test can be relied
-// on to catch a regression. These compile-time checks are the real guard.
-//
-// Both invariants live in ONE place: duckdb::SparkStateLayout below. They are
-// checked in two ways, and BOTH cover BOTH invariants:
-//   * SparkUnaryAggregate() — register every Spark aggregate through it rather
-//     than AggregateFunction::UnaryAggregate() directly. This is the enforcing
-//     check: it cannot be skipped by forgetting a separate line.
-//   * SPARK_ASSERT_STATE_LAYOUT(State) at each state definition — redundant with
-//     the above, but points the diagnostic at the offending struct instead of at
-//     a SparkUnaryAggregate<...> instantiation. That matters most for the size
-//     invariant, whose victim is the NEXT state rather than the struct itself.
-// ============================================================================
+// DuckDB places aggregate states at 8-byte-aligned offsets. Keep every state
+// aligned to 8 bytes and sized to an 8-byte multiple; these checks are needed
+// because release builds do not enforce either layout invariant. In particular,
+// store hugeint_t rather than a raw __int128 and convert for stack arithmetic.
 
-// Expands to a check on duckdb::SparkStateLayout, defined just inside the
-// namespace below. Deliberately declared outside `namespace duckdb` — the
-// preprocessor has no notion of namespaces, and defining it inside would only
-// mislead.
 #define SPARK_ASSERT_STATE_LAYOUT(STATE_TYPE)                                                                          \
 	static_assert(duckdb::SparkStateLayout<STATE_TYPE>::ok,                                                            \
 	              #STATE_TYPE " violates the DuckDB aggregate-state layout invariants; see SparkStateLayout")
 
 namespace duckdb {
 
-// The single definition of the two invariants. Instantiating it checks them, so
-// both the macro and SparkUnaryAggregate() below route through here rather than
-// repeating the conditions or the messages.
 template <class STATE>
 struct SparkStateLayout {
 	static_assert(alignof(STATE) <= 8, "aggregate state must not require >8-byte alignment: DuckDB aligns aggregate "
@@ -76,22 +31,17 @@ struct SparkStateLayout {
 	static const bool ok = true;
 };
 
-// Wrapper around AggregateFunction::UnaryAggregate that enforces the state layout
-// invariants. Deliberately does not forward UnaryAggregate's optional
-// null_handling / destructor_type parameters: no Spark aggregate uses them, and
-// leaving them off keeps the invariants unbypassable at the one place a new
-// function gets copied from.
+// Every Spark aggregate uses this wrapper so a new registration cannot bypass
+// the layout assertions. DuckDB owns these inline, trivially destructible
+// states; Spark needs neither a custom NULL handler nor a destructor callback.
 template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP>
 static AggregateFunction SparkUnaryAggregate(const LogicalType &input_type, LogicalType return_type) {
 	static_assert(SparkStateLayout<STATE>::ok, "aggregate state violates the DuckDB layout invariants");
-	// The one intentional direct call to the DuckDB API in this extension.
 	return AggregateFunction::UnaryAggregate<STATE, INPUT_TYPE, RESULT_TYPE, OP>(input_type, return_type);
 }
 
-// ============================================================================
-// Bind data for spark_sum and spark_avg (stores the input scale for finalize)
-// ============================================================================
-
+// Bind data is copied with the bound function and remains alive through
+// Finalize, where DECIMAL input/result scales are needed after state merges.
 struct SparkAggBindData : public FunctionData {
 	uint8_t input_scale;
 	uint8_t result_scale;
@@ -110,10 +60,6 @@ struct SparkAggBindData : public FunctionData {
 	}
 };
 
-// ============================================================================
-// Helper: Convert __int128 result to the target DECIMAL physical type
-// ============================================================================
-
 template <typename T>
 static inline void WriteAggResult(T &target, __int128 val) {
 	target = static_cast<T>(val);
@@ -124,14 +70,7 @@ inline void WriteAggResult<hugeint_t>(hugeint_t &target, __int128 val) {
 	target = Int128ToHugeint(val);
 }
 
-// ============================================================================
-// spark_sum: DECIMAL path
-//
-// Accumulates into a hugeint_t state, converting to __int128 only for
-// stack-local arithmetic (see the layout invariants at the top of this file).
-// Input is promoted to DECIMAL(38, s) by DuckDB's implicit cast.
-// Returns DECIMAL(min(p+10, 38), s) per Spark rules.
-// ============================================================================
+// spark_sum DECIMAL path; the result is DECIMAL(min(p+10, 38), s).
 
 struct SparkSumDecimalState {
 	hugeint_t value;
@@ -152,7 +91,6 @@ struct SparkSumDecimalState {
 };
 SPARK_ASSERT_STATE_LAYOUT(SparkSumDecimalState);
 
-// Templatized operation so Finalize can target different physical types
 template <typename RESULT_TYPE>
 struct SparkSumDecimalOperation {
 	template <class STATE>
@@ -193,14 +131,12 @@ struct SparkSumDecimalOperation {
 	}
 };
 
-// Helper: create a SparkSumDecimal AggregateFunction for a specific result physical type
 template <typename RESULT_TYPE>
 static AggregateFunction GetSparkSumDecimalFunction() {
 	return SparkUnaryAggregate<SparkSumDecimalState, hugeint_t, RESULT_TYPE, SparkSumDecimalOperation<RESULT_TYPE>>(
 	    LogicalType::DECIMAL(38, 0), LogicalType::DECIMAL(38, 0));
 }
 
-// Helper: look up the SparkSumDecimal function for a given physical type
 static AggregateFunction GetSparkSumByPhysicalType(PhysicalType pt) {
 	switch (pt) {
 	case PhysicalType::INT16:
@@ -227,12 +163,10 @@ static unique_ptr<FunctionData> BindSparkSumDecimal(ClientContext &context, Aggr
 	uint8_t s = DecimalType::GetScale(type);
 	auto result = ComputeSumType(p, s);
 
-	// Promote input to DECIMAL(38, s) -> hugeint_t physical type
 	function.arguments[0] = LogicalType::DECIMAL(38, s);
 	auto result_type = LogicalType::DECIMAL(result.precision, result.scale);
 	function.return_type = result_type;
 
-	// Select the correct function implementation based on result physical type
 	{
 		auto tf = GetSparkSumByPhysicalType(result_type.InternalType());
 		function.update = tf.update;
@@ -244,12 +178,7 @@ static unique_ptr<FunctionData> BindSparkSumDecimal(ClientContext &context, Aggr
 	return make_uniq<SparkAggBindData>(s, result.scale);
 }
 
-// ============================================================================
-// spark_sum: Integer path
-//
-// Spark: SUM(int/long/short/byte) -> BIGINT
-// Accumulates into int64_t, returns BIGINT.
-// ============================================================================
+// spark_sum integer path; Spark returns BIGINT.
 
 struct SparkSumIntegerState {
 	int64_t value;
@@ -306,14 +235,8 @@ struct SparkSumIntegerOperation {
 	}
 };
 
-// ============================================================================
-// spark_avg: DECIMAL path
-//
-// Accumulates sum (hugeint_t state, converted to __int128 only for stack-local
-// arithmetic — see the layout invariants at the top of this file) and count.
-// At finalize, divides sum/count using SparkDecimalDivide with ROUND_HALF_UP.
-// Returns DECIMAL(min(p+4, 38), min(s+4, 18)) per Spark rules.
-// ============================================================================
+// spark_avg DECIMAL path returns DECIMAL(min(p+4, 38), min(s+4, 18)); division
+// uses SparkDecimalDivide and ROUND_HALF_UP.
 
 struct SparkAvgDecimalState {
 	hugeint_t sum;
@@ -332,7 +255,6 @@ struct SparkAvgDecimalState {
 };
 SPARK_ASSERT_STATE_LAYOUT(SparkAvgDecimalState);
 
-// Templatized so Finalize can target different physical result types
 template <typename RESULT_TYPE>
 struct SparkAvgDecimalOperation {
 	template <class STATE>
@@ -383,14 +305,12 @@ struct SparkAvgDecimalOperation {
 	}
 };
 
-// Helper: create a SparkAvgDecimal AggregateFunction for a specific result physical type
 template <typename RESULT_TYPE>
 static AggregateFunction GetSparkAvgDecimalFunction() {
 	return SparkUnaryAggregate<SparkAvgDecimalState, hugeint_t, RESULT_TYPE, SparkAvgDecimalOperation<RESULT_TYPE>>(
 	    LogicalType::DECIMAL(38, 0), LogicalType::DECIMAL(38, 0));
 }
 
-// Helper: look up the SparkAvgDecimal function for a given physical type
 static AggregateFunction GetSparkAvgByPhysicalType(PhysicalType pt) {
 	switch (pt) {
 	case PhysicalType::INT16:
@@ -417,12 +337,10 @@ static unique_ptr<FunctionData> BindSparkAvgDecimal(ClientContext &context, Aggr
 	uint8_t s = DecimalType::GetScale(type);
 	auto result = ComputeAvgType(p, s);
 
-	// Promote input to DECIMAL(38, s) -> hugeint_t physical type
 	function.arguments[0] = LogicalType::DECIMAL(38, s);
 	auto result_type = LogicalType::DECIMAL(result.precision, result.scale);
 	function.return_type = result_type;
 
-	// Select the correct function implementation based on result physical type
 	{
 		auto tf = GetSparkAvgByPhysicalType(result_type.InternalType());
 		function.update = tf.update;
@@ -434,43 +352,29 @@ static unique_ptr<FunctionData> BindSparkAvgDecimal(ClientContext &context, Aggr
 	return make_uniq<SparkAggBindData>(s, result.scale);
 }
 
-// spark_count is NOT needed as a separate extension function.
-// DuckDB's built-in COUNT already returns BIGINT, matching Spark semantics.
-
-// ============================================================================
-// Factory functions to create the AggregateFunctionSets
-// ============================================================================
-
 inline AggregateFunctionSet CreateSparkSumFunctionSet() {
 	AggregateFunctionSet set("spark_sum");
 
-	// DECIMAL overload: input DECIMAL -> result DECIMAL(min(p+10,38), s)
-	// Initial template uses hugeint_t; bind function swaps to correct physical type
 	auto decimal_func = GetSparkSumDecimalFunction<hugeint_t>();
 	decimal_func.bind = BindSparkSumDecimal;
 	decimal_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(decimal_func);
 
-	// Integer overloads: all return BIGINT (Spark semantics)
-	// TINYINT
 	auto tinyint_func = SparkUnaryAggregate<SparkSumIntegerState, int8_t, int64_t, SparkSumIntegerOperation>(
 	    LogicalType::TINYINT, LogicalType::BIGINT);
 	tinyint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(tinyint_func);
 
-	// SMALLINT
 	auto smallint_func = SparkUnaryAggregate<SparkSumIntegerState, int16_t, int64_t, SparkSumIntegerOperation>(
 	    LogicalType::SMALLINT, LogicalType::BIGINT);
 	smallint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(smallint_func);
 
-	// INTEGER
 	auto int_func = SparkUnaryAggregate<SparkSumIntegerState, int32_t, int64_t, SparkSumIntegerOperation>(
 	    LogicalType::INTEGER, LogicalType::BIGINT);
 	int_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(int_func);
 
-	// BIGINT
 	auto bigint_func = SparkUnaryAggregate<SparkSumIntegerState, int64_t, int64_t, SparkSumIntegerOperation>(
 	    LogicalType::BIGINT, LogicalType::BIGINT);
 	bigint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
@@ -482,8 +386,6 @@ inline AggregateFunctionSet CreateSparkSumFunctionSet() {
 inline AggregateFunctionSet CreateSparkAvgFunctionSet() {
 	AggregateFunctionSet set("spark_avg");
 
-	// DECIMAL overload: input DECIMAL -> result DECIMAL(min(p+4,38), min(s+4,18))
-	// Initial template uses hugeint_t; bind function swaps to correct physical type
 	auto decimal_func = GetSparkAvgDecimalFunction<hugeint_t>();
 	decimal_func.bind = BindSparkAvgDecimal;
 	decimal_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
@@ -492,69 +394,10 @@ inline AggregateFunctionSet CreateSparkAvgFunctionSet() {
 	return set;
 }
 
-// No CreateSparkCountFunctionSet — DuckDB COUNT already matches Spark.
-
-// ============================================================================
-// spark_skewness: Population skewness (matches Spark's skewness())
-//
-// Pebay's numerically stable online algorithm (Sandia 2008) with state
-// (n, mean, m2, m3), where m2/m3 are central moment sums.
-//
-// Formula: spark_skewness = sqrt(n) * m3 / sqrt((m2*m2)*m2)
-//
-// This replaced an earlier form that accumulated sum/sum_sqr/sum_cub and
-// reconstructed the moments at finalize; that suffered catastrophic cancellation
-// (e.g. on [1.0, 1.0, 1.0000000000000002] it returned -164382474.0 where Spark
-// returns 0.7071067811865475).
-//
-// -- Why NOT Spark's literal expression tree ---------------------------------
-// Spark 4.1.1's own CentralMomentAgg update is
-//     m2 = m2 + delta * (delta - deltaN)
-//     m3 = (m3 - 3*deltaN*m2_NEW) + delta * (delta*delta - deltaN*deltaN)
-// and transcribing it verbatim DOES reproduce Spark bit-for-bit — but only when
-// floating-point contraction is disabled. `delta*delta - deltaN*deltaN` must
-// cancel to exactly 0 on the first row (where deltaN == delta); with GCC's
-// default -ffp-contract=fast the compiler fuses it into an FMA that computes
-// delta*delta without intermediate rounding, so the cancellation leaves a large
-// residue. Measured on this TU, x = [1e12 .. 1e12+9, 1e12+20]:
-//     -ffp-contract=off  -> 1.5383370916855739  (== Spark 4.1.1, bit-exact)
-//     -ffp-contract=fast -> 1.0660149014611716e+16  (m3 = 1.68e19, garbage)
-// Pinning contraction off would mean build-flag changes this directory's
-// CLAUDE.md forbids for feature work, and per-compiler pragmas across the 4
-// shipped platforms (gcc on linux, clang on macOS); `#pragma STDC FP_CONTRACT`
-// is ignored by gcc in C++ mode. The Pebay form below has no such
-// exact-cancellation dependency — its result is unchanged under
-// -ffp-contract=off/on/fast — at the cost of ~12 ULP vs Spark on a
-// single-partition run. That trade is deliberate: DO NOT "fix" the ULP gap by
-// pasting in Spark's expression.
-//
-// Note also that "bit-exact vs Spark" is only well defined for a single
-// partition: Spark's own answer for the 15-value vector in test/sql/skewness.test
-// is 0.017475922407012685 under --master local[1], 0.017475922407012644 under
-// local[*], and 0.017475922407012155 under REPARTITION(5) — a ~150 ULP spread,
-// an order of magnitude wider than the gap being discussed here.
-//
-// Edge cases (verified against Spark 4.1.1, ANSI mode):
-//   - n == 0:       NULL
-//   - n == 1:       NULL for a finite value (m2 is exactly 0.0, which Spark also
-//                   maps to NULL). KNOWN DIVERGENCE for a single value that is
-//                   non-finite or large enough to overflow delta*delta
-//                   (|x| >~ 1.34e154): Spark returns NaN there, because its merge
-//                   into the zero-initialized buffer multiplies inf by a zero
-//                   count; the `target.n == 0` short-circuit in Combine below
-//                   deliberately suppresses that, so we return NULL.
-//                   Measured: skewness(Infinity) / skewness(NaN) / skewness(1e308)
-//                   over one row = NaN in Spark, NULL here.
-//   - m2 == 0:      NULL   (zero variance / all values equal; NOT a
-//                           DIVIDE_BY_ZERO error even under ANSI mode)
-//   - m2 overflow:  Spark's SQRT((m2*m2)*m2) goes +inf, so the result is 0.0
-//                   (e.g. skewness(0, 1e60, 2e60, 3e60, 1e61) = 0.0)
-//   - non-finite:   propagated as-is (NaN/inf). Spark has NO finiteness guard
-//                   here; it returns NaN — e.g. skewness(0, 1e110, 2e110,
-//                   3e110, 1e111) = NaN. DuckDB's built-in skewness() throws
-//                   "SKEW is out of range!" instead; matching DuckDB there would
-//                   be a parity violation, so we do not.
-// ============================================================================
+// Spark population skewness. Pebay's online moments avoid the cancellation in
+// Spark's literal update under fused floating-point contraction. Keep
+// sqrt((m2*m2)*m2) rather than pow(m2, 1.5): Spark overflows m2^3 to infinity,
+// yielding 0.0, and propagates NaN instead of raising DuckDB's range error.
 
 struct SparkSkewState {
 	uint64_t n;
@@ -581,7 +424,6 @@ struct SparkSkewnessOperation {
 		}
 	}
 
-	// Pebay online update: add a single value x.
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
 		double x = static_cast<double>(input);
@@ -596,15 +438,11 @@ struct SparkSkewnessOperation {
 		state.mean += delta_n;
 	}
 
-	// Pebay parallel merge: combine two partial aggregates.
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
-		// Identity fast paths. DuckDB merges far more often than Spark does (per
-		// thread, per partition, and the ungrouped path always merges into a
-		// zero-initialized global state), so short-circuiting an empty side keeps
-		// the result independent of merge topology. Spark instead relies on
-		// multiply-by-zero, which would degrade to inf * 0 = NaN for inputs large
-		// enough to overflow delta^3 below.
+		// DuckDB merges empty and zero-initialized partial states. These identity
+		// branches avoid inf*0 -> NaN for extreme values and preserve the source
+		// state when the target has no rows.
 		if (source.n == 0) {
 			return;
 		}
@@ -634,24 +472,16 @@ struct SparkSkewnessOperation {
 		target.m3 = new_m3;
 	}
 
-	// Spark: IF(n = 0, NULL, IF(m2 = 0, NULL, (SQRT(n) * m3) / SQRT((m2*m2)*m2)))
 	template <class TARGET_TYPE, class STATE>
 	static void Finalize(STATE &state, TARGET_TYPE &target, AggregateFinalizeData &finalize_data) {
-		// n < 2 rather than Spark's n == 0. For a finite single value these agree
-		// (delta_n == delta, so m2 is exactly 0.0, and Spark's own m2 == 0 branch
-		// maps that to NULL). They DIVERGE for a single non-finite or
-		// magnitude-overflowing value — see the edge-case list above.
+		// Finite singletons have zero variance and return NULL like Spark; a
+		// non-finite singleton is a documented divergence (Spark returns NaN).
 		if (state.n < 2 || state.m2 == 0.0) {
 			finalize_data.ReturnNull();
 			return;
 		}
 		double n = static_cast<double>(state.n);
-		// NOT pow(m2, 1.5): Spark uses sqrt((m2*m2)*m2), which overflows to +inf
-		// (=> result 0.0) where pow stays finite, and unlike pow is IEEE-754 exact
-		// and therefore identical across the platforms this extension ships for.
 		target = (std::sqrt(n) * state.m3) / std::sqrt((state.m2 * state.m2) * state.m2);
-		// No finiteness guard on purpose — Spark propagates NaN here. See the
-		// header comment above.
 	}
 
 	static bool IgnoreNull() {

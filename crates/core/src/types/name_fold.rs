@@ -31,7 +31,7 @@
 /// This reproduces JDK 21's per-`char` `equalsIgnoreCase` fold exactly for
 /// every case in the divergence table (`É`/`é`, `MÜLLER`/`müller`, `ß`/`ß`
 /// vs `ß`/`ss`, Greek `σ`/`ς`/`Σ`, the Kelvin sign vs `k`) — see this
-/// module's tests. The one known, ACCEPTED residual: `İ` (LATIN CAPITAL
+/// module's tests. The one known residual: `İ` (LATIN CAPITAL
 /// LETTER I WITH DOT ABOVE, U+0130) vs `i` — Java's `equalsIgnoreCase`
 /// matches them (both fold to `i` under JVM `Character.toLowerCase`'s
 /// locale-independent 1:1 mapping), but Rust's `'İ'.to_lowercase()` yields
@@ -40,9 +40,7 @@
 /// fallback rule leaves `İ` unfolded and it does not match plain `i`. This
 /// is an ADR-022 category-2 (Thunderduck-boundary) residual — bridging it
 /// would need a hardcoded exception table Rust's `char` API has no room
-/// for — and was ALREADY present (identically) on both the pre-existing
-/// ASCII-only and Unicode-lowercasing folds this module replaces, so it is
-/// not a regression.
+/// for.
 pub(crate) fn canon_char(c: char) -> char {
     let upper = single_char(c.to_uppercase()).unwrap_or(c);
     single_char(upper.to_lowercase()).unwrap_or(upper)

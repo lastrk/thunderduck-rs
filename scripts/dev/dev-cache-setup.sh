@@ -18,7 +18,6 @@ SCCACHE_VERSION="${SCCACHE_VERSION:-0.16.0}"
 
 log() { printf '[dev-cache] %s\n' "$*" >&2; }
 
-# --- locations ---------------------------------------------------------------
 common_git="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 [[ -z "$common_git" ]] && { log "not inside a git repo — aborting"; exit 1; }
 MAIN_ROOT="$(dirname "$common_git")"
@@ -30,7 +29,6 @@ mkdir -p "$BIN" "$CACHE_ROOT/sccache"
 triple="$(rustc -vV | awk '/^host: /{print $2}')"   # e.g. aarch64-unknown-linux-gnu
 arch="$(uname -m)"                                   # e.g. aarch64
 
-# --- download helpers --------------------------------------------------------
 fetch() { curl -fsSL --retry 3 --max-time 180 "$1" -o "$2"; }
 
 install_mold() {
@@ -69,7 +67,6 @@ install_sccache() {
 install_mold
 install_sccache
 
-# --- linker shim dirs (gcc -B<dir> uses <dir>/ld) ----------------------------
 # gcc 11 has no -fuse-ld=mold; the -B trick swaps the linker while keeping the
 # gcc driver, so the g++-built libduckdb.a links with the identical C++ runtime.
 mkdir -p "$BIN/ld-mold" "$BIN/ld-lld"
@@ -83,14 +80,12 @@ if [[ -e "$BIN/ld-mold/ld" ]]; then LINKER_DIR="$BIN/ld-mold"; LINKER_NAME="mold
 elif [[ -e "$BIN/ld-lld/ld" ]]; then LINKER_DIR="$BIN/ld-lld"; LINKER_NAME="lld"
 fi
 
-# --- ensure the shared prebuilt libduckdb exists (build once, then reused) ---
 # This is what lets every worktree skip the ~2 GB DuckDB C++ compile: builds
 # link the prebuilt static lib via DUCKDB_LIB_DIR (the default, non-bundled path).
 "$SCRIPT_DIR/duckdb-build-cache.sh" ensure || log "WARN: could not prepare prebuilt libduckdb (builds will need --features bundled)"
 duckdb_dir="$("$SCRIPT_DIR/duckdb-build-cache.sh" dir 2>/dev/null || true)"
 duckdb_lib="$duckdb_dir/lib/libduckdb_static.a"
 
-# --- generate $CARGO_HOME/config.toml (local-only, merges with repo config) --
 # IMPORTANT: we deliberately do NOT put the linker in rustflags. A rustflags
 # entry is part of cargo's fingerprint, so it would invalidate EVERY crate's
 # hash (including the frozen libduckdb.a) and force a full rebuild. The linker
@@ -131,7 +126,6 @@ fi
 
 log "wrote managed block to $cfg (sccache=$([[ -x $BIN/sccache ]] && echo on || echo off), duckdb=$([[ -f $duckdb_lib ]] && echo prebuilt || echo MISSING))"
 
-# --- env.sh: prepend the linker shim to PATH (no fingerprint impact) ---------
 # Source this in shells that build/test. (cargo check / rust-analyzer don't link,
 # so they don't need it; they still get sccache from the cargo config above.)
 envsh="$CACHE_ROOT/env.sh"

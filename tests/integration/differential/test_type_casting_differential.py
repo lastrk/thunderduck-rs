@@ -25,9 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # Numeric Type Casts
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -116,9 +114,7 @@ class TestNumericCasts:
         assert_dataframes_equal(ref, td, "long_to_int")
 
 
-# =============================================================================
 # Decimal Precision Casts
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -129,7 +125,6 @@ class TestDecimalCasts:
     def test_decimal_scale_change(self, spark_reference, spark_thunderduck):
         """CAST decimal with scale change (rounding)"""
         def run_test(spark):
-            # Create decimals and cast to different scale
             return spark.sql("""
                 SELECT
                     CAST(123.456 AS DECIMAL(10,3)) as original,
@@ -173,9 +168,7 @@ class TestDecimalCasts:
         assert_dataframes_equal(ref, td, "double_to_decimal")
 
 
-# =============================================================================
 # Date/Time Casts
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -222,7 +215,6 @@ class TestDateTimeCasts:
     def test_date_to_string(self, spark_reference, spark_thunderduck):
         """CAST date to string"""
         def run_test(spark):
-            # Use SQL to create date values
             return spark.sql("""
                 SELECT
                     DATE '2025-01-15' as date_value,
@@ -248,9 +240,7 @@ class TestDateTimeCasts:
         assert_dataframes_equal(ref, td, "timestamp_to_date")
 
 
-# =============================================================================
 # NULL Handling
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -312,9 +302,7 @@ class TestNullCasts:
         assert_dataframes_equal(ref, td, "cast_null_literal", ignore_nullable=True)
 
 
-# =============================================================================
 # Boolean Casts
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -354,9 +342,7 @@ class TestBooleanCasts:
         assert_dataframes_equal(ref, td, "boolean_to_int")
 
 
-# =============================================================================
 # String Casts
-# =============================================================================
 
 
 @pytest.mark.differential

@@ -1,21 +1,11 @@
-//! Single Spark-DDL type-string parser.
+//! Spark DDL type-string parsing.
 //!
-//! Pass-2 simplification: Spark type-string → [`DataType`] parsing used to be
-//! implemented twice with different grammars — connect-server's
-//! `parse_type_str` (lowercase tokens, decimal / array / intervals / null,
-//! NOT NULL stripping, unknown → `Unresolved`) and emission's
-//! `spark_ddl_type_to_core_data_type` (uppercase tokens, STRUCT / ARRAY,
-//! unknown → `None`). This module is the union of BOTH grammars behind two
-//! entry points that differ only in unknown-token handling: strict (unknown →
-//! `None`, emission behavior) and [`parse_spark_type_lenient`] (unknown →
-//! [`DataType::Unresolved`], connect-server behavior). Only the lenient *type*
-//! entry point and the schema entry point ([`parse_spark_schema`], which routes
-//! through strict parsing internally) are public; strict type parsing is
-//! reachable through `parse_type(s, false)`.
-//!
-//! The union is strictly additive over each legacy parser: every input either
-//! legacy parser accepted parses here to the SAME type; each entry point
-//! additionally accepts what only the *other* legacy grammar covered.
+//! Strict parsing returns `None` for unknown or malformed types. Lenient
+//! parsing maps unknown types to [`DataType::Unresolved`]. Schema parsing is
+//! strict and accepts either a bare field list or a `struct<...>` wrapper.
+//! The grammar is the additive union of the former strict and lenient parsers:
+//! previously accepted inputs keep their meaning, while forms such as
+//! `struct<...>`, `blob`, and bare `null` are shared across call sites.
 //!
 //! Value-level code only: this module must not import `transpiler_v2` or
 //! `runtime` (INV10-adjacent layering — `types/` sits below τ).
@@ -23,15 +13,7 @@
 use super::{DataType, StructField, StructType};
 
 /// Parse a Spark type string leniently: unknown input returns
-/// [`DataType::Unresolved`] (the legacy `parse_type_str` contract).
-///
-/// Grammar = the union of both legacy parsers. Relative to the legacy lenient
-/// parser, acceptance is widened strictly additively by the union:
-/// `struct<name:type,...>` now parses (it previously fell through to
-/// `Unresolved`), `blob` maps to Binary, and a bare `null` token now parses
-/// to [`DataType::Null`] (the legacy suffix-stripping consumed it before the
-/// token match could see it). Nothing the legacy lenient parser accepted
-/// parses differently.
+/// [`DataType::Unresolved`].
 pub fn parse_spark_type_lenient(s: &str) -> DataType {
     // The lenient mode of `parse_type` is total (every fallthrough lands on
     // `Unresolved`); `unwrap_or` is belt-and-braces, not a reachable path.
@@ -42,8 +24,7 @@ pub fn parse_spark_type_lenient(s: &str) -> DataType {
 /// (`"a INT, b ARRAY<STRING>"`) or a single `struct<...>` type
 /// (`"struct<a:INT,b:STRING>"`) — into a [`StructType`]. Returns `None` when
 /// the DDL cannot be translated. All fields are marked nullable (a trailing
-/// `NOT NULL` qualifier is accepted but, matching the legacy parsers, does
-/// not flip nullability).
+/// `NOT NULL` qualifier is accepted but does not flip nullability).
 pub fn parse_spark_schema(ddl: &str) -> Option<StructType> {
     let t = ddl.trim();
     if starts_with_ci(t, "struct<") {
@@ -57,19 +38,16 @@ pub fn parse_spark_schema(ddl: &str) -> Option<StructType> {
 
 /// Core recursive parser. `lenient` controls unknown-token handling only:
 /// `true` → `Some(Unresolved)`, `false` → `None`. In lenient mode every
-/// fallthrough degrades to `Unresolved` (never `None`), matching the legacy
-/// `parse_type_str` which was total.
+/// fallthrough degrades to `Unresolved` (never `None`).
 fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
     let t = s.trim();
-    // Bare `null` / `void` first: the NOT NULL / NULL qualifier stripping
-    // below would otherwise consume a bare `null` token entirely (the legacy
-    // lenient parser had exactly that quirk — bare `null` was unreachable).
+    // Check bare `null` / `void` before stripping type qualifiers.
     if t.eq_ignore_ascii_case("null") || t.eq_ignore_ascii_case("void") {
         return Some(DataType::Null);
     }
     let t = strip_null_qualifiers(t);
 
-    // struct<name:type, ...> (from the legacy strict grammar).
+    // struct<name:type, ...>
     if starts_with_ci(t, "struct<") {
         if let Some(inner) = t["struct<".len()..].strip_suffix('>') {
             if let Some(st) = parse_fields(inner, lenient) {
@@ -83,7 +61,7 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
         }
     }
 
-    // array<element_type> (both legacy grammars; contains_null = true).
+    // array<element_type> (contains_null = true).
     if starts_with_ci(t, "array<") {
         if let Some(inner) = t["array<".len()..].strip_suffix('>') {
             if let Some(elem) = parse_type(inner, lenient) {
@@ -93,13 +71,10 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
                 return None;
             }
         }
-        // Malformed array falls through: token match fails in both modes,
-        // yielding None (strict) / Unresolved (lenient) — legacy behavior.
+        // Malformed arrays fall through to the mode-specific unknown result.
     }
 
-    // decimal / decimal(p) / decimal(p,s) (from the legacy lenient grammar,
-    // defaults preserved verbatim: missing/unparseable precision → 38,
-    // missing/unparseable scale → 18).
+    // decimal / decimal(p) / decimal(p,s), with defaults 38 and 18.
     if starts_with_ci(t, "decimal") {
         return Some(parse_decimal(&t["decimal".len()..]));
     }
@@ -133,11 +108,9 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
     Some(dt)
 }
 
-/// Parse the remainder after a leading `decimal` prefix, replicating the
-/// legacy `parse_type_str` semantics exactly: well-formed `(p,s)` / `(p)`
-/// parse their numbers with fallback defaults (precision 38, scale 18);
-/// anything else (bare `decimal`, malformed parens, trailing junk) yields
-/// `decimal(38,18)`.
+/// Parse the remainder after a leading `decimal` prefix. Well-formed `(p,s)` /
+/// `(p)` forms use fallback defaults (precision 38,
+/// scale 18); bare or malformed forms yield `decimal(38,18)`.
 fn parse_decimal(rest: &str) -> DataType {
     if let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
         let mut parts = inner.split(',');
@@ -243,11 +216,8 @@ fn split_field_name_type(field: &str) -> Option<(&str, &str)> {
     Some((n, &t[sep_len..]))
 }
 
-/// Strip trailing `NOT NULL` / `NULL` qualifiers, replicating the legacy
-/// `trim_end_matches("not null").trim_end_matches("null").trim()` (repeated
-/// suffix stripping, no whitespace normalization between strips) but
-/// case-insensitively and without lowercasing the input — struct field names
-/// must keep their casing.
+/// Strip trailing `NOT NULL` / `NULL` qualifiers case-insensitively without
+/// lowercasing the input, preserving struct field-name casing.
 fn strip_null_qualifiers(s: &str) -> &str {
     let mut cur = s;
     while let Some(rest) = strip_suffix_ci(cur, "not null") {
@@ -286,8 +256,6 @@ mod tests {
     fn lenient(s: &str) -> DataType {
         parse_spark_type_lenient(s)
     }
-
-    // ── Primitive token union ────────────────────────────────────────────
 
     #[test]
     fn primitives_parse_case_insensitively_in_both_modes() {
@@ -343,8 +311,6 @@ mod tests {
         assert_eq!(lenient("garbage"), DataType::Unresolved);
     }
 
-    // ── decimal (legacy parse_type_str defaults preserved verbatim) ──────
-
     #[test]
     fn decimal_forms_and_legacy_defaults() {
         assert_eq!(
@@ -361,7 +327,7 @@ mod tests {
                 scale: 2
             }
         );
-        // decimal(p) → legacy default scale 18.
+        // decimal(p) defaults the scale to 18.
         assert_eq!(
             lenient("decimal(10)"),
             DataType::Decimal {
@@ -369,7 +335,7 @@ mod tests {
                 scale: 18
             }
         );
-        // Bare / malformed decimal → legacy default (38,18).
+        // Bare / malformed decimal defaults to (38,18).
         for input in ["decimal", "decimal(abc)", "decimal(10,2) extra"] {
             assert_eq!(
                 lenient(input),
@@ -382,8 +348,6 @@ mod tests {
         }
     }
 
-    // ── NOT NULL / NULL qualifier stripping ──────────────────────────────
-
     #[test]
     fn not_null_qualifier_is_stripped_in_both_modes() {
         assert_eq!(strict("int not null"), Some(DataType::Integer));
@@ -391,8 +355,6 @@ mod tests {
         assert_eq!(lenient("bigint null"), DataType::Long);
         assert_eq!(lenient("array<int> not null").to_string(), "array<integer>");
     }
-
-    // ── array ─────────────────────────────────────────────────────────────
 
     #[test]
     fn array_parses_with_nullable_elements() {
@@ -411,8 +373,7 @@ mod tests {
 
     #[test]
     fn array_unknown_element_lenient_unresolved_strict_none() {
-        // Legacy lenient behavior: element degrades to Unresolved, the array
-        // itself still parses.
+        // Lenient mode keeps the array shape while degrading its element type.
         assert_eq!(
             lenient("array<garbage>"),
             DataType::Array(Box::new(DataType::Unresolved), true)
@@ -426,8 +387,6 @@ mod tests {
         assert_eq!(lenient("array<int"), DataType::Unresolved);
     }
 
-    // ── struct ────────────────────────────────────────────────────────────
-
     #[test]
     fn struct_parses_in_both_modes() {
         let expected = DataType::Struct(StructType::new(vec![
@@ -438,7 +397,6 @@ mod tests {
             strict("struct<id:bigint,name:string>"),
             Some(expected.clone())
         );
-        // Widening over legacy lenient parse_type_str (previously Unresolved).
         assert_eq!(lenient("struct<id: bigint, name: string>"), expected);
     }
 
@@ -459,8 +417,6 @@ mod tests {
         assert_eq!(strict("struct<a>"), None);
         assert_eq!(lenient("struct<a>"), DataType::Unresolved);
     }
-
-    // ── schema-level helper ──────────────────────────────────────────────
 
     #[test]
     fn parse_spark_schema_accepts_bare_field_list() {
@@ -502,7 +458,6 @@ mod tests {
 
     #[test]
     fn parse_spark_schema_empty_field_list_is_empty_struct() {
-        // Matches the historical emission walker: empty DDL → empty struct.
         assert_eq!(parse_spark_schema(""), Some(StructType::empty()));
     }
 }

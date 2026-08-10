@@ -114,7 +114,6 @@ class TestRangeOperationsDifferential:
 
     def test_range_join_via_sql(self, spark_reference, spark_thunderduck):
         """Test joining two ranges using DataFrame API - exact parity check."""
-        # Create two ranges with column name "id"
         r1_spark = spark_reference.range(0, 5)  # 0, 1, 2, 3, 4
         r2_spark = spark_reference.range(3, 8)  # 3, 4, 5, 6, 7
 

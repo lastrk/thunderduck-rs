@@ -25,8 +25,7 @@
 //!   post-lowering splicing by [`splice_multi_aliases`].
 //!
 //! Both functions use the sqlparser-rs [`Tokenizer`](sqlparser::tokenizer::Tokenizer)
-//! — NOT raw SQL text. Reading tokens (not bytes) keeps τ within CLAUDE.md
-//! rule 1 (no string manipulation on SQL text).
+//! — NOT raw SQL text. Reading tokens preserves SQL structure while rewriting.
 
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -156,8 +155,6 @@ pub(super) fn strip_trailing_multi_alias(
     }
     Ok((stripped, Some(aliases)))
 }
-
-// ── Full-SQL multi-alias rewrite ────────────────────────────────────────────
 
 /// Sentinel prefix used by [`rewrite_multi_aliases`] / [`splice_multi_aliases`].
 /// The format is `__td_multi_alias_<N>` where N is a 0-based index into the
@@ -354,8 +351,6 @@ fn next_non_ws(tokens: &[Token], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-// ── Post-lowering splice ────────────────────────────────────────────────────
-
 /// Walk the `CommonAst` tree recursively and replace sentinel-aliased
 /// projections (from [`rewrite_multi_aliases`]) with the appropriate
 /// generator-specific expansions.
@@ -536,8 +531,6 @@ fn dispatch_multi_alias(
     }
 }
 
-// ── Shared builders ─────────────────────────────────────────────────────────
-
 /// Build a `FunctionCall("stack_multi_alias", [inner, Literal(a1), ..., Literal(aK)])`
 /// expression — the shape the analyzer's `expand_stack_projections` expects.
 ///
@@ -597,8 +590,6 @@ pub(super) fn build_map_explode_pair(
 mod tests {
     use super::*;
 
-    // ── strip_trailing_multi_alias (existing, F.expr path) ──────────────────
-
     #[test]
     fn strips_trailing_two_column_alias() {
         let (sql, aliases) = strip_trailing_multi_alias(
@@ -657,8 +648,6 @@ mod tests {
         assert_eq!(sql, "f(x) as (1, 2)");
     }
 
-    // ── rewrite_multi_aliases (full-SQL path) ───────────────────────────────
-
     #[test]
     fn rewrite_mid_list_occurrence_cx011() {
         // cx-011 shape: `SELECT id, explode(attrs) AS (k, v) FROM emp`
@@ -702,8 +691,6 @@ mod tests {
         assert!(rewritten.contains("__td_multi_alias_0"));
         assert!(rewritten.contains("__td_multi_alias_1"));
     }
-
-    // ── Non-match fixtures (must return unchanged / empty alias lists) ──────
 
     #[test]
     fn rewrite_ignores_cte_body() {
@@ -762,8 +749,6 @@ mod tests {
         assert_eq!(rewritten, sql);
     }
 
-    // ── build_stack_multi_alias ─────────────────────────────────────────────
-
     #[test]
     fn build_stack_multi_alias_shape() {
         let inner = Expression::FunctionCall(FunctionCall {
@@ -796,8 +781,6 @@ mod tests {
             other => panic!("expected FunctionCall, got {other:?}"),
         }
     }
-
-    // ── build_map_explode_pair ───────────────────────────────────────────────
 
     #[test]
     fn build_map_explode_pair_shape() {

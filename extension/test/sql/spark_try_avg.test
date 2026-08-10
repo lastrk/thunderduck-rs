@@ -8,32 +8,29 @@
 
 require thdck_spark_funcs
 
-# integer avg -> DOUBLE
+# Integer averages use DOUBLE, so large BIGINT inputs stay non-NULL; NULL and
+# empty inputs still produce NULL.
 query T
 SELECT CAST(spark_try_avg(v) AS VARCHAR) FROM (VALUES (1::BIGINT),(2),(3)) t(v);
 ----
 2.0
 
-# NULLs skipped
 query T
 SELECT CAST(spark_try_avg(v) AS VARCHAR) FROM (VALUES (1::BIGINT),(NULL),(3)) t(v);
 ----
 2.0
 
-# integer avg does NOT overflow-to-NULL (double); ~9.22e18, matches native AVG
 query I
 SELECT (spark_try_avg(v) > 9e18 AND spark_try_avg(v) < 9.3e18)::INT
 FROM (VALUES (9223372036854775807::BIGINT),(9223372036854775807::BIGINT)) t(v);
 ----
 1
 
-# empty group -> NULL
 query I
 SELECT spark_try_avg(v) FROM (VALUES (1::BIGINT)) t(v) WHERE v > 100;
 ----
 NULL
 
-# return type DOUBLE for integer input
 query T
 SELECT typeof(spark_try_avg(v)) FROM (VALUES (1::BIGINT)) t(v);
 ----

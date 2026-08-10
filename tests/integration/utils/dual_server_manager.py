@@ -123,7 +123,6 @@ class DualServerManager:
         print("Starting Apache Spark Connect Reference Server (Native)")
         print("=" * 80)
 
-        # Check if process is already running
         if self.is_spark_process_running():
             print("✓ Spark Connect process already running")
             if self.wait_for_port(self.spark_reference_port, timeout=10):
@@ -134,7 +133,6 @@ class DualServerManager:
                 print("✗ Process running but server not responding, restarting...")
                 self.stop_spark_reference()
 
-        # Start the native Spark server
         script_path = self.workspace_dir / "tests/scripts/start-spark-4.1.1-reference.sh"
         if not script_path.exists():
             raise FileNotFoundError(f"Spark Connect start script not found: {script_path}")
@@ -236,13 +234,11 @@ class DualServerManager:
         print("Starting Both Servers for Differential Testing")
         print("=" * 80)
 
-        # Start Spark Connect reference first
         spark_ok = self.start_spark_reference(timeout=timeout)
         if not spark_ok:
             print("✗ Failed to start Spark Connect reference server")
             return False, False
 
-        # Start Thunderduck
         thunderduck_ok = self.start_thunderduck(timeout=timeout)
         if not thunderduck_ok:
             print("✗ Failed to start Thunderduck server")
@@ -291,7 +287,6 @@ class DualServerManager:
 
 
 if __name__ == "__main__":
-    # Test the dual server manager
     print("Testing DualServerManager...")
 
     manager = DualServerManager()

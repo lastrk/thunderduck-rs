@@ -63,9 +63,8 @@ impl Dialect for SparkDialect {
     /// `\0 \a \b \f \n \r \t \Z` to their control chars and passes every other
     /// escape through as the char after the backslash (so `\\`→`\`, `\'`→`'`,
     /// `\"`→`"`); this matches Spark for the escapes the corpus exercises
-    /// (`\n`, `\t`). Known Spark divergences with no corpus witness — deferred
-    /// (see architecture-pass-137.md): `\a`→BEL / `\f`→FF (Spark strips the
-    /// backslash to `a`/`f`), `\%`/`\_` LIKE-preservation (sqlparser strips
+    /// (`\n`, `\t`). Known divergences include `\a`→BEL / `\f`→FF (Spark
+    /// strips the backslash to `a`/`f`), `\%`/`\_` LIKE-preservation (sqlparser strips
     /// to `%`/`_` while `ignores_wildcard_escapes` is off), and `\uXXXX`/octal.
     fn supports_string_literal_backslash_escape(&self) -> bool {
         true

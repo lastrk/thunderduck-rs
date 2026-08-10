@@ -79,10 +79,8 @@ from pyspark.sql.types import (
 )
 
 
-# ---------------------------------------------------------------------------
 # Inputs — compact but type-diverse; enough to exercise the Delta-type -> Spark
 # type mapping (ADR-012/013) without the full corpus's nested-type weight.
-# ---------------------------------------------------------------------------
 
 def _d(s: str) -> datetime.date:
     return datetime.date.fromisoformat(s)
@@ -139,9 +137,7 @@ TYPES_ROWS = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # Seed / write helpers (executed by the reference delta-spark session)
-# ---------------------------------------------------------------------------
 
 def seed_delta(rows, schema, partition_by=None):
     """Return a seed closure that overwrites a Delta table at `path` with `rows`."""
@@ -165,9 +161,7 @@ def _read_parquet_df(session: SparkSession, path: str) -> DataFrame:
     return session.read.format("parquet").load(path)
 
 
-# ---------------------------------------------------------------------------
 # Case registry
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DeltaCase:

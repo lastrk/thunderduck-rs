@@ -144,7 +144,6 @@ def run_pair(ref_fn, td_fn) -> tuple:
     return results["ref"], results["td"]
 
 
-# ---------------------------------------------------------------------------
 # Tri-state error-parity comparator (ADR-006 "Error emulation contract")
 #
 # The differential oracle must compare error paths symmetrically:
@@ -152,7 +151,6 @@ def run_pair(ref_fn, td_fn) -> tuple:
 #   both throw with matching error class -> PASS
 #   one throws, one returns values       -> FAIL (divergence)
 #   both throw with different classes    -> FAIL (divergence)
-# ---------------------------------------------------------------------------
 
 _ERROR_TOKEN_RE = re.compile(r"^\s*\[([A-Z][A-Z0-9_.]*)\]")
 # Un-anchored variant: a raw gRPC ``_MultiThreadedRendezvous`` repr buries the
@@ -704,9 +702,7 @@ def assert_dataframes_equal(
             raise AssertionError(f"{query_name} failed:\n{message}")
 
 
-# ============================================================================
 # Orchestrator-Based Comparison (internal implementation)
-# ============================================================================
 
 def compare_differential(
     orchestrator,

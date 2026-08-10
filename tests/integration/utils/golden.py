@@ -69,9 +69,7 @@ def golden_path(corpus: str, case_id: str) -> Path:
     return _GOLDENS_ROOT / corpus / f"{case_id}.json"
 
 
-# ---------------------------------------------------------------------------
 # Schema-driven value codec
-# ---------------------------------------------------------------------------
 
 def _encode(dt: DataType, v: Any) -> Any:
     """Encode a single value of Spark type ``dt`` to a JSON-safe form."""
@@ -164,9 +162,7 @@ def _decode_row(schema: StructType, cells: list) -> tuple:
     return tuple(_decode(f.dataType, c) for f, c in zip(schema.fields, cells))
 
 
-# ---------------------------------------------------------------------------
 # Read / write
-# ---------------------------------------------------------------------------
 
 def write_golden(
     corpus: str,
@@ -217,9 +213,7 @@ def read_golden(corpus: str, case_id: str) -> Optional[Golden]:
     return Golden(kind, schema, rows)
 
 
-# ---------------------------------------------------------------------------
 # Driver helpers (shared by both corpus drivers)
-# ---------------------------------------------------------------------------
 
 def record_reference(corpus: str, case_id: str, ref_df, *, schema_only: bool) -> None:
     """Record a case's reference result from a live Spark ``ref_df`` (record mode).

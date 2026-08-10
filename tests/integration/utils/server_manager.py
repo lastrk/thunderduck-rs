@@ -29,7 +29,6 @@ class ServerManager:
         if binary_path:
             self.server_binary = Path(binary_path)
         else:
-            # Default: release build output
             self.server_binary = (
                 self.workspace_dir / "target/release/thunderduck-connect-server"
             )
@@ -64,7 +63,6 @@ class ServerManager:
                 f"Please build the project first: cargo build --release"
             )
 
-        # Check if port is already in use
         if not self.is_port_available():
             print(f"Port {self.port} is already in use. Attempting to kill existing process...")
             self.kill_existing_server()

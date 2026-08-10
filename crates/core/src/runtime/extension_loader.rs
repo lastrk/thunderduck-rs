@@ -106,14 +106,12 @@ mod tests {
         assert!(load_optional_extension(&conn(), None).is_ok());
     }
 
-    /// PROBE (pass 13, `spark_avg` decimal-coherence wiring): pins the
-    /// shipped ext6 `spark_avg` aggregate's native DECIMAL result type,
+    /// Pins the shipped `spark_avg` aggregate's native DECIMAL result type,
     /// grouped and windowed. `emission.rs`'s `render_decimal_avg` wraps this
     /// call in an outer `CAST(... AS DECIMAL(pa,sa))` regardless (idempotent
     /// if this probe's observed native type already matches Spark's declared
-    /// `(pa,sa)`), so this test exists to catch the extension ever ceasing to
-    /// return DECIMAL (or ceasing to run under a window) — either of which
-    /// would silently reroute the emitted CAST onto a non-decimal substrate.
+    /// `(pa,sa)`), so a change in the extension's native type cannot silently
+    /// alter the emitted decimal path.
     #[test]
     fn spark_avg_decimal_probe() {
         let conn = conn();

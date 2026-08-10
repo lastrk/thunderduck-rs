@@ -25,9 +25,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
-# Test Data Fixtures
-# =============================================================================
 
 @pytest.fixture(scope="class")
 def date_test_data(spark_reference, spark_thunderduck):
@@ -90,9 +87,7 @@ def string_date_data(spark_reference, spark_thunderduck):
     return df_ref, df_td
 
 
-# =============================================================================
 # Date Extraction Tests
-# =============================================================================
 
 @pytest.mark.differential
 @pytest.mark.datetime
@@ -248,9 +243,7 @@ class TestDateExtraction:
         assert_dataframes_equal(ref_result, td_result, query_name="dayofyear_quarter_weekofyear")
 
 
-# =============================================================================
 # Date Arithmetic Tests
-# =============================================================================
 
 @pytest.mark.differential
 @pytest.mark.datetime
@@ -351,9 +344,7 @@ class TestDateArithmetic:
         assert_dataframes_equal(ref_result, td_result, query_name="months_between")
 
 
-# =============================================================================
 # Date Formatting Tests
-# =============================================================================
 
 @pytest.mark.differential
 @pytest.mark.datetime
@@ -431,9 +422,7 @@ class TestDateFormatting:
         assert_dataframes_equal(ref_result, td_result, query_name="unix_timestamp")
 
 
-# =============================================================================
 # Date Truncation Tests
-# =============================================================================
 
 @pytest.mark.differential
 @pytest.mark.datetime

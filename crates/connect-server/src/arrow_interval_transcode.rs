@@ -24,8 +24,6 @@
 //! server-side; the `CalendarInterval` case is already the correct
 //! `Interval(MonthDayNano)` layout that pyarrow accepts.
 //!
-//! # Q3 (empirically verified — see `runtime::session::tests::duckdb_month_day_nano_*`)
-//!
 //! For every pure-DayTime DuckDB result, `months == 0` and the entire
 //! quantity lives in `days` + `nanoseconds`. `INTERVAL 90 DAYS` is emitted as
 //! `{months: 0, days: 90, nanos: 0}` — DuckDB does NOT fold days into months
@@ -35,10 +33,8 @@
 //! total_micros = days as i64 * 86_400_000_000 + nanoseconds / 1_000
 //! ```
 //!
-//! `wrapping_mul`/`wrapping_add` are used because Spark's own
-//! `DayTimeIntervalType` has a smaller range than i64 microseconds
-//! (~±106.7M days ≈ ±292 KY); no observable overflow within legal Spark
-//! values.
+//! Spark's legal range is roughly ±106.7M days (±292K years), which fits in
+//! i64 microseconds, so wrapping arithmetic is safe for legal values.
 
 use std::sync::Arc;
 
@@ -81,12 +77,8 @@ pub struct IntervalPlan {
 
 impl IntervalPlan {
     /// Build the plan by walking `resolved_schema`'s top-level fields.
-    /// Nested intervals (e.g. `Array<DayTimeInterval>`) are intentionally
-    /// NOT walked — Q2 in the architecture plan is "defer nested" and the
-    /// plan calls for a boundary error at `apply` time if one is encountered
-    /// (top-level scan produces `NoOp` for a nested-interval column, and any
-    /// mismatch is caught by the `Interval(MonthDayNano)`-shape guard on
-    /// non-NoOp columns).
+    /// Nested intervals (e.g. `Array<DayTimeInterval>`) are intentionally not
+    /// walked; top-level interval columns are the wire boundary supported here.
     pub fn build(resolved_schema: &TdckStruct) -> Self {
         let mut all_noop = true;
         let targets: Vec<IntervalTarget> = resolved_schema
@@ -101,8 +93,6 @@ impl IntervalPlan {
                     all_noop = false;
                     IntervalTarget::YearMonthPassthrough
                 }
-                // CalendarInterval (`Interval`) needs no transcode — DuckDB
-                // already emits `Interval(MonthDayNano)`.
                 _ => IntervalTarget::NoOp,
             })
             .collect();
@@ -155,9 +145,7 @@ impl From<TranscodeError> for ConnectError {
 /// `columns()` slice is cloned into a fresh `Vec` — no per-column allocation.
 ///
 /// The final wire `RecordBatch` is built by the caller from
-/// `(stamped_schema, columns)` — this function no longer constructs an
-/// intermediate `RecordBatch`/`Schema`/`Vec<Field>` that `arrow_schema_stamp`
-/// would immediately discard (see perf finding MED-1, `.agent-output/004-perf-findings.md`).
+/// `(stamped_schema, columns)`.
 pub fn apply(batch: &RecordBatch, plan: &IntervalPlan) -> Result<Vec<ArrayRef>, TranscodeError> {
     if plan.is_noop() {
         return Ok(batch.columns().to_vec());
@@ -193,8 +181,6 @@ fn transcode_daytime_to_duration_us(
     input: &dyn Array,
     col_index: usize,
 ) -> Result<ArrayRef, TranscodeError> {
-    // Loud-fail if DuckDB ever emits something other than MonthDayNano for
-    // an INTERVAL column (should be impossible in current DuckDB).
     let src = input
         .as_any()
         .downcast_ref::<IntervalMonthDayNanoArray>()
@@ -207,10 +193,6 @@ fn transcode_daytime_to_duration_us(
     let n = src.len();
     let mut out: Vec<i64> = Vec::with_capacity(n);
     for v in src.values() {
-        // Q3-verified layout: DuckDB emits months == 0 for pure DayTime; the
-        // rare pathological case (months != 0) collapses to 30-day rate
-        // implicitly by ignoring months here. Spark 4.1's own
-        // `IntervalUtils.subtractTimestamps` never emits months either.
         let micros = (v.days as i64)
             .wrapping_mul(86_400_000_000)
             .wrapping_add(v.nanoseconds / 1_000);
@@ -343,7 +325,6 @@ mod tests {
             Some(IntervalMonthDayNano::new(0, 2, 0)),
         ];
         let src = IntervalMonthDayNanoArray::from(vals);
-        // Sanity: nulls sitting on input.
         assert!(src.nulls().is_some());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "dt",
@@ -370,7 +351,6 @@ mod tests {
     /// (i.e. DuckDB regressed) → `UnexpectedArrowType` error.
     #[test]
     fn unexpected_arrow_type_returns_error() {
-        // Build a Duration(us) column but declare tdck as DayTimeInterval.
         let bogus = DurationMicrosecondArray::new(ScalarBuffer::from(vec![1_000_000i64]), None);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "dt",
@@ -412,20 +392,12 @@ mod tests {
         );
     }
 
-    /// Pins the streaming pipeline shape (perf finding MED-1). `apply` returns
-    /// only `Vec<ArrayRef>`; the caller feeds those columns + a wire schema
-    /// (built once per query, distinct from the source Arrow schema in both
-    /// type — post-transcode — and name — post-stamp) directly to a single
-    /// `RecordBatch::try_new_with_options`. Regressing the seam back to
-    /// "apply builds a RecordBatch, then it is rebuilt against the
-    /// `build_stamped_schema` result" would fail this assertion by producing
-    /// a batch whose schema comes from `apply` rather than the
-    /// caller-supplied schema.
+    /// The caller combines transcoded columns with the stamped wire schema in
+    /// one `RecordBatch` construction.
     #[test]
     fn one_shot_batch_construction_from_cols_and_wire_schema() {
         use arrow::array::RecordBatchOptions;
 
-        // Source: {dt: Interval(MonthDayNano)} — DuckDB shape.
         let src =
             IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNano::new(0, 1, 500_000_000)]);
         let src_schema = Arc::new(Schema::new(vec![Field::new(
@@ -436,7 +408,6 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::clone(&src_schema), vec![Arc::new(src)]).unwrap();
         let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
 
-        // Step 1: apply returns columns only.
         let cols = apply(&batch, &plan).expect("apply must succeed");
         assert_eq!(cols.len(), 1);
         assert_eq!(
@@ -445,16 +416,12 @@ mod tests {
             "transcoded column carries the post-transcode Arrow type",
         );
 
-        // Step 2: caller builds a wire schema whose (a) type matches the
-        // transcoded column AND (b) name differs from the source — mimicking
-        // the stamped-schema path in `service::streaming_step`.
         let wire_schema = Arc::new(Schema::new(vec![Field::new(
             "renamed_dt",
             ArrowDt::Duration(TimeUnit::Microsecond),
             true,
         )]));
 
-        // Step 3: one-shot RecordBatch construction from (wire_schema, cols).
         let opts = RecordBatchOptions::new()
             .with_match_field_names(false)
             .with_row_count(Some(batch.num_rows()));

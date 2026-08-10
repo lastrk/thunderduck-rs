@@ -10,22 +10,17 @@
 
 require thdck_spark_funcs
 
-# -----------------------------------------------------------------------------
-# Return type and seed semantics
-# -----------------------------------------------------------------------------
 
 query I
 SELECT typeof(spark_hash(1::INTEGER));
 ----
 INTEGER
 
-# Zero args returns the initial seed (42)
 query I
 SELECT spark_hash();
 ----
 42
 
-# NULL skip: a NULL leaves the seed unchanged
 query I
 SELECT spark_hash(NULL::INTEGER);
 ----
@@ -42,19 +37,13 @@ SELECT spark_hash(1::INTEGER, NULL::INTEGER, 2::INTEGER) = spark_hash(1::INTEGER
 ----
 true
 
-# -----------------------------------------------------------------------------
-# Spark documentation golden — primary parity oracle
 # https://spark.apache.org/docs/latest/api/sql/index.html#hash
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_hash('Spark', [123]::INTEGER[], 2::INTEGER);
 ----
 -1321691492
 
-# -----------------------------------------------------------------------------
-# Per-type goldens
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_hash(TRUE);
@@ -66,7 +55,6 @@ SELECT spark_hash(FALSE);
 ----
 933211791
 
-# Cross-type invariants
 query II
 SELECT spark_hash(TRUE) = spark_hash(1::INTEGER),
        spark_hash(1::INTEGER) = spark_hash(1::TINYINT);
@@ -95,7 +83,6 @@ SELECT spark_hash((-1)::INTEGER);
 ----
 -1604776387
 
-# SMALLINT -1 sign-extends to INTEGER -1
 query I
 SELECT spark_hash((-1)::SMALLINT) = spark_hash((-1)::INTEGER);
 ----
@@ -111,7 +98,8 @@ SELECT spark_hash((-1)::BIGINT);
 ----
 -939490007
 
-# NaN canonicalization
+# NaNs use Java's canonical FLOAT (0x7FC00000) and DOUBLE (0x7FF8000000000000)
+# bit patterns before entering the byte/integer hash path.
 query I
 SELECT spark_hash('nan'::FLOAT);
 ----
@@ -160,7 +148,8 @@ SELECT spark_hash(TIMESTAMP '1970-01-01 00:00:00') = spark_hash(0::BIGINT);
 ----
 true
 
-# Decimal
+# DECIMAL precision <=18 hashes the unscaled long; wider DECIMAL hashes
+# BigInteger.toByteArray(unscaledValue).
 query I
 SELECT spark_hash(123.45::DECIMAL(5,2));
 ----
@@ -171,9 +160,6 @@ SELECT spark_hash(123456789012345.6789::DECIMAL(38,4));
 ----
 -285683440
 
-# -----------------------------------------------------------------------------
-# Nested types
-# -----------------------------------------------------------------------------
 
 # Spark invariant: array(1, 2) folds the same as columns (1, 2)
 query I
@@ -212,19 +198,14 @@ SELECT spark_hash(MAP {1::INTEGER: 'a', 2::INTEGER: 'b'});
 ----
 -1706464220
 
-# -----------------------------------------------------------------------------
-# Multi-column seed chaining
-# -----------------------------------------------------------------------------
 
 query I
 SELECT spark_hash(1::INTEGER, 2::BIGINT, 'hello');
 ----
 948072272
 
-# -----------------------------------------------------------------------------
-# Vectorized batch
-# -----------------------------------------------------------------------------
 
+# Each output row starts from seed 42 and folds only its own selected input row.
 query II
 SELECT i, spark_hash(i::BIGINT) FROM range(3) t(i);
 ----
@@ -232,9 +213,7 @@ SELECT i, spark_hash(i::BIGINT) FROM range(3) t(i);
 1	-1712319331
 2	-797927272
 
-# -----------------------------------------------------------------------------
 # Unsupported types throw at bind time
-# -----------------------------------------------------------------------------
 
 statement error
 SELECT spark_hash(1::UTINYINT);

@@ -54,7 +54,6 @@ for arg in "$@"; do
   esac
 done
 
-# --- 1. submodules present? --------------------------------------------------
 need_init=0
 for path in extension/duckdb extension/extension-ci-tools; do
   if [[ -z "$(ls -A "$ROOT/$path" 2>/dev/null)" ]]; then
@@ -73,7 +72,6 @@ if [[ "$need_init" -eq 1 ]]; then
   fi
 fi
 
-# --- 2. parse the pin -------------------------------------------------------
 [[ -f "$BUILD_PINS" ]] || {
   err "missing $BUILD_PINS"
   exit 1
@@ -84,7 +82,6 @@ pinned_version="$(awk -F'"' '/^\[duckdb\]/{f=1; next} /^\[/{f=0} f && /^version 
   exit 1
 }
 
-# --- 3. three-way lock -------------------------------------------------------
 # (a) extension/duckdb submodule checked out at the pinned tag
 submodule_tag="$(git -C "$EXT_DIR/duckdb" describe --tags --exact-match 2>/dev/null || true)"
 if [[ "$submodule_tag" != "$pinned_version" ]]; then
@@ -119,7 +116,6 @@ fi
 
 log "three-way lock OK: submodule=$submodule_tag  BUILD_PINS=$pinned_version  duckdb crate=$crate_version ($decoded_version)"
 
-# --- 4. host platform ---------------------------------------------------------
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
 case "$uname_s-$uname_m" in
@@ -134,7 +130,6 @@ case "$uname_s-$uname_m" in
 esac
 log "host platform: $platform"
 
-# --- 5. build ------------------------------------------------------------------
 if command -v ninja >/dev/null 2>&1; then
   export GEN=ninja
   log "using ninja generator"
@@ -164,7 +159,6 @@ log "built:   $BIN"
 log "sha256:  $sha256"
 log "size:    $size bytes"
 
-# --- 6. footer check: expect the pinned DuckDB version + this platform ------
 footer="$(tail -c 1024 "$BIN" | strings)"
 footer_ok=1
 if ! grep -qF -- "$pinned_version" <<<"$footer" && ! grep -qF -- "${pinned_version#v}" <<<"$footer"; then
@@ -178,7 +172,6 @@ fi
 [[ "$footer_ok" -eq 1 ]] || exit 1
 log "footer check OK ($pinned_version + $platform present in the binary footer)"
 
-# --- 7. --smoke ----------------------------------------------------------------
 if [[ "$DO_SMOKE" -eq 1 ]]; then
   log "running make test (SQLLogicTest suite)"
   make -C "$EXT_DIR" test

@@ -6,22 +6,10 @@
 
 namespace duckdb {
 
-// ---------------------------------------------------------------------------
-// spark_schema_of_json: Parses a JSON string and returns Spark DDL schema format
-//
-// Example:
-//   spark_schema_of_json('{"a": 1, "b": "hello"}')
-//   → 'STRUCT<a: BIGINT, b: STRING>'
-//
-// Type mapping (JSON → Spark DDL):
-//   null    → VOID
-//   boolean → BOOLEAN
-//   integer → BIGINT
-//   real    → DOUBLE
-//   string  → STRING
-//   array   → ARRAY<element_type>
-//   object  → STRUCT<field1: type1, field2: type2, ...>
-// ---------------------------------------------------------------------------
+// Parses JSON and returns Spark DDL: JSON null maps to VOID, numbers map to
+// BIGINT or DOUBLE, strings to STRING, arrays to ARRAY<T>, and objects to
+// STRUCT<name: type>. Invalid JSON produces a NULL result; array type
+// inference uses the first element.
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -49,7 +37,7 @@ static std::string InferSparkType(yyjson_val *val) {
 		return "STRING";
 
 	case YYJSON_TYPE_ARR: {
-		// Infer element type from first element (or VOID if empty)
+		// Spark defaults an empty array to ARRAY<STRING>.
 		yyjson_arr_iter iter;
 		yyjson_arr_iter_init(val, &iter);
 		yyjson_val *elem = yyjson_arr_iter_next(&iter);

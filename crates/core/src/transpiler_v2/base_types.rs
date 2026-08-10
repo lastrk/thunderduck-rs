@@ -7,7 +7,7 @@
 //! closure — the dispatch site constructs the closure that
 //! bridges `DuckDbSession` into this overlay.
 //!
-//! **Short-circuit invariant (checklist §5.5):** `build_from_plan()` walks
+//! **Short-circuit invariant:** `build_from_plan()` walks
 //! the plan once via [`empty_scan_tables()`] and never invokes the catalog
 //! closure when no empty-schema `TableScan` exists. See the
 //! `build_from_plan_short_circuits_when_no_empty_scan` test.
@@ -40,7 +40,7 @@ impl BaseTypes {
     /// Build an overlay by walking `plan` and resolving every empty-schema
     /// `TableScan` via `catalog_lookup`.
     ///
-    /// **Short-circuit (checklist §5.5):** `catalog_lookup` is invoked at
+    /// **Short-circuit:** `catalog_lookup` is invoked at
     /// most once per unique table name collected by [`empty_scan_tables`] —
     /// a plan with no empty-schema `TableScan` never invokes it, verified by
     /// the `build_from_plan_short_circuits_when_no_empty_scan` test.
@@ -127,8 +127,6 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         collect_empty_scan_tables(child, out);
     }
 }
-
-// ── Seam D: subquery-aware expression descent ────────────────────────────────
 
 /// Invoke `f` on every expression carried *directly* by `op`. Operators whose
 /// only expressions are guaranteed literal (`LocalRelation`) or absent
@@ -325,8 +323,6 @@ mod tests {
 
     #[test]
     fn empty_scan_tables_empty_for_project_over_populated_scan() {
-        // §5.5 short-circuit anchor: a plan whose leaves are non-TableScan
-        // (here: SingleRow) collects nothing.
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![single_int_literal()],
@@ -394,7 +390,6 @@ mod tests {
 
     #[test]
     fn build_from_plan_short_circuits_when_no_empty_scan() {
-        // Anchor for §5.5: closure MUST NOT be invoked when no TableScan.
         let calls = Cell::new(0u32);
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
@@ -411,7 +406,6 @@ mod tests {
     #[test]
     fn build_from_plan_calls_catalog_lookup_once_per_empty_scan_table() {
         let calls = Cell::new(0u32);
-        // Same table twice → dedup after first insert.
         let scan1 = table_scan("orders");
         let scan2 = table_scan("orders");
         let plan = CommonAst::new(CommonOp::Join {
@@ -430,7 +424,6 @@ mod tests {
             calls.set(calls.get() + 1);
             Some(schema.clone())
         });
-        // Closure invoked once — cached on the second occurrence of "orders".
         assert_eq!(calls.get(), 1);
         assert!(!bt.is_empty());
         assert_eq!(bt.lookup("orders"), Some(&schema));
@@ -453,8 +446,6 @@ mod tests {
         assert_eq!(bt.lookup("Orders"), Some(&schema));
         assert!(bt.lookup("orders").is_none());
     }
-
-    // ── Pass 106 — Seam D: subquery-nested tables are collected ──────────
 
     #[test]
     fn collect_descends_into_in_subquery_over_dept() {

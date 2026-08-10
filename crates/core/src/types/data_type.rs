@@ -4,7 +4,6 @@
 /// Compound types use `Box<DataType>` to avoid infinite size.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataType {
-    // ── Scalar ────────────────────────────────────────────────────
     Boolean,
     Byte,
     Short,
@@ -32,7 +31,6 @@ pub enum DataType {
     /// Type could not be statically resolved; treated as VARCHAR at generation time.
     Unresolved,
 
-    // ── Compound ─────────────────────────────────────────────────
     /// Array type. Second field is `contains_null` (whether elements may be null).
     Array(Box<DataType>, bool),
     Map {

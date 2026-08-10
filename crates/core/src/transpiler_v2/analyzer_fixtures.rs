@@ -1,16 +1,15 @@
-//! τ's analyzer fixtures — 5 input relations + 11 mini-fixtures for INV4 / INV5.
+//! τ's analyzer fixtures for INV4 and INV5.
 //!
 //! **INV10:** this module imports ONLY `crate::types::{DataType, StructField,
 //! StructType}` and intra-τ modules.
 //!
-//! The five input-relation schemas mirror
-//! `tests/integration/differential/dataframe_corpus.py::build_inputs`,
-//! reduced to τ's analyzer types (arrays / maps / structs kept for `emp.address`).
+//! The input-relation schemas mirror the differential corpus's analyzer
+//! inputs, reduced to τ's types.
 //!
 //! [`all_fixtures`] yields Ok-path fixtures only — used by
 //! `invariants::inv4_inference_validated_in_isolation` and
-//! `invariants::inv5_schema_everywhere`. Error-path fixtures (e.g. ambiguous
-//! column) are exercised directly inside `analyzer.rs::tests`.
+//! `invariants::inv5_schema_everywhere`. Error-path fixtures are exercised
+//! directly inside `analyzer.rs::tests`.
 
 use super::analyzer::flip_all_nullable;
 use super::ast::{CommonAst, CommonOp, JoinType, SetOpKind};
@@ -21,8 +20,6 @@ use super::expression::{
 };
 use super::schema::ResolvedSchema;
 use crate::types::{DataType, StructField, StructType};
-
-// ── Input-relation schemas ──────────────────────────────────────────────────
 
 /// Schema for the `emp` input relation.
 pub(crate) fn emp_schema() -> StructType {
@@ -174,15 +171,12 @@ fn table_scan_chain(names: &[&str]) -> CommonAst {
     })
 }
 
-// ── Mini-fixture builders ───────────────────────────────────────────────────
-
 /// A ready-to-analyze fixture record.
 pub(crate) type Fixture = (&'static str, CommonAst, BaseTypes, StructType);
 
 /// Yield every Ok-path τ's analyzer fixture.
 ///
-/// Ordering matches plan §7 §11 — error-path fixtures (`AmbiguousColumn`) are
-/// exercised directly in `analyzer.rs::tests`, not here.
+/// Error-path fixtures are exercised directly in `analyzer.rs::tests`.
 pub(crate) fn all_fixtures() -> impl Iterator<Item = Fixture> {
     vec![
         input_relation_emp(),
@@ -215,8 +209,6 @@ pub(crate) fn all_fixtures() -> impl Iterator<Item = Fixture> {
     ]
     .into_iter()
 }
-
-// ── Input-relation fixtures ────────────────────────────────────────────────
 
 fn input_relation_emp() -> Fixture {
     (
@@ -262,8 +254,6 @@ fn input_relation_raw() -> Fixture {
         raw_schema(),
     )
 }
-
-// ── Set-op widening fixtures ────────────────────────────────────────────────
 
 fn values_row(name: &str, lit: LiteralValue, dt: DataType) -> CommonAst {
     CommonAst::new(CommonOp::Values {
@@ -353,8 +343,6 @@ fn except_widens_short_and_long() -> Fixture {
     )
 }
 
-// ── Outer-join nullability fixtures ─────────────────────────────────────────
-
 /// Test-only bridge: `flip_all_nullable` operates on `ResolvedSchema`, but
 /// these fixtures build their `expected` schema as a plain `StructType`
 /// (per `Fixture`'s shape) — mint, flip, then drop back to `StructType`.
@@ -437,8 +425,6 @@ fn full_outer_join_flips_both_sides() -> Fixture {
     )
 }
 
-// ── Nested-struct field access ──────────────────────────────────────────────
-
 fn nested_struct_field_access() -> Fixture {
     // Project `emp.address.geo.lat` — the analyzer should resolve nested
     // nullability via ExtractValue chaining. Since ExtractValue is
@@ -476,12 +462,10 @@ fn nested_struct_field_access() -> Fixture {
     )
 }
 
-// ── plan_id disambiguates self-join ─────────────────────────────────────────
-
 fn plan_id_disambiguates_self_join() -> Fixture {
     // `emp AS e1 JOIN emp AS e2 ON e1.id = e2.manager_id` — we use aliases
     // so the join condition columns can be resolved to distinct sides via
-    // qualifier. plan_ids are attached to signal future τ work's downstream use.
+    // qualifier. Plan ids identify the two aliases.
     let cond = Expression::Binary(BinaryExpression {
         op: BinaryOp::Eq,
         left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -516,8 +500,6 @@ fn plan_id_disambiguates_self_join() -> Fixture {
     )
 }
 
-// ── Star expansion ──────────────────────────────────────────────────────────
-
 fn star_expansion_in_project() -> Fixture {
     let ast = CommonAst::new(CommonOp::Project {
         input: Box::new(table_scan("dept")),
@@ -531,8 +513,6 @@ fn star_expansion_in_project() -> Fixture {
         expected,
     )
 }
-
-// ── SparkSQL plan_id = None resolves via qualifier (Open Decision 12) ───────
 
 fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
     // Reference `emp.id` with no plan_id — the analyzer must resolve via
@@ -557,7 +537,6 @@ fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
     )
 }
 
-// ── Alias-aware qualified column resolution over joins (jn-006) ────────────
 //
 // `emp.dept_id` is nullable, `dept.dept_id` is non-null (see the schemas
 // above) — the SAME name on both sides of a join with DIFFERING

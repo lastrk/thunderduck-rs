@@ -13,6 +13,8 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
 ## Workflow shape
 
+- **Do not infer a missing host credential from a devcontainer fallback test.** The Codex devcontainer setup (2026-08-06) initially treated absent captured files under `/workspace/.devcontainer/` as evidence that no OpenAI credential was available. A safe host check showed both `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` unset, while `codex login status` reported a ChatGPT login cached in `~/.codex/auth.json`. Rule: distinguish environment credentials from Codex's persisted ChatGPT session; inspect both without printing secrets before recommending an auth path.
+
 - **Substrate-only efforts are the right shape when the runway to the next unlock is long.**
   The v2 analyzer (2026-07-01) landed as substrate with an honest zero-delta on the
   differential progress signal (`v2_progress.md` stayed 12/324). Fighting for a fake `+N`

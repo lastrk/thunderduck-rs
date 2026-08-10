@@ -3,6 +3,9 @@
 .devcontainer/.claude-auth-token
 .devcontainer/.claude-base-url
 .devcontainer/.claude-custom-headers
+.devcontainer/.codex-api-key
+.devcontainer/.codex-access-token
+.devcontainer/.codex-auth.json
 
 # GitHub auth token forwarded from host (auto-generated, keep secret)
 .devcontainer/.github-token

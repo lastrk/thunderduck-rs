@@ -798,6 +798,71 @@ case("num-030", "numeric_tower", "bitwise AND/OR/XOR over short/int/bigint", "SE
 case("num-031", "numeric_tower", "shift/bit_count over integral tower", "SELECT shiftleft(a, 2) shl, shiftright(lng, 1) shr, bit_count(a) bc FROM nums", flags=("schema_only",))
 case("num-032", "numeric_tower", "hex/bin over int vs bigint", "SELECT hex(a) ha, hex(lng) hl, bin(a) ba FROM nums", flags=("schema_only",))
 
+# ── Review A1 witnesses (SQL front end) ─────────────────────────────────────
+# These three sites used to carry their Spark class as PROSE inside an
+# `AnalyzerError::Other` message, e.g.
+# "UNSUPPORTED_FEATURE: LATERAL join with NATURAL join". The oracle recovers a
+# class with `^\s*\[([A-Z][A-Z0-9_.]*)\]`, which cannot see a prose token — and
+# because `Other` bridged to a τ-boundary `Unsupported`, the wire message led
+# with "τ emission error:" and exited as gRPC UNIMPLEMENTED. So these could
+# only ever report error_class=None and were structurally unable to pass,
+# independent of being red.
+#
+# Two of the three prose tokens were also simply WRONG. Every class below was
+# observed against live Spark 4.1.1 and checked against the 1244-condition
+# catalogue in spark-common-utils_2.13-4.1.1.jar:
+#   * LATERAL+NATURAL is INCOMPATIBLE_JOIN_TYPES, not UNSUPPORTED_FEATURE —
+#     no UNSUPPORTED_FEATURE subclass for natural joins exists at all.
+#   * LATERAL+USING is the UNSUPPORTED_FEATURE.LATERAL_JOIN_USING *subclass*;
+#     the prose carried only the bare base class.
+case("errcls-101", "error_class", "A1 — recursive CTE with UNION (not ALL)", "WITH RECURSIVE seq(n) AS (SELECT 1 UNION SELECT n + 1 FROM seq WHERE n < 5) SELECT * FROM seq", flags=("spark4",), expected_error="UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE")
+case("errcls-102", "error_class", "A1 — LATERAL join with NATURAL join", "SELECT * FROM emp NATURAL JOIN LATERAL (SELECT 1 AS id)", expected_error="INCOMPATIBLE_JOIN_TYPES")
+case("errcls-103", "error_class", "A1 — LATERAL join with USING", "SELECT * FROM emp JOIN LATERAL (SELECT 1 AS id) USING (id)", expected_error="UNSUPPORTED_FEATURE.LATERAL_JOIN_USING")
+case("errcls-104", "error_class", "A1 — ragged VALUES rows", "SELECT * FROM VALUES (1, 2), (3) AS t(a, b)", expected_error="INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH")
+
+# ── Parse-error emulation witnesses (A1's twin, one layer up) ───────────────
+# Every sqlparser failure used to become Unsupported{ProtoShape,
+# "sql::parse_error"} -> gRPC UNIMPLEMENTED with no recoverable class, exactly
+# the miscategorisation A1 fixed in the analyzer. `classify_parse_failure`
+# (parser_v2/mod.rs) now upgrades the provably-malformed subset to a
+# Spark-emulated PARSE_SYNTAX_ERROR, using three signals that hold regardless of
+# grammar coverage: a lexical failure, unbalanced delimiters, or an EMPTY slot
+# where an expression is required.
+#
+# GROUP 1 — both engines reject AND Spark's class is PARSE_SYNTAX_ERROR.
+# 002-005 are GREEN: each is caught by one of the three signals.
+case("parseerr-002", "error_class", "unbalanced paren — malformed by delimiter count", "SELECT (1 FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-003", "error_class", "dangling GROUP BY — expression required, input ended", "SELECT * FROM emp GROUP BY", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-004", "error_class", "unterminated string — lexical failure", "SELECT 'abc FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-005", "error_class", "empty UNPIVOT IN list — expression required, slot empty", "SELECT * FROM emp UNPIVOT (v FOR k IN ())", expected_error="PARSE_SYNTAX_ERROR")
+# parseerr-001 is DEFERRED and provably unfixable without a Spark-grammar
+# oracle. `SELECT * FRM emp` IS malformed, but sqlparser reports
+# `Expected: end of statement, found: FRM` — byte-identical in form to the shape
+# produced by genuine τ grammar gaps (HiveQL TRANSFORM -> `found: 'cat'`,
+# VERSION AS OF -> `found: AS`, CREATE TABLE ... USING -> `found: USING`), all of
+# which Spark ACCEPTS. Upgrading this shape would tell users their valid Spark is
+# invalid. Kept red on purpose; it will go green for free if sqlparser ever grows
+# those constructs, shrinking the ambiguous set. See
+# docs/future_work/adr-022-strict-rejection-enforcement.md.
+case("parseerr-001", "error_class", "keyword typo; error shape is indistinguishable from a τ grammar gap", "SELECT * FRM emp", flags=("deferred",), expected_error="PARSE_SYNTAX_ERROR")
+#
+# GROUP 2 — the COUNTER-EXAMPLE, and the reason a blanket
+# sql::parse_error -> PARSE_SYNTAX_ERROR mapping is UNSAFE. sqlparser rejects
+# this at parse time, but Spark parses it fine and fails later in ANALYSIS with
+# a completely different class. Mapping the whole sql::parse_error category to
+# PARSE_SYNTAX_ERROR would therefore emit the WRONG class here, replacing one
+# miscategorisation with another. A fix must make this case report
+# UNSUPPORTED_FEATURE.TIME_TRAVEL (or stay UNIMPLEMENTED) — never
+# PARSE_SYNTAX_ERROR. This is the guardrail against over-mapping.
+#
+# The survey also found two shapes Spark ACCEPTS OUTRIGHT while sqlparser
+# rejects them (HiveQL TRANSFORM; CREATE TABLE ... USING parquet) — the same
+# hazard in its starkest form. They are recorded in
+# tasks/tau-error-class-audit-2026-08.md rather than as corpus cases, because
+# TRANSFORM spawns an external process and CREATE TABLE mutates catalog state,
+# neither of which belongs in the corpus.
+case("parseerr-101", "error_class", "counter-example — time travel: τ says sql::parse_error, Spark says UNSUPPORTED_FEATURE.TIME_TRAVEL (must NOT become PARSE_SYNTAX_ERROR)", "SELECT * FROM emp VERSION AS OF 1", flags=("deferred",), expected_error="UNSUPPORTED_FEATURE.TIME_TRAVEL")
+
 
 # ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
 #

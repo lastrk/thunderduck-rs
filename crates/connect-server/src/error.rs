@@ -71,14 +71,14 @@ mod tests {
 
     /// ADR-023 chunk 3b must-have: an ambiguous-column `EmissionError`
     /// surfaces as a `Status` whose message LEADS with the real Spark class
-    /// token (`[AMBIGUOUS_REFERENCE]`), not `Status::unimplemented`'s
-    /// `analyzer-spark-emulated` marker. This is what unblocks
+    /// token (`[AMBIGUOUS_REFERENCE]`) under INVALID_ARGUMENT, never as a
+    /// τ-boundary UNIMPLEMENTED. This is what unblocks
     /// `tests/integration/utils/dataframe_diff.py::spark_error_class` on the
     /// client side.
     #[test]
     fn spark_emulated_ambiguous_column_status_leads_with_class_token() {
         let emission_err = EmissionError::SparkEmulated {
-            class: "AMBIGUOUS_REFERENCE",
+            class: Some("AMBIGUOUS_REFERENCE"),
             message:
                 "column `dept_id` is ambiguous, candidates: [\"emp.dept_id\", \"dept.dept_id\"]"
                     .to_owned(),
@@ -91,6 +91,43 @@ mod tests {
             status.message().starts_with("[AMBIGUOUS_REFERENCE]"),
             "expected Status message to lead with the Spark class token, got: {}",
             status.message()
+        );
+    }
+
+    /// Review A1. A Spark-emulated error whose Spark class τ has NOT
+    /// established must still exit as `INVALID_ARGUMENT` — Spark rejects the
+    /// input too, so `UNIMPLEMENTED` ("τ doesn't support this") would be a lie.
+    /// Before A1 every such error took the boundary path.
+    ///
+    /// It must ALSO render prefix-free. The client oracle recovers the class
+    /// with `^\s*\[([A-Z][A-Z0-9_.]*)\]`
+    /// (`tests/integration/utils/dataframe_diff.py`), so any leading
+    /// bracketed token here would be compared against Spark's real class as if
+    /// τ had emitted one. `None` must yield no token at all rather than a
+    /// placeholder.
+    #[test]
+    fn classless_spark_emulated_is_invalid_argument_with_no_bogus_token() {
+        let emission_err = EmissionError::SparkEmulated {
+            class: None,
+            message: "requirement failed: Unsupported natural join type LeftSemi".to_owned(),
+        };
+        let connect_err: ConnectError = emission_err.into();
+        let status: Status = connect_err.into();
+
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "a classless Spark-emulated error is still Spark-emulated"
+        );
+        assert!(
+            !status.message().starts_with('['),
+            "a classless error must not lead with any bracketed token — the \
+             oracle would read it as a real Spark class; got: {}",
+            status.message()
+        );
+        assert_eq!(
+            status.message(),
+            "requirement failed: Unsupported natural join type LeftSemi"
         );
     }
 

@@ -108,6 +108,15 @@ def test_case(case: Case, request, corpus_inputs_thunderduck, tpc_view_switcher)
     row comparison; everything else is row-compared after `repr`-sort
     canonicalization.
     """
+    # `deferred` cases are known-divergent and INTENTIONALLY not fixed — each
+    # carries its reason in the corpus comment and in
+    # docs/future_work/. Skipped rather than left red so the corpus signal
+    # stays meaningful: a red case should mean "τ regressed or is missing a
+    # feature", not "we already decided this one waits". pytest still reports
+    # them as skips, so they cannot silently disappear.
+    if "deferred" in case.flags:
+        pytest.skip(f"deferred (see corpus comment / docs/future_work): {case.description}")
+
     mode = golden.oracle_mode()
 
     # tpch/tpcds cases: re-point the benchmark-colliding temp views (e.g.

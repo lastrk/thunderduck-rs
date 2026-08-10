@@ -1,0 +1,84 @@
+{
+ "id": "errcls-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "kept",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "x",
+       "type": "long",
+       "nullable": false,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$row": [
+     1
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     2
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     3
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     4
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     5
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     6
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     7
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     8
+    ]
+   }
+  ]
+ ]
+}

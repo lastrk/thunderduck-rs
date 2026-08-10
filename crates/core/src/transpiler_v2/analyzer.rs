@@ -763,6 +763,16 @@ pub enum TypedOp {
 ///
 /// The Display prefix (`[SPARK-EMULATED]` vs `[TDCK-BOUNDARY]`) enables
 /// grep-based classification and reviewer verification.
+/// Display prefix marking an [`AnalyzerError`] as ADR-022 Spark-emulated.
+/// Stripped by [`analyzer_error_to_emission_error`] before the Spark class
+/// token (if any) takes its place as the leading token on the wire.
+pub const SPARK_EMULATED_PREFIX: &str = "[SPARK-EMULATED] ";
+/// Display prefix marking an [`AnalyzerError`] as a Thunderduck-boundary gap.
+pub const TDCK_BOUNDARY_PREFIX: &str = "[TDCK-BOUNDARY] ";
+/// Display prefix marking an [`AnalyzerError`] as a τ-internal invariant
+/// violation — neither ADR-022 category.
+pub const TDCK_INTERNAL_PREFIX: &str = "[TDCK-INTERNAL] ";
+
 #[derive(thiserror::Error, Debug, Clone, PartialEq)]
 pub enum AnalyzerError {
     // ── Spark-emulated ─────────────────────────────────────────────────────
@@ -829,11 +839,50 @@ pub enum AnalyzerError {
         context: String,
     },
 
+    /// A Spark-emulated error whose exact Spark error-class token has been
+    /// **observed against live Spark 4.1.1** (review A1; the per-site audit is
+    /// recorded in `tasks/tau-error-class-audit-2026-08.md`).
+    ///
+    /// Prefer this over [`Self::Other`] whenever the class is known. `Other`
+    /// means "Spark rejects this input too, but we have not established which
+    /// class it raises" — it is not a licence to invent a token. Three sites
+    /// previously carried a *prose* pseudo-class inside `Other`'s `reason`
+    /// (e.g. `"UNSUPPORTED_FEATURE: LATERAL join with NATURAL join"`); the
+    /// oracle's `^\s*\[([A-Z][A-Z0-9_.]*)\]` token regex cannot recover those,
+    /// and two of the three prose tokens turned out to be wrong (the real
+    /// classes are `INCOMPATIBLE_JOIN_TYPES` and the
+    /// `UNSUPPORTED_FEATURE.LATERAL_JOIN_USING` *subclass*). Put the token
+    /// here, never in the message.
+    #[error("[SPARK-EMULATED] {reason}")]
+    SparkEmulated {
+        /// The exact Spark error-class token, e.g.
+        /// `"UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE"`.
+        class: &'static str,
+        /// A description of the error, WITHOUT a leading class token.
+        reason: String,
+    },
+
     /// A catch-all Spark-emulated error not captured by the more specific
-    /// variants above.
+    /// variants above, and whose Spark error class is not established.
     #[error("[SPARK-EMULATED] {reason}")]
     Other {
         /// A description of the error.
+        reason: String,
+    },
+
+    // ── τ-internal ─────────────────────────────────────────────────────────
+    /// A τ-internal invariant violation raised from the analyzer. Bridges to
+    /// [`EmissionError::Internal`] → `Status::internal`.
+    ///
+    /// This is neither category in ADR-022's pair: the client did nothing
+    /// wrong (so it is not Spark-emulated) and τ is not missing a feature (so
+    /// it is not a boundary gap) — τ broke its own promise. Reporting these as
+    /// Spark-emulated would blame the user for a τ bug.
+    ///
+    /// [`EmissionError::Internal`]: super::error::EmissionError::Internal
+    #[error("[TDCK-INTERNAL] {reason}")]
+    Internal {
+        /// Description of the violated invariant and where it fired.
         reason: String,
     },
 
@@ -876,9 +925,67 @@ impl AnalyzerError {
             Self::AmbiguousColumnReference { .. } => Some("AMBIGUOUS_COLUMN_REFERENCE"),
             Self::AmbiguousLateralColumnAlias { .. } => Some("AMBIGUOUS_LATERAL_COLUMN_ALIAS"),
             Self::TypeMismatch { .. } => Some("DATATYPE_MISMATCH"),
-            Self::Other { .. } | Self::PuntedOperator { .. } | Self::UnsupportedRule { .. } => None,
+            Self::SparkEmulated { class, .. } => Some(class),
+            Self::Other { .. }
+            | Self::Internal { .. }
+            | Self::PuntedOperator { .. }
+            | Self::UnsupportedRule { .. } => None,
         }
     }
+
+    /// Which ADR-022 category (plus τ-internal) this variant belongs to.
+    ///
+    /// This — **not** `spark_class().is_some()` — is the bridge's branch
+    /// condition. Review A1: a Spark-emulated error with no established class
+    /// is still Spark-emulated, and keying on the class made every such error
+    /// fall to the Thunderduck-boundary path and exit as gRPC UNIMPLEMENTED,
+    /// telling clients "τ doesn't support this" about inputs Spark itself
+    /// rejects. One exhaustive match, so a new variant cannot silently pick
+    /// the wrong category.
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::UnknownTable { .. }
+            | Self::UnknownColumn { .. }
+            | Self::AmbiguousColumn { .. }
+            | Self::AmbiguousColumnReference { .. }
+            | Self::AmbiguousLateralColumnAlias { .. }
+            | Self::TypeMismatch { .. }
+            | Self::SparkEmulated { .. }
+            | Self::Other { .. } => ErrorCategory::SparkEmulated,
+            Self::Internal { .. } => ErrorCategory::Internal,
+            Self::PuntedOperator { .. } | Self::UnsupportedRule { .. } => {
+                ErrorCategory::ThunderduckBoundary
+            }
+        }
+    }
+}
+
+/// Which wire shape — and therefore which gRPC status — an [`AnalyzerError`]
+/// takes. Used by [`analyzer_error_to_emission_error`].
+///
+/// Maps to ADR-022's categories 1 and 2, plus a τ-internal variant that is
+/// **neither** ADR-022 category (the client did nothing wrong and τ is not
+/// missing a feature — τ broke its own promise).
+///
+/// Note the numbering does not line up with the ADR: ADR-022's Amendment 1
+/// added a *category 3* — "strict rejections", inputs Spark accepts that τ
+/// deliberately rejects as malformed. That is a distinct concept from
+/// [`Self::Internal`] and has **no variant here yet**, because no analyzer
+/// error currently implements it (the sole register entry is rejected at the
+/// parse stage, before this enum is reachable). Add a variant when the first
+/// analyzer-stage strict rejection lands — do not overload `Internal` for it,
+/// which would report a deliberate policy decision as a τ bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    /// ADR-022 category 1 — Spark itself would reject this input →
+    /// `Status::invalid_argument`.
+    SparkEmulated,
+    /// ADR-022 category 2 — τ has not implemented this shape →
+    /// `Status::unimplemented`.
+    ThunderduckBoundary,
+    /// Not an ADR-022 category — τ broke its own invariant →
+    /// `Status::internal`.
+    Internal,
 }
 
 // ── analyze() — the top-level entry point ───────────────────────────────────
@@ -990,50 +1097,53 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
 }
 
 /// Bridge an [`AnalyzerError`] into an [`EmissionError`] preserving the
-/// two-category classification. Spark-emulated variants with a known
-/// [`AnalyzerError::spark_class`] surface as [`EmissionError::SparkEmulated`]
-/// so the class token leads the wire message (ADR-023 chunk 3b); `Other`
-/// (no class) keeps the legacy `Unsupported{name: "analyzer-spark-emulated"}`
-/// path. Thunderduck-boundary variants (`[TDCK-BOUNDARY]`) are unaffected.
+/// ADR-022 classification.
+///
+/// Branches on [`AnalyzerError::category`], **not** on whether a Spark class
+/// is known (review A1). Spark-emulated errors become
+/// [`EmissionError::SparkEmulated`] — carrying the class token when one has
+/// been established, and `None` otherwise, which renders a clean prefix-free
+/// message rather than a fabricated token. Either way they exit as
+/// `Status::invalid_argument`, because Spark rejects these inputs too.
+/// Thunderduck-boundary variants stay `Unsupported` → `UNIMPLEMENTED`, and
+/// τ-internal ones become [`EmissionError::Internal`] → `INTERNAL`.
+///
 /// Called by `transpiler_v2::generate()`.
 pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionError {
-    match e.spark_class() {
-        Some(class) => {
+    match e.category() {
+        ErrorCategory::SparkEmulated => {
+            let class = e.spark_class();
             let full = e.to_string();
             let message = full
-                .strip_prefix("[SPARK-EMULATED] ")
+                .strip_prefix(SPARK_EMULATED_PREFIX)
                 .unwrap_or(&full)
                 .to_owned();
             EmissionError::SparkEmulated { class, message }
         }
-        None => {
+        ErrorCategory::Internal => {
             let full = e.to_string();
-            match e {
-                AnalyzerError::Other { .. } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Expression,
-                    name: "analyzer-spark-emulated".to_owned(),
-                    reason: full,
-                },
-                AnalyzerError::PuntedOperator { op, reason } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Op,
-                    name: op,
-                    reason,
-                },
-                AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Expression,
-                    name: rule,
-                    reason,
-                },
-                AnalyzerError::UnknownTable { .. }
-                | AnalyzerError::UnknownColumn { .. }
-                | AnalyzerError::AmbiguousColumn { .. }
-                | AnalyzerError::AmbiguousColumnReference { .. }
-                | AnalyzerError::AmbiguousLateralColumnAlias { .. }
-                | AnalyzerError::TypeMismatch { .. } => {
-                    unreachable!("spark_class() returns Some for these variants")
-                }
-            }
+            let message = full
+                .strip_prefix(TDCK_INTERNAL_PREFIX)
+                .unwrap_or(&full)
+                .to_owned();
+            EmissionError::Internal { message }
         }
+        ErrorCategory::ThunderduckBoundary => match e {
+            AnalyzerError::PuntedOperator { op, reason } => EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: op,
+                reason,
+            },
+            AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name: rule,
+                reason,
+            },
+            other => unreachable!(
+                "category() returns ThunderduckBoundary only for PuntedOperator / \
+                 UnsupportedRule, got {other:?}"
+            ),
+        },
     }
 }
 
@@ -1958,7 +2068,8 @@ fn analyze_to_df(
     let typed_input = analyze_node(input, base_types, outer)?;
     let input_fields = &typed_input.resolved_schema.fields;
     if input_fields.len() != column_names.len() {
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "ASSIGNMENT_ARITY_MISMATCH",
             reason: format!(
                 "toDF arity mismatch: input has {} columns, got {} names",
                 input_fields.len(),
@@ -1972,6 +2083,17 @@ fn analyze_to_df(
     for (f, new_name) in input_fields.iter().zip(column_names.iter()) {
         let mut nf = f.clone();
         nf.name = new_name.clone();
+        // Review C1 / P2, same rule as the `WithColumnsRenamed` arm above: a
+        // rename severs referenceability via the PRE-rename qualifier, so the
+        // renamed slot loses its inherited lineage (the id is untouched —
+        // ADR-024's rename-keeps-id divergence still stands). Unconditional
+        // here because `toDF` renames EVERY column, unlike
+        // `withColumnsRenamed`'s partial rename map. Without this,
+        // `df.alias("t").toDF("y", ..).select("t.y")` resolves in τ and is
+        // UNRESOLVED_COLUMN in Spark. The SQL `FROM t AS x(a, b)` shape is
+        // unaffected: `v2_lowering` wraps `ToDf` in an `AliasedRelation`,
+        // whose `seed_source_quals` re-seeds every slot with `x` afterwards.
+        nf.source_quals.clear();
         output_fields.push(nf);
     }
     // Convert to WithColumnsRenamed for emission simplicity — the renamed
@@ -2003,13 +2125,15 @@ fn analyze_join(
 
     // ── LATERAL guards (analyzer-enforced invariants) ──────────────────
     if lateral && natural {
-        return Err(AnalyzerError::Other {
-            reason: "UNSUPPORTED_FEATURE: LATERAL join with NATURAL join".to_owned(),
+        return Err(AnalyzerError::SparkEmulated {
+            class: "INCOMPATIBLE_JOIN_TYPES",
+            reason: "The join types LATERAL and NATURAL are incompatible.".to_owned(),
         });
     }
     if lateral && !using_columns.is_empty() {
-        return Err(AnalyzerError::Other {
-            reason: "UNSUPPORTED_FEATURE: LATERAL join with USING join".to_owned(),
+        return Err(AnalyzerError::SparkEmulated {
+            class: "UNSUPPORTED_FEATURE.LATERAL_JOIN_USING",
+            reason: "The feature is not supported: JOIN USING with LATERAL correlation.".to_owned(),
         });
     }
     if lateral && !matches!(join_type, JoinType::Inner | JoinType::Cross) {
@@ -2265,7 +2389,8 @@ fn analyze_recursive_cte(
     } else {
         // (d) Arity check — column list length must match anchor output width.
         if column_names.len() != typed_anchor.resolved_schema.fields.len() {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "ASSIGNMENT_ARITY_MISMATCH",
                 reason: format!(
                     "recursive CTE `{name}` column list has {} names but the anchor produces {} columns",
                     column_names.len(),
@@ -2289,8 +2414,11 @@ fn analyze_recursive_cte(
 
     // (c) Reject UNION (without ALL) — Spark's UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE.
     if !union_all {
-        return Err(AnalyzerError::Other {
-            reason: "UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE: recursive CTE body must use UNION ALL"
+        return Err(AnalyzerError::SparkEmulated {
+            class: "UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE",
+            reason: "The UNION operator is not yet supported within recursive common table \
+                     expressions (WITH clauses that refer to themselves, directly or \
+                     indirectly). Please use UNION ALL."
                 .to_owned(),
         });
     }
@@ -2330,7 +2458,8 @@ fn analyze_recursive_cte(
 
     // (g) Arity match — recursive term must produce the same number of columns.
     if typed_recursive.resolved_schema.fields.len() != cte_schema.fields.len() {
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "ASSIGNMENT_ARITY_MISMATCH",
             reason: format!(
                 "recursive CTE `{name}` anchor has {} columns but the recursive term produces {}",
                 cte_schema.fields.len(),
@@ -2455,7 +2584,8 @@ fn analyze_set_op(
                     .map(|f| fold_key(&f.name))
                     .collect();
                 if child_names_lower != first_names_lower {
-                    return Err(AnalyzerError::Other {
+                    return Err(AnalyzerError::SparkEmulated {
+                        class: "_LEGACY_ERROR_TEMP_1201",
                         reason: format!(
                             "unionByName column-name mismatch: child 0 has {:?}, child {idx} has {:?}",
                             first_names_lower, child_names_lower
@@ -2553,8 +2683,8 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
         }
         // `widened_type` must be Some — the name came from
         // some child so at least one child has it.
-        let ty = widened_type.ok_or_else(|| AnalyzerError::Other {
-            reason: format!("internal: union-of-names produced orphan name {name:?}"),
+        let ty = widened_type.ok_or_else(|| AnalyzerError::Internal {
+            reason: format!("union-of-names produced orphan name {name:?}"),
         })?;
         // Extras present in only one child become
         // unconditionally nullable — the other child pads
@@ -2602,7 +2732,8 @@ fn widen_by_position(
     let first_len = children[0].resolved_schema.len();
     for (idx, child) in children.iter().enumerate().skip(1) {
         if child.resolved_schema.len() != first_len {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "NUM_COLUMNS_MISMATCH",
                 reason: format!(
                     "set-op arity mismatch: child 0 has {} columns, child {idx} has {}",
                     first_len,
@@ -2785,7 +2916,8 @@ fn expand_inline_projections(
             _ => return Ok(None),
         };
         if args.len() != 1 {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
                 reason: format!(
                     "`{name_lower}` requires exactly 1 argument, got {}",
                     args.len()
@@ -2912,7 +3044,8 @@ fn expand_json_tuple_projections(
             _ => return Ok(None),
         };
         if args.len() < 2 {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
                 reason: format!(
                     "`json_tuple` requires at least 2 arguments (json_str, key_1, ...), got {}",
                     args.len()
@@ -3025,7 +3158,7 @@ fn expand_stack_projections(
                     value: LiteralValue::String(s),
                     ..
                 }) => Ok(s),
-                other => Err(AnalyzerError::Other {
+                other => Err(AnalyzerError::Internal {
                     reason: format!(
                         "`stack_multi_alias` alias slots must be string literals, got {other:?}"
                     ),
@@ -3047,7 +3180,8 @@ fn expand_stack_projections(
             }
         };
         if stack_args.is_empty() {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
                 reason: "`stack` requires at least one argument (row count N)".to_owned(),
             });
         }
@@ -3064,7 +3198,8 @@ fn expand_stack_projections(
                 ..
             }) if *i >= 1 => *i as usize,
             other => {
-                return Err(AnalyzerError::Other {
+                return Err(AnalyzerError::SparkEmulated {
+                    class: "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
                     reason: format!(
                         "`stack`'s first argument must be a positive integer literal, got {other:?}"
                     ),
@@ -3073,7 +3208,8 @@ fn expand_stack_projections(
         };
         let values = &stack_args[1..];
         if values.len() != n * k {
-            return Err(AnalyzerError::Other {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "UDTF_ALIAS_NUMBER_MISMATCH",
                 reason: format!(
                     "`stack({n}, ...)` with a {k}-alias tail requires {} value arguments, got {}",
                     n * k,
@@ -3388,28 +3524,16 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
             Ok(Expression::ExistsSubquery(e))
         }
-        // UpdateFields: recurse via the walker, then run Spark 4.1's
-        // `dropFields("X")` existence validation. See Catalyst
-        // `UpdateFields.scala::checkInputDataTypes`.
-        Expression::UpdateFields(_) => {
-            let recursed = expr.map_children(|e| resolve_and_stamp(e, ctx))?;
-            if let Expression::UpdateFields(ref u) = recursed {
-                if let DataType::Struct(base_st) = u.struct_expr.data_type(ctx.schema) {
-                    let base_names: Vec<String> =
-                        base_st.fields.iter().map(|f| f.name.clone()).collect();
-                    if let Err(missing) =
-                        super::expression::validate_update_fields_ops(&base_names, &u.updates)
-                    {
-                        return Err(AnalyzerError::Other {
-                            reason: format!(
-                                "cannot resolve field `{missing}` in dropFields — not present in struct"
-                            ),
-                        });
-                    }
-                }
-            }
-            Ok(recursed)
-        }
+        // UpdateFields: recurse via the walker. τ used to additionally reject
+        // `dropFields("X")` for an X absent from the struct, citing Catalyst
+        // `UpdateFields.scala::checkInputDataTypes`. Observed against live
+        // Spark 4.1.1 (review A1 audit): **Spark accepts it** and returns the
+        // struct unchanged —
+        //   structs.select(col("s").dropFields("nope"))
+        //   -> update_fields(s, dropfield()): struct<x:bigint,y:bigint>
+        // so the guard made τ reject a query Spark runs. Dropping a
+        // non-existent field is a no-op, not an error.
+        Expression::UpdateFields(_) => expr.map_children(|e| resolve_and_stamp(e, ctx)),
         // N4: recurse first (children fully resolved/typed), then materialize
         // the binary-arithmetic coercions (decimal-Div widening, Date ±
         // Interval correction) `binary_data_type`'s own inference implies but
@@ -4090,7 +4214,8 @@ fn analyze_single_column_subquery(
 ) -> Result<SubqueryPlan, AnalyzerError> {
     let inner = analyze_subquery_plan(plan, ctx)?;
     if inner.resolved_schema.fields.len() != 1 {
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "INVALID_SUBQUERY_EXPRESSION.SCALAR_SUBQUERY_RETURN_MORE_THAN_ONE_OUTPUT_COLUMN",
             reason: error_reason.to_owned(),
         });
     }
@@ -4919,8 +5044,20 @@ fn analyze_unpivot(
         UnpivotIds::Explicit(v) => v,
         UnpivotIds::Implicit => {
             if values.is_empty() {
-                return Err(AnalyzerError::Other {
-                    reason: "SQL UNPIVOT requires at least one value column".to_owned(),
+                // Defensive only — unreachable through either front end.
+                // `UnpivotIds::Implicit` is produced solely by the SQL path
+                // (`v2_lowering::lower_table_factor`); the DataFrame converter
+                // always emits `Explicit`. And sqlparser's
+                // `parse_unpivot_table_factor` parses the IN list with
+                // `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` is
+                // rejected at parse time ("Expected: an expression, found: )")
+                // and `values` can never arrive empty. Reaching here means a
+                // τ invariant broke, not that the user sent bad SQL — hence
+                // Internal, not Spark-emulated.
+                return Err(AnalyzerError::Internal {
+                    reason: "unpivot with implicit ids reached the analyzer with an empty \
+                             value list; the SQL parser should have rejected it"
+                        .to_owned(),
                 });
             }
             // Validate each value column resolves before deriving ids from it.
@@ -4947,58 +5084,28 @@ fn analyze_unpivot(
     };
 
     if materialised_values.is_empty() {
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "UNPIVOT_REQUIRES_VALUE_COLUMNS",
             reason:
                 "unpivot requires at least one value column (none supplied and no non-id columns)"
                     .to_owned(),
         });
     }
 
-    // M2: reject duplicate/overlapping names across the union of id + value
-    // columns (case-insensitive per Spark identifier semantics). Spark itself
-    // rejects overlap between ids and values; τ mirrors that Spark-emulated
-    // behavior with `AnalyzerError::Other`.
-    {
-        let mut seen: HashSet<String> =
-            HashSet::with_capacity(ids.len() + materialised_values.len());
-        for name in ids.iter().chain(materialised_values.iter()) {
-            let key = fold_key(name);
-            if !seen.insert(key) {
-                return Err(AnalyzerError::Other {
-                    reason: format!(
-                        "unpivot id and value columns must be disjoint and unique; duplicate name: {name}"
-                    ),
-                });
-            }
-        }
-    }
-
-    // M3: reject collisions between the synthetic variable/value column names
-    // and any id column (case-insensitive). Otherwise the stamped output
-    // schema would carry two fields with the same name — Spark rejects this.
-    for id in &ids {
-        if eq_fold(id, &variable_column_name) {
-            return Err(AnalyzerError::Other {
-                reason: format!(
-                    "unpivot variable column name '{variable_column_name}' collides with id column '{id}'"
-                ),
-            });
-        }
-        if eq_fold(id, &value_column_name) {
-            return Err(AnalyzerError::Other {
-                reason: format!(
-                    "unpivot value column name '{value_column_name}' collides with id column '{id}'"
-                ),
-            });
-        }
-    }
-    if eq_fold(&variable_column_name, &value_column_name) {
-        return Err(AnalyzerError::Other {
-            reason: format!(
-                "unpivot variable and value column names must differ; both are '{variable_column_name}'"
-            ),
-        });
-    }
+    // The former M2/M3 guards rejected (a) overlap between id and value
+    // columns, (b) a variable/value column name colliding with an id column,
+    // and (c) variable == value. Their comments asserted "Spark itself rejects
+    // overlap between ids and values" and "the stamped output schema would
+    // carry two fields with the same name — Spark rejects this". Both claims
+    // were falsified against live Spark 4.1.1 (review A1 audit): Spark accepts
+    // all four shapes and is perfectly happy to emit a duplicate-named output
+    // schema, because it only rejects an ambiguous *reference*, not a
+    // duplicate name in a schema. Observed:
+    //   unpivot(ids=[id], values=[id])            -> id:bigint, k:string, v:bigint
+    //   unpivot(ids=[id], values=[salary], "id")  -> id:bigint, id:string, v:double
+    //   unpivot(ids=[id], values=[salary], var=value="same")
+    //                                             -> id:bigint, same:string, same:double
+    // The guards therefore made τ reject queries Spark runs, so they are gone.
 
     // Widen value-column types across `materialised_values`.
     let mut widened_type = DataType::Unresolved;
@@ -5973,7 +6080,7 @@ fn infer_values_schema(
     column_names: &[String],
 ) -> Result<StructType, AnalyzerError> {
     if rows.is_empty() {
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::Internal {
             reason: "VALUES relation must have at least one row".to_owned(),
         });
     }
@@ -5982,7 +6089,8 @@ fn infer_values_schema(
         // Ragged VALUES rows (e.g. `VALUES (1,2),(3)`) would otherwise index
         // out of bounds below on the shorter rows — a session-killing panic.
         // Spark rejects inconsistent-length VALUES with an AnalysisException.
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH",
             reason: format!(
                 "VALUES rows have inconsistent lengths: expected {ncols}, got {}",
                 bad.len()
@@ -5992,7 +6100,8 @@ fn infer_values_schema(
     if ncols != column_names.len() {
         // Arity mismatch, not a per-column type mismatch — see the set-op
         // path for the equivalent decision.
-        return Err(AnalyzerError::Other {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH",
             reason: format!(
                 "VALUES column count mismatch: {} names vs {} row columns",
                 column_names.len(),
@@ -7305,6 +7414,110 @@ mod tests {
     }
 
     #[test]
+    fn source_quals_to_df_clears_lineage_on_every_slot() {
+        // Review C1, the ToDf mirror of
+        // `source_quals_with_columns_renamed_clears_lineage_on_renamed_slot_only`.
+        // `toDF` renames EVERY column, so unlike the partial-rename case there
+        // is no unrenamed slot to keep its lineage — all of them clear.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "t".to_owned(),
+        });
+        let to_df = CommonAst::new(CommonOp::ToDf {
+            input: Box::new(aliased),
+            column_names: vec![
+                "c0".to_owned(),
+                "c1".to_owned(),
+                "c2".to_owned(),
+                "c3".to_owned(),
+            ],
+        });
+        let typed = analyze(to_df, &bt).unwrap();
+        for f in &typed.resolved_schema.fields {
+            assert!(
+                f.source_quals.is_empty(),
+                "toDF renames every slot, so every slot must lose its inherited \
+                 qualifier lineage — `{}` kept {:?}",
+                f.name,
+                f.source_quals
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_column_to_df_pre_rename_qualifier_rejects_renamed_slot() {
+        // Review C1, the ToDf mirror of
+        // `resolve_column_with_columns_renamed_pre_rename_qualifier_rejects_renamed_slot`.
+        // `df.alias("t").toDF("c0", ..).select("t.c0")` raises
+        // UNRESOLVED_COLUMN in Spark even though "t" still binds this node's
+        // alias scope. Before this fix τ resolved it — a leniency divergence.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "t".to_owned(),
+        });
+        let to_df = CommonAst::new(CommonOp::ToDf {
+            input: Box::new(aliased),
+            column_names: vec![
+                "c0".to_owned(),
+                "c1".to_owned(),
+                "c2".to_owned(),
+                "c3".to_owned(),
+            ],
+        });
+        let filter_renamed = CommonAst::new(CommonOp::Filter {
+            input: Box::new(to_df),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("t", "c0")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(filter_renamed, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "c0");
+                assert_eq!(qualifier.as_deref(), Some("t"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_sql_aliased_column_list_still_resolves_after_to_df_clear() {
+        // Review C1 ordering pin. The SQL `FROM emp AS x(a, b, c, d)` shape
+        // lowers to `ToDf` wrapped in an `AliasedRelation`
+        // (`v2_lowering::lower_table_factor`). C1's clear runs INSIDE the
+        // ToDf, but `AliasedRelation`'s `seed_source_quals` re-seeds every
+        // slot with `x` afterwards — so `x.a` must still resolve. This test
+        // fails if the clear is ever hoisted above the seed.
+        let bt = base_types_with_emp_dept();
+        let to_df = CommonAst::new(CommonOp::ToDf {
+            input: Box::new(emp_scan()),
+            column_names: vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ],
+        });
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(to_df),
+            alias: "x".to_owned(),
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(aliased),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("x", "a")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        analyze(filter, &bt).expect("`x.a` must resolve — AliasedRelation re-seeds after ToDf");
+    }
+
+    #[test]
     fn resolve_column_set_op_first_child_qualifier_resolves_second_child_rejects() {
         // Pass F3 Stage 4 / P1 (live-Spark-4.1.1-verified):
         // `df1.alias("a").union(df2.alias("b")).select("a.x")` resolves
@@ -8237,7 +8450,14 @@ mod tests {
             })],
         });
         let err = analyze(ast, &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::Other { .. }));
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class:
+                    "INVALID_SUBQUERY_EXPRESSION.SCALAR_SUBQUERY_RETURN_MORE_THAN_ONE_OUTPUT_COLUMN",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -8254,7 +8474,14 @@ mod tests {
             })],
         });
         let err = analyze(ast, &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::Other { .. }));
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class:
+                    "INVALID_SUBQUERY_EXPRESSION.SCALAR_SUBQUERY_RETURN_MORE_THAN_ONE_OUTPUT_COLUMN",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -9192,8 +9419,14 @@ mod tests {
         });
         let err = analyze(ast, &bt).expect_err("ragged VALUES must be rejected");
         assert!(
-            matches!(err, AnalyzerError::Other { .. }),
-            "expected AnalyzerError::Other, got {err:?}"
+            matches!(
+                err,
+                AnalyzerError::SparkEmulated {
+                    class: "INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH",
+                    ..
+                }
+            ),
+            "expected SparkEmulated INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH, got {err:?}"
         );
     }
 
@@ -9289,7 +9522,10 @@ mod tests {
         let ast = set_op(SetOpKind::Union, true, vec![tiny_int_plan(), two_col]);
         let err = analyze(ast, &bt).unwrap_err();
         match err {
-            AnalyzerError::Other { ref reason } => {
+            AnalyzerError::SparkEmulated {
+                class: "NUM_COLUMNS_MISMATCH",
+                ref reason,
+            } => {
                 assert!(
                     reason.contains("arity mismatch"),
                     "expected arity-mismatch message, got: {reason}",
@@ -9931,8 +10167,9 @@ mod tests {
     fn analyzer_error_bridge_maps_spark_emulated_with_class_to_spark_emulated() {
         // ADR-023 chunk 3b/3d: `UnknownColumn` has a known `spark_class()`
         // (`UNRESOLVED_COLUMN.WITH_SUGGESTION`), so the bridge routes it to
-        // `EmissionError::SparkEmulated` — NOT the legacy
-        // `Unsupported{name: "analyzer-spark-emulated"}` path.
+        // `EmissionError::SparkEmulated`. Since review A1 EVERY Spark-emulated
+        // variant goes there — classless ones with `class: None` — so this now
+        // pins the class propagation rather than the choice of variant.
         let e = AnalyzerError::UnknownColumn {
             name: "c".to_owned(),
             qualifier: None,
@@ -9940,7 +10177,7 @@ mod tests {
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
             EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "UNRESOLVED_COLUMN.WITH_SUGGESTION");
+                assert_eq!(class, Some("UNRESOLVED_COLUMN.WITH_SUGGESTION"));
                 assert!(
                     !message.starts_with("[SPARK-EMULATED]"),
                     "message must not double the internal prefix, got: {message}"
@@ -9963,7 +10200,7 @@ mod tests {
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
             EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "AMBIGUOUS_COLUMN_REFERENCE");
+                assert_eq!(class, Some("AMBIGUOUS_COLUMN_REFERENCE"));
                 assert!(
                     !message.starts_with("[SPARK-EMULATED]"),
                     "message must not double the internal prefix, got: {message}"
@@ -9983,24 +10220,69 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_error_bridge_maps_other_to_unsupported_expression() {
-        // `Other` has no specific Spark class (`spark_class() == None`), so
-        // the bridge keeps the legacy `Unsupported{name:
-        // "analyzer-spark-emulated"}` path — the ADR-023 chunk 3b carve-out
-        // only applies to variants with a known class.
+    fn analyzer_error_bridge_maps_classless_other_to_spark_emulated() {
+        // Review A1. `Other` carries no established Spark class, but it is
+        // still ADR-022 Spark-emulated — Spark rejects these inputs too. It
+        // must therefore bridge to `SparkEmulated { class: None }` and exit as
+        // INVALID_ARGUMENT, NOT to the old
+        // `Unsupported{name: "analyzer-spark-emulated"}` shape, which exited as
+        // UNIMPLEMENTED and told clients τ was missing a feature.
+        //
+        // With `class: None` the message must render prefix-free: inventing a
+        // token would make the differential oracle compare a fabricated class
+        // against Spark's real one.
         let e = AnalyzerError::Other {
             reason: "catch-all".to_owned(),
         };
+        assert_eq!(e.category(), ErrorCategory::SparkEmulated);
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Expression,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "analyzer-spark-emulated");
-                assert!(reason.starts_with("[SPARK-EMULATED]"));
+            EmissionError::SparkEmulated { class, message } => {
+                assert_eq!(class, None);
+                assert_eq!(message, "catch-all");
+                assert!(
+                    !message.contains("[SPARK-EMULATED]"),
+                    "the τ-internal prefix must be stripped, got: {message}"
+                );
             }
+            other => panic!("expected EmissionError::SparkEmulated, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyzer_error_bridge_maps_internal_to_emission_internal() {
+        // Review A1: a τ-internal invariant violation is neither ADR-022
+        // category. It must reach `EmissionError::Internal` (→ Status::internal)
+        // rather than being relabelled as a Spark error, which would blame the
+        // client for a τ bug.
+        let e = AnalyzerError::Internal {
+            reason: "union-of-names produced orphan name \"x\"".to_owned(),
+        };
+        assert_eq!(e.category(), ErrorCategory::Internal);
+        assert_eq!(e.spark_class(), None);
+        match analyzer_error_to_emission_error(e) {
+            EmissionError::Internal { message } => {
+                assert_eq!(message, "union-of-names produced orphan name \"x\"");
+            }
+            other => panic!("expected EmissionError::Internal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyzer_error_bridge_keeps_boundary_variants_unsupported() {
+        // The Thunderduck-boundary category is unchanged by review A1: these
+        // are honest "not implemented in τ" gaps and must stay UNIMPLEMENTED.
+        let e = AnalyzerError::PuntedOperator {
+            op: "FileScan".to_owned(),
+            reason: "no arm".to_owned(),
+        };
+        assert_eq!(e.category(), ErrorCategory::ThunderduckBoundary);
+        match analyzer_error_to_emission_error(e) {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name,
+                ..
+            } => assert_eq!(name, "FileScan"),
             other => panic!("expected EmissionError::Unsupported, got: {other:?}"),
         }
     }
@@ -10178,9 +10460,12 @@ mod tests {
     }
 
     #[test]
-    fn unpivot_duplicate_across_ids_and_values_rejected() {
-        // M2: `salary` appears in both ids and values. Spark rejects id/value
-        // overlap; τ mirrors that with `AnalyzerError::Other`, case-insensitive.
+    fn unpivot_duplicate_across_ids_and_values_is_accepted_like_spark() {
+        // Review A1 audit. The removed M2 guard claimed "Spark rejects id/value
+        // overlap". Falsified against live Spark 4.1.1:
+        //   emp.unpivot(ids=["id"], values=["id"], "k", "v")
+        //   -> id:bigint, k:string, v:bigint   (accepted, one row per value col)
+        // τ must accept it too. Pins the corrected behaviour.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10189,26 +10474,28 @@ mod tests {
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("disjoint") || reason.contains("duplicate"),
-                    "reason should mention duplicate/disjoint: {reason}"
-                );
-                assert!(
-                    reason.to_ascii_lowercase().contains("salary"),
-                    "reason should surface the offending name: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::Other, got: {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("Spark accepts id/value overlap, so τ must too");
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"metric") && names.contains(&"value"),
+            "unpivot must still stamp its variable/value columns, got {names:?}"
+        );
     }
 
     #[test]
-    fn unpivot_variable_column_colliding_with_id_rejected() {
-        // M3: `variable_column_name` shares a name with an id column
-        // (case-insensitive). The stamped schema would produce two "id" fields;
-        // Spark rejects — τ mirrors with `AnalyzerError::Other`.
+    fn unpivot_variable_column_colliding_with_id_is_accepted_like_spark() {
+        // Review A1 audit. The removed M3 guard claimed the duplicate-named
+        // output schema would be rejected by Spark. Falsified against live
+        // Spark 4.1.1 — it emits the duplicate name happily:
+        //   emp.unpivot(ids=["id"], values=["salary"], "id", "v")
+        //   -> id:bigint, id:string, v:double
+        // Spark only rejects an ambiguous *reference*, never a duplicate name
+        // in a schema. τ must therefore accept and stamp both "id" fields.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10217,21 +10504,33 @@ mod tests {
             variable_column_name: "ID".to_owned(),
             value_column_name: "value".to_owned(),
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("variable column name") && reason.contains("collides"),
-                    "reason should describe the collision: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::Other, got: {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("Spark accepts the collision, so τ must too");
+        let dup = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .filter(|f| f.name.eq_ignore_ascii_case("id"))
+            .count();
+        assert_eq!(
+            dup,
+            2,
+            "expected the id column AND the variable column both named `id` \
+             (Spark permits duplicate output names), got {:?}",
+            typed
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn unpivot_value_column_colliding_with_id_rejected() {
-        // M3: `value_column_name` shares a name with an id column. Symmetric
-        // to the variable-column case above.
+    fn unpivot_value_column_colliding_with_id_is_accepted_like_spark() {
+        // Review A1 audit, symmetric to the variable-column case above.
+        // Live Spark 4.1.1:
+        //   emp.unpivot(ids=["id"], values=["salary"], "k", "id")
+        //   -> id:bigint, k:string, id:double   (accepted)
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10240,15 +10539,14 @@ mod tests {
             variable_column_name: "metric".to_owned(),
             value_column_name: "Id".to_owned(),
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("value column name") && reason.contains("collides"),
-                    "reason should describe the collision: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::Other, got: {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("Spark accepts the collision, so τ must too");
+        let dup = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .filter(|f| f.name.eq_ignore_ascii_case("id"))
+            .count();
+        assert_eq!(dup, 2, "expected two `id`-named output fields");
     }
 
     // ── Aggregate output schema uses function names ─────────────────────
@@ -10735,9 +11033,16 @@ mod tests {
     }
 
     /// `UnpivotIds::Implicit` with an empty value list is nonsensical (both
-    /// axes implicit) — the analyzer rejects it.
+    /// axes implicit) — the analyzer rejects it as a τ-INTERNAL invariant
+    /// break, not as a Spark-emulated error.
+    ///
+    /// It is unreachable in production and can only be built by constructing
+    /// the `CommonAst` directly, as this test does: `Implicit` comes only from
+    /// the SQL path, and sqlparser parses the UNPIVOT `IN` list with
+    /// `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` dies at parse time.
+    /// Blaming the client for reaching it would be wrong.
     #[test]
-    fn analyze_unpivot_implicit_ids_empty_values_rejected() {
+    fn analyze_unpivot_implicit_ids_empty_values_is_internal_error() {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -10747,13 +11052,15 @@ mod tests {
             value_column_name: "val".to_owned(),
         });
         match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("value column"),
-                    "expected value-column reason, got: {reason}"
+            Err(e @ AnalyzerError::Internal { .. }) => {
+                assert_eq!(e.category(), ErrorCategory::Internal);
+                assert_eq!(
+                    e.spark_class(),
+                    None,
+                    "a τ-internal break must not claim a Spark class"
                 );
             }
-            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+            other => panic!("expected AnalyzerError::Internal, got {other:?}"),
         }
     }
 
@@ -10773,37 +11080,43 @@ mod tests {
         )])
     }
 
-    /// Spark 4.1 (Catalyst `UpdateFields.scala::checkInputDataTypes`) rejects
-    /// `dropFields("X")` when `X` is not present in the struct. τ mirrors
-    /// this as `AnalyzerError::Other` (Spark-emulated). Locking this here
-    /// guards against regressing to Spark 3.5's silent-ignore behaviour.
+    /// Review A1 audit (2026-08-06). τ used to reject `dropFields("X")` for an
+    /// `X` absent from the struct, citing Catalyst
+    /// `UpdateFields.scala::checkInputDataTypes`. Observed against **live Spark
+    /// 4.1.1**, that reading is wrong — Spark ACCEPTS it and returns the struct
+    /// unchanged:
+    ///
+    /// ```text
+    /// structs.select(col("s").dropFields("nope"))
+    ///   -> update_fields(s, dropfield()): struct<x:bigint,y:bigint>
+    /// ```
+    ///
+    /// Dropping a non-existent field is a no-op, so the guard made τ reject a
+    /// query Spark runs. This test now pins the corrected, Spark-matching
+    /// behaviour: analysis succeeds and the base struct's fields survive.
     #[test]
-    fn analyze_update_fields_missing_drop_target_is_spark_emulated_error() {
+    fn analyze_update_fields_missing_drop_target_is_accepted_like_spark() {
         let bt = base_types_with_addr_table();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("addrs")),
             projections: vec![Expression::UpdateFields(
                 super::super::expression::UpdateFieldsExpression {
                     struct_expr: Box::new(unresolved_col("addr")),
-                    // `nope` does not exist in the struct — case-insensitive
-                    // lookup must still fail.
                     updates: vec![("nope".to_owned(), None)],
                 },
             )],
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("nope"),
-                    "expected missing-field reason to name `nope`, got: {reason}"
-                );
-                assert!(
-                    reason.contains("dropFields"),
-                    "expected reason to mention `dropFields`, got: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::Other, got {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("Spark accepts a no-op dropFields, so τ must too");
+        let DataType::Struct(st) = &typed.resolved_schema.fields[0].data_type else {
+            panic!(
+                "expected a struct output type, got {:?}",
+                typed.resolved_schema.fields[0].data_type
+            );
+        };
+        assert!(
+            !st.fields.is_empty(),
+            "the base struct's fields must survive a no-op drop, got {st:?}"
+        );
     }
 
     // ── Pass 65: multi-level nested-struct dot-path access ──────────────────
@@ -11852,7 +12165,13 @@ mod tests {
     fn expand_json_tuple_rejects_zero_keys() {
         let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[])])
             .expect_err("must reject arity < 2");
-        assert!(matches!(err, AnalyzerError::Other { .. }));
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+                ..
+            }
+        ));
         assert!(
             err.to_string().starts_with("[SPARK-EMULATED]"),
             "err: {err}"
@@ -13051,8 +13370,15 @@ mod tests {
             right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + natural must error");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("LATERAL join with NATURAL join"), "got: {msg}");
+        // Review A1: observed against live Spark 4.1.1 — the real class is
+        // INCOMPATIBLE_JOIN_TYPES. The prose token this site used to carry
+        // ("UNSUPPORTED_FEATURE") was wrong; no UNSUPPORTED_FEATURE subclass
+        // for a natural join exists anywhere in Spark's 1244 conditions.
+        assert_eq!(
+            err.spark_class(),
+            Some("INCOMPATIBLE_JOIN_TYPES"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -13072,8 +13398,14 @@ mod tests {
             right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + USING must error");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("LATERAL join with USING join"), "got: {msg}");
+        // Review A1: observed against live Spark 4.1.1 — the real class is the
+        // UNSUPPORTED_FEATURE.LATERAL_JOIN_USING *subclass*; this site's prose
+        // token carried only the bare base class.
+        assert_eq!(
+            err.spark_class(),
+            Some("UNSUPPORTED_FEATURE.LATERAL_JOIN_USING"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -13374,11 +13706,15 @@ mod tests {
         });
         let bt = BaseTypes::empty();
         let err = analyze(outer, &bt).expect_err("should reject UNION without ALL");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE"),
-            "error should mention UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE, got: {msg}"
+        // Review A1: the class is carried in the typed `class` field, NOT as
+        // prose in the message — the oracle's `^\s*\[([A-Z][A-Z0-9_.]*)\]`
+        // regex can only recover it from the leading bracketed token.
+        assert_eq!(
+            err.spark_class(),
+            Some("UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE"),
+            "got: {err:?}"
         );
+        assert_eq!(err.category(), ErrorCategory::SparkEmulated);
     }
 
     #[test]

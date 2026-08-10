@@ -128,9 +128,8 @@ mod tests {
     fn generate_surfaces_analyzer_error_not_pipeline_marker() {
         // A plan referencing an unknown table must surface the analyzer's
         // Spark-emulated error re-clothed with its Spark class token
-        // (ADR-023 chunk 3b), not the legacy `analyzer-spark-emulated`
-        // marker — `UnknownTable` has a known `spark_class()`
-        // (`TABLE_OR_VIEW_NOT_FOUND`).
+        // (ADR-023 chunk 3b) — `UnknownTable` has a known `spark_class()`
+        // (`TABLE_OR_VIEW_NOT_FOUND`) — rather than any τ-boundary marker.
         let plan = CommonAst::new(CommonOp::TableScan {
             table: "no_such_table".to_owned(),
         });
@@ -138,7 +137,7 @@ mod tests {
         let result = generate(&plan, &base_types);
         match result {
             Err(EmissionError::SparkEmulated { class, message }) => {
-                assert_eq!(class, "TABLE_OR_VIEW_NOT_FOUND");
+                assert_eq!(class, Some("TABLE_OR_VIEW_NOT_FOUND"));
                 assert!(
                     !message.contains("[SPARK-EMULATED]"),
                     "message must not double the internal prefix, got: {message}",
@@ -203,7 +202,7 @@ mod tests {
         let err = generate(&plan, &base_types).expect_err("ambiguous column must error");
         match err {
             EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "AMBIGUOUS_REFERENCE");
+                assert_eq!(class, Some("AMBIGUOUS_REFERENCE"));
                 let display = EmissionError::SparkEmulated {
                     class,
                     message: message.clone(),

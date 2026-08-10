@@ -15,8 +15,103 @@ mod v2_lowering;
 
 use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::CommonAst;
+use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::EmissionError;
 use dialect::SparkDialect;
+use sqlparser::parser::ParserError;
+use sqlparser::tokenizer::{Token, Tokenizer};
+
+/// ADR-022 classification for a `sqlparser` failure.
+///
+/// **The default is category 2 (Thunderduck-boundary), unchanged.** A parse
+/// failure usually means `sqlparser`'s grammar lacks a Spark construct, and
+/// telling a user their valid SQL is invalid is strictly worse than admitting
+/// τ cannot ingest it. The classifier only ever *upgrades*, never relaxes.
+///
+/// It upgrades to category 1 (Spark-emulated `PARSE_SYNTAX_ERROR`) only on
+/// evidence that holds **regardless of grammar coverage**:
+///
+/// 1. **Lexical failure** — the input is not valid SQL *text*. No grammar gap
+///    can make a string literal terminate.
+/// 2. **Unbalanced delimiters** — counted over the token stream, so it does not
+///    depend on `sqlparser` understanding what is inside them.
+/// 3. **An empty slot where an expression is required** — `found: EOF` or
+///    `found: )`. There is no syntax there at all, so it cannot be *unsupported*
+///    syntax.
+///
+/// Deliberately **not** upgraded: `Expected: end of statement, found: X`. A
+/// live-Spark survey (`tasks/tau-error-class-audit-2026-08.md`) found that shape
+/// produced by both malformed input (`SELECT * FRM emp`, `SELECT * FROM emp FROM
+/// dept`) and genuine τ grammar gaps (HiveQL `TRANSFORM`, `VERSION AS OF`,
+/// `CREATE TABLE … USING parquet`). It carries no information, and treating it
+/// as malformed would slander valid Spark. Cases stranded by this are tracked as
+/// deferred witnesses (`parseerr-001`) and in
+/// `docs/future_work/adr-022-strict-rejection-enforcement.md`.
+fn classify_parse_failure(parsed_sql: &str, e: &ParserError) -> EmissionError {
+    if is_definitely_malformed(parsed_sql, e) {
+        // Spark raises PARSE_SYNTAX_ERROR for these, so this is ADR-022
+        // category 1 — an ordinary Spark-emulated error, not a new category.
+        EmissionError::SparkEmulated {
+            class: Some("PARSE_SYNTAX_ERROR"),
+            message: format!("Syntax error in SQL: {e}"),
+        }
+    } else {
+        EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::parse_error".to_owned(),
+            reason: e.to_string(),
+        }
+    }
+}
+
+/// The three grammar-independent malformedness signals described on
+/// [`classify_parse_failure`]. Conservative by construction: any doubt returns
+/// `false`, leaving the boundary error in place.
+fn is_definitely_malformed(parsed_sql: &str, e: &ParserError) -> bool {
+    // (1) Lexical — the tokenizer itself gave up.
+    if matches!(e, ParserError::TokenizerError(_)) {
+        return true;
+    }
+
+    // (2) Delimiter balance, over tokens rather than raw text so parens inside
+    // string literals, comments and quoted identifiers do not count. A
+    // tokenizer failure here is itself signal (1).
+    match Tokenizer::new(&SparkDialect, parsed_sql).tokenize() {
+        Err(_) => return true,
+        Ok(tokens) => {
+            let mut depth: i64 = 0;
+            for t in &tokens {
+                match t {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    _ => continue,
+                }
+                if depth < 0 {
+                    return true; // a close with no matching open
+                }
+            }
+            if depth != 0 {
+                return true; // an open never closed
+            }
+        }
+    }
+
+    // (3) An expression was required and the slot was EMPTY — end of input, or
+    // an immediate close-paren. Restricted to those two on purpose: for any
+    // other token, "expression expected" could equally mean τ's parser does not
+    // recognise a construct that IS a valid Spark expression.
+    if let ParserError::ParserError(msg) = e {
+        const EMPTY_EXPRESSION_SLOT: &[&str] = &[
+            "Expected: an expression, found: EOF",
+            "Expected: an expression, found: )",
+        ];
+        if EMPTY_EXPRESSION_SLOT.iter().any(|p| msg.starts_with(p)) {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// τ's public SparkSQL parser entry point.
 pub struct SparkSqlParserV2;
@@ -36,7 +131,6 @@ impl SparkSqlParserV2 {
     /// generator-specific expansions (e.g. `explode(m) AS (k, v)` becomes
     /// `map_explode_key(m) AS k, map_explode_val(m) AS v`).
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
-        use crate::transpiler_v2::error::UnsupportedKind;
         use sqlparser::parser::Parser;
 
         // Step 1: token-level rewrite of multi-column aliases.
@@ -48,16 +142,12 @@ impl SparkSqlParserV2 {
         };
 
         let dialect = SparkDialect;
-        // τ fix pass (review M2): sqlparser errors are boundary
-        // failures — the input never reached `CommonAst`, so the correct
-        // category is `ProtoShape` (input τ can't ingest), not `Op`
-        // (emission arm not implemented).
-        let mut stmts =
-            Parser::parse_sql(&dialect, parse_input).map_err(|e| EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: "sql::parse_error".to_owned(),
-                reason: e.to_string(),
-            })?;
+        // A sqlparser failure is a boundary error by DEFAULT — the input never
+        // reached `CommonAst`, so `ProtoShape` (input τ can't ingest), not `Op`
+        // (emission arm not implemented). `classify_parse_failure` upgrades the
+        // provably-malformed subset to a Spark-emulated PARSE_SYNTAX_ERROR.
+        let mut stmts = Parser::parse_sql(&dialect, parse_input)
+            .map_err(|e| classify_parse_failure(parse_input, &e))?;
         if stmts.len() != 1 {
             bail_boundary_proto!(
                 "sql::multi_statement",
@@ -85,7 +175,6 @@ impl SparkSqlParserV2 {
     /// so that `spark.sql("CREATE TEMP VIEW v AS SELECT …")` can be
     /// eagerly executed.
     pub fn parse_statement(sql: &str) -> Result<crate::transpiler_v2::SqlStatement, EmissionError> {
-        use crate::transpiler_v2::error::UnsupportedKind;
         use crate::transpiler_v2::SqlStatement;
         use sqlparser::parser::Parser;
 
@@ -99,12 +188,8 @@ impl SparkSqlParserV2 {
         };
 
         let dialect = SparkDialect;
-        let mut stmts =
-            Parser::parse_sql(&dialect, parse_input).map_err(|e| EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: "sql::parse_error".to_owned(),
-                reason: e.to_string(),
-            })?;
+        let mut stmts = Parser::parse_sql(&dialect, parse_input)
+            .map_err(|e| classify_parse_failure(parse_input, &e))?;
         if stmts.len() != 1 {
             bail_boundary_proto!(
                 "sql::multi_statement",
@@ -245,6 +330,119 @@ mod tests {
 
     use super::SparkSqlParserV2;
     use crate::transpiler_v2::Expression;
+
+    /// ADR-022 classification of `sqlparser` failures — the
+    /// `classify_parse_failure` contract, pinned end-to-end through
+    /// `parse_statement`.
+    ///
+    /// These tests double as the canary for a `sqlparser` bump: signal (3)
+    /// matches on the parser's error *wording*, so if that wording changes the
+    /// upgrade silently stops firing. A failure here means re-derive the
+    /// prefixes, not delete the test.
+    mod parse_failure_classification {
+        use super::SparkSqlParserV2;
+        use crate::transpiler_v2::EmissionError;
+
+        #[track_caller]
+        fn assert_spark_emulated_syntax_error(sql: &str) {
+            match SparkSqlParserV2::parse_statement(sql) {
+                Err(EmissionError::SparkEmulated { class, .. }) => {
+                    assert_eq!(
+                        class,
+                        Some("PARSE_SYNTAX_ERROR"),
+                        "malformed SQL must carry Spark's own class: {sql}"
+                    );
+                }
+                other => {
+                    panic!("expected SparkEmulated PARSE_SYNTAX_ERROR for `{sql}`, got {other:?}")
+                }
+            }
+        }
+
+        #[track_caller]
+        fn assert_boundary_error(sql: &str) {
+            match SparkSqlParserV2::parse_statement(sql) {
+                Err(EmissionError::Unsupported { name, .. }) => {
+                    assert_eq!(name, "sql::parse_error", "for `{sql}`");
+                }
+                other => panic!("expected a boundary error for `{sql}`, got {other:?}"),
+            }
+        }
+
+        // ── Signal 1: lexical failure ───────────────────────────────────────
+        #[test]
+        fn unterminated_string_is_spark_emulated() {
+            // A tokenizer error. No grammar gap can make a literal terminate.
+            assert_spark_emulated_syntax_error("SELECT 'abc FROM emp");
+        }
+
+        // ── Signal 2: unbalanced delimiters ─────────────────────────────────
+        #[test]
+        fn unclosed_paren_is_spark_emulated() {
+            assert_spark_emulated_syntax_error("SELECT (1 FROM emp");
+        }
+
+        #[test]
+        fn unopened_paren_is_spark_emulated() {
+            assert_spark_emulated_syntax_error("SELECT id FROM emp )))");
+        }
+
+        #[test]
+        fn parens_inside_string_literals_do_not_count_as_unbalanced() {
+            // Balance is counted over TOKENS, so a lone paren inside a literal
+            // must not trip signal 2. This query is valid, so it must parse.
+            SparkSqlParserV2::parse_statement("SELECT '(' AS p FROM emp")
+                .expect("a paren inside a string literal is not a delimiter");
+        }
+
+        // ── Signal 3: an EMPTY slot where an expression is required ─────────
+        #[test]
+        fn expression_required_but_input_ended_is_spark_emulated() {
+            assert_spark_emulated_syntax_error("SELECT * FROM emp GROUP BY");
+        }
+
+        #[test]
+        fn expression_required_but_slot_empty_is_spark_emulated() {
+            assert_spark_emulated_syntax_error("SELECT * FROM emp UNPIVOT (v FOR k IN ())");
+        }
+
+        // ── The NEGATIVE half: these must stay Thunderduck-boundary ─────────
+        // `Expected: end of statement, found: X` is produced by BOTH malformed
+        // input and genuine τ grammar gaps, so it must never be upgraded.
+        // Getting this wrong tells users their valid Spark is invalid, which is
+        // strictly worse than admitting τ cannot ingest it.
+
+        #[test]
+        fn hiveql_transform_stays_boundary() {
+            // Spark ACCEPTS this; sqlparser does not. A τ gap, not bad SQL.
+            assert_boundary_error("SELECT TRANSFORM(id, name) USING 'cat' AS (x, y) FROM emp");
+        }
+
+        #[test]
+        fn create_table_using_stays_boundary() {
+            // Spark ACCEPTS this too.
+            assert_boundary_error("CREATE TABLE t2 (a INT) USING parquet");
+        }
+
+        #[test]
+        fn time_travel_stays_boundary() {
+            // Spark parses it and fails in ANALYSIS with
+            // UNSUPPORTED_FEATURE.TIME_TRAVEL — never PARSE_SYNTAX_ERROR. This
+            // is the guardrail witnessed by corpus case parseerr-101.
+            assert_boundary_error("SELECT * FROM emp VERSION AS OF 1");
+        }
+
+        #[test]
+        fn keyword_typo_stays_boundary_because_it_is_indistinguishable() {
+            // `SELECT * FRM emp` IS malformed, but its error shape
+            // (`Expected: end of statement, found: FRM`) is byte-identical in
+            // form to the three τ gaps above. Upgrading it would upgrade them
+            // too. Deliberately left as a boundary error and tracked by the
+            // deferred witness parseerr-001 — see
+            // docs/future_work/adr-022-strict-rejection-enforcement.md.
+            assert_boundary_error("SELECT * FRM emp");
+        }
+    }
 
     /// Assert the parsed fragment resolves to a `FunctionCall` for `name`.
     fn assert_parses_as_function(expr_sql: &str, name: &str) {

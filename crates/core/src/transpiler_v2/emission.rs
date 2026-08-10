@@ -6381,9 +6381,9 @@ fn render_update_fields(
     //   * add / replace: case-insensitive match against current fields;
     //     preserves the original declared field name on replace.
     //   * drop: case-insensitive match against current fields.
-    // The analyzer's `validate_update_fields_ops` rejects missing drop
-    // targets before emission runs, so any silent-ignore here is unreachable
-    // via the τ pipeline.
+    // A missing drop target is silently ignored (the struct comes through
+    // unchanged). That is Spark 4.1.1's own behaviour — verified in the review
+    // A1 audit, which is why the analyzer no longer rejects it.
     let mut fields: Vec<(String, FieldSource)> = base_struct
         .fields
         .iter()

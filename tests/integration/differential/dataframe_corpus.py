@@ -873,6 +873,36 @@ case("struc-006", "structural", "reduce HOF (alias of aggregate, spark4)", lambd
 # pairs [("id","a"),("id","b")] last-wins to id->b; the downstream
 # select("a") must resolve to the FIRST "id" (the self-join's "e" side).
 case("struc-007", "structural", "toDF positional rename over dup-named self-join child", lambda I: I["emp"].alias("e").join(I["emp"].alias("m"), F.col("e.manager_id") == F.col("m.id"), "left").select(F.col("e.id"), F.col("m.id")).toDF("a", "b").select("a"))
+# ── Review C1 witness ───────────────────────────────────────────────────────
+# `toDF` renames EVERY column, which severs referenceability via the
+# PRE-rename qualifier exactly as `withColumnRenamed` does. Spark 4.1.1 raises
+# UNRESOLVED_COLUMN.WITH_SUGGESTION here; τ used to RESOLVE it, because
+# `analyze_to_df` cloned+renamed the attributes without clearing
+# `source_quals` (the sibling `WithColumnsRenamed` arm does). Born red as an
+# error-parity divergence: "Spark raised …; τ returned N rows".
+case("errcls-001", "error_class", "C1 — dead pre-toDF qualifier must not resolve", lambda I: I["emp"].select("id", "name").alias("t").toDF("a", "b").select("t.a"), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
+# ── Review A1 witnesses (DataFrame front end) ───────────────────────────────
+# Both were previously `AnalyzerError::Other`, which exited as gRPC
+# UNIMPLEMENTED with the class buried in prose, so `spark_error_class` could
+# only ever recover None — the cases could not pass an error-class comparison
+# at all. Classes below were OBSERVED against live Spark 4.1.1.
+case("errcls-002", "error_class", "A1 — union arity mismatch carries NUM_COLUMNS_MISMATCH", lambda I: I["emp"].union(I["dept"]), expected_error="NUM_COLUMNS_MISMATCH")
+case("errcls-003", "error_class", "A1 — toDF arity mismatch carries ASSIGNMENT_ARITY_MISMATCH", lambda I: I["emp"].toDF("only_one"), expected_error="ASSIGNMENT_ARITY_MISMATCH")
+# ── Review A1 bonus witnesses: τ was OVER-STRICT (Spark accepts these) ──────
+# The audit found τ rejecting input Spark runs. Verified twice against live
+# Spark 4.1.1 — it analysed AND returned rows. Spark permits duplicate names
+# in an output schema; it only rejects an ambiguous *reference*. These carry no
+# `expected_error`: they must return rows on both sides.
+case("errcls-004", "error_class", "A1 — dropFields of an absent field is a no-op, not an error", lambda I: I["emp"].select(F.col("id")).withColumn("s", F.struct(F.col("id").alias("x"))).select(F.col("s").dropFields("nope").alias("kept")))
+# Same shape as errcls-004 but UNALIASED, which exposes a THIRD gap the A1
+# audit surfaced: `pretty_name` has no `UpdateFields` arm, so τ auto-names the
+# projection "expr" where Spark names it "update_fields(s, dropfield())". Same
+# family as the deferred prettyname-004 (Window) case — data matches, only the
+# auto-generated column name diverges. DEFERRED: not in the baseline, so its
+# redness is not a regression. errcls-004 above carries an explicit alias so it
+# tests the over-strictness fix without depending on this.
+case("errcls-006", "error_class", "A1 — unaliased dropFields pretty-name (DEFERRED: no UpdateFields pretty_name arm)", lambda I: I["emp"].select(F.col("id")).withColumn("s", F.struct(F.col("id").alias("x"))).select(F.col("s").dropFields("nope")))
+case("errcls-005", "error_class", "A1 — unpivot variable name may collide with an id column", lambda I: I["emp"].select("id", "salary").unpivot(["id"], ["salary"], "id", "v"))
 
 # ── 32. Time-window aggregate (tumbling) ────────────────────────────────────
 case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["emp"].filter(F.col("last_login").isNotNull()).groupBy(F.window("last_login", "1 day")).agg(F.count(F.lit(1)).alias("n")))

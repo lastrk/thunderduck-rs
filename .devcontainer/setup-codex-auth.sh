@@ -14,7 +14,7 @@ API_KEY_FILE="$DEVCONTAINER_DIR/.codex-api-key"
 AUTH_CACHE_FILE="$DEVCONTAINER_DIR/.codex-auth.json"
 
 if [ -s "$ACCESS_TOKEN_FILE" ]; then
-    codex login --with-access-token < "$ACCESS_TOKEN_FILE"
+    timeout 30s codex login --with-access-token < "$ACCESS_TOKEN_FILE" || { status=$?; echo "Codex: 'codex login' failed (exit $status); skipping." >&2; exit 0; }
     echo "Codex: authenticated with a ChatGPT Enterprise access token."
 elif [ -s "$API_KEY_FILE" ]; then
     codex login --with-api-key < "$API_KEY_FILE"

@@ -15,8 +15,9 @@ The four:
   (`/workspace`) or it errors.
 - **scip-nav** — `Bash: python3 .claude/skills/scip-nav/scip_query.py <refs|def|sym> <NAME>
   [--count]`. Type/trait-resolved refs, exact defs, symbol search from a static
-  rust-analyzer SCIP snapshot. **Tiny** (5–160 tok), exact. Fails closed if the
-  index is stale (`refresh`, or `--stale-ok`/`--auto-refresh`). Also has a
+  rust-analyzer SCIP snapshot. **Tiny** (5–160 tok), exact. The current Git worktree
+  selects an immutable content-keyed snapshot in the shared cache; missing exact
+  snapshots fail closed (`refresh`, or `--stale-ok`/`--auto-refresh`). Also has a
   heavyweight **`expand <crate> [pat]`** mode (nightly `rustc -Zunpretty=expanded`)
   that shows **macro-generated code** — compile-bound, crate-scoped, needs a green
   tree; for exploration/review, not tight loops. See the `scip-nav` skill.
@@ -89,4 +90,5 @@ The four:
   (`tests/integration/differential/*`), invisible to all four Rust tools — a Rust "no covering
   tests" flag is not the whole story; grep the corpus too.
 - **scip-nav is a snapshot**: run `refresh` (~15 s, ~3 GB transient, then freed) after edits, or
-  a query will fail closed. `status` reports freshness.
+  a query will fail closed. `status` reports the discovered worktree, shared cache,
+  fingerprint, and exact snapshot. `--stale-ok` is scoped to the same worktree.

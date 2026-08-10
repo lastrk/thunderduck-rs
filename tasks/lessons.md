@@ -403,6 +403,16 @@ newer than the sources it claims to test (`ls -la target/release/... `
 vs the latest edit). Fixed on this branch: the runner now always runs
 `cargo build --release` (a no-op when the tree is unchanged) unless an
 explicit `THUNDERDUCK_BINARY` is supplied.
+
+## 2026-08-09 — Isolate worktree-aware caches and their delivery
+
+- **Separate source and cache roots.** SCIP refresh indexed `/workspace` from a
+  linked worktree because one setting controlled both. Discover the current Git
+  worktree, and share only immutable, content-keyed cache artifacts.
+- **Land cross-cutting tooling independently.** Keep the SCIP isolation PR based
+  on `main`, then cherry-pick the same commit into the active refactor branch;
+  do not make generally useful tooling depend on the in-flight refactor stack.
+
 ## 2026-08-09 — Resolve phase labels from the named plan
 
 - When a request names a plan file and phase, read that exact phase before

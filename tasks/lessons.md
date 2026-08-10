@@ -421,3 +421,36 @@ explicit `THUNDERDUCK_BINARY` is supplied.
   selecting a branch or implementation target. Nearby branch context can be
   stale: here, an active plan-origin branch suggested Phase 2 work while the
   named plan's Phase 3 was the generator-IR migration.
+
+## 2026-08-09 — Run independent broad audits on isolated branches
+
+The architecture plan originally deferred the whole-tree comment audit until
+after structural work. The user correctly moved it onto a parallel thread.
+When a broad, review-heavy pass is independent of the active representation
+change, isolate it in a separate worktree and partition ownership by path; do
+not serialize it behind the critical path or mix its churn into that diff.
+
+- **Report production and repository LOC separately before calling a refactor
+  smaller.** The `bff14bd` deletion slice removed 306 net production lines but
+  added a 645-line task plan, so the commit grew by 339 lines overall. Keep the
+  plan proportional, and state both measurements when documentation reverses
+  the repository-level result.
+
+- **Separate Git state from architectural intent.** The
+  `plan-origin-metadata` and `relation-plan-id-metadata` worktrees were two
+  drafts of one Phase 2 effort; a duplicate tooling commit and overlapping
+  dirty files did not make them separate designs. Compare objectives and
+  invariants before explaining consolidation mechanics.
+
+- **Spark Connect plan IDs are plan-node lookup anchors, not freely propagated
+  source lineage.** The Phase 2 audit (2026-08-10) confirmed that Spark tags
+  every logical-plan node, searches top-down for a matching ID, and filters the
+  resolved attribute through ancestor outputs. Preserve that algorithm before
+  deleting join-side vectors; rename, Union, star, USING, and unknown-ID
+  behavior cannot be inferred from generic lineage rules.
+
+- **Retired ADRs should leave the active context, not just gain a superseded
+  banner.** ADR-023 still consumed the authoritative spine and influenced agent
+  reasoning after ADR-024/026 replaced it. Move superseded text under
+  `docs/adrs/retired/`, remove it from active dependency/ratification tables,
+  and keep only successor links to the historical rationale.

@@ -57,7 +57,9 @@ CLAUDE.md requires the corpus differential (no previously-green case regresses) 
 In this environment the differential harness could not start both servers (verified failure:
 "Failed to start both servers", earlier this session; known shared-worktree/Spark-startup
 contention). A 33.7k-line-module schema-type swap validated only by lib tests is exactly the
-"silent wrong-column" hazard ADR-023 itself flags as the migration risk.
+"silent wrong-column" hazard the
+[retired ADR-023](../docs/adrs/retired/adr-023-ordinal-reference-resolution.md)
+flags as the migration risk.
 
 ## Questions for the reviewer (adversarial: try to REFUTE)
 

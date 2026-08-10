@@ -8,6 +8,7 @@
 .devcontainer/.github-token
 .devcontainer/.gh-auth-token
 .reference/
+.worktrees/
 
 # Rust
 /target/

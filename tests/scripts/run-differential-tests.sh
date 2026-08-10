@@ -58,6 +58,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# All worktrees share one git common directory.  Resolve the main checkout
+# dynamically so a worktree can reuse generated Spark, venv, and TPC assets
+# without hard-coding the devcontainer's /workspace path or copying gigabytes.
+COMMON_GIT_DIR="$(git -C "$WORKSPACE_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [ -n "$COMMON_GIT_DIR" ]; then
+    MAIN_WORKSPACE_DIR="$(dirname "$COMMON_GIT_DIR")"
+else
+    MAIN_WORKSPACE_DIR="$WORKSPACE_DIR"
+fi
+
 # Source the env file written by setup-differential-testing.sh if present
 # (sets SPARK_HOME, THUNDERDUCK_VENV_DIR, etc. to the vendored install).
 ENV_FILE="$WORKSPACE_DIR/tests/integration/.env"
@@ -66,9 +76,16 @@ if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
 fi
 
-# Fall back to the vendored in-tree install, then $HOME/spark/current,
+# .env predates worktree support and may contain the main checkout's absolute
+# WORKSPACE_DIR. The path of this runner is the only valid source for the
+# worktree under test.
+WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Fall back to the main checkout's shared install, then $HOME/spark/current,
 # before failing in the prerequisite check below.
-SPARK_HOME="${SPARK_HOME:-$WORKSPACE_DIR/.spark/spark-4.1.1}"
+if [ -z "${SPARK_HOME:-}" ] || [ ! -d "$SPARK_HOME" ]; then
+    SPARK_HOME="$MAIN_WORKSPACE_DIR/.spark/spark-4.1.1"
+fi
 [ -d "$SPARK_HOME" ] || SPARK_HOME="$HOME/spark/current"
 
 # Handle --ci flag
@@ -98,7 +115,10 @@ if [[ "$THUNDERDUCK_ORACLE" != "golden" && "$THUNDERDUCK_ORACLE" != "live" && "$
 fi
 
 # Resolve Python interpreter
-VENV_DIR="${THUNDERDUCK_VENV_DIR:-$WORKSPACE_DIR/.venv}"
+VENV_DIR="${THUNDERDUCK_VENV_DIR:-}"
+if [ -z "$VENV_DIR" ] || [ ! -x "$VENV_DIR/bin/python3" ]; then
+    VENV_DIR="$MAIN_WORKSPACE_DIR/.venv"
+fi
 if [ -n "$VIRTUAL_ENV" ]; then
     PYTHON="python3"
 elif [ -x "$VENV_DIR/bin/python3" ]; then
@@ -221,8 +241,12 @@ else
     echo -e "${GREEN}  Spark found at: $SPARK_HOME${NC}"
 fi
 
-if [ ! -d "$WORKSPACE_DIR/tests/integration/tpch_sf001" ]; then
-    echo -e "${RED}ERROR: TPC-H data not found at $WORKSPACE_DIR/tests/integration/tpch_sf001${NC}"
+TPCH_DATA_DIR="${THUNDERDUCK_TPCH_DATA_DIR:-$WORKSPACE_DIR/tests/integration/tpch_sf001}"
+if [ ! -d "$TPCH_DATA_DIR" ]; then
+    TPCH_DATA_DIR="$MAIN_WORKSPACE_DIR/tests/integration/tpch_sf001"
+fi
+if [ ! -d "$TPCH_DATA_DIR" ]; then
+    echo -e "${RED}ERROR: TPC-H data not found at $TPCH_DATA_DIR${NC}"
     echo "Please ensure TPC-H data files exist in tests/integration/tpch_sf001/"
     exit 1
 fi
@@ -333,6 +357,8 @@ echo ""
 
 export SPARK_HOME
 export THUNDERDUCK_BINARY="$BINARY_PATH"
+export THUNDERDUCK_TPCH_DATA_DIR="$TPCH_DATA_DIR"
+export THUNDERDUCK_TPCDS_DATA_DIR="${THUNDERDUCK_TPCDS_DATA_DIR:-$MAIN_WORKSPACE_DIR/tests/integration/tpcds_sf001}"
 
 cd "$WORKSPACE_DIR/tests/integration"
 

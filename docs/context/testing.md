@@ -143,6 +143,44 @@ runs never clash and cleanup never kills another worktree's servers:
   temp dir); `THUNDERDUCK_DUCKDB_EXTENSION_DIR` optionally points DuckDB's
   `INSTALL` cache at a per-worktree dir to avoid a shared-`~/.duckdb` race.
 
+### Devcontainer worktree workflow
+
+Create worktrees *inside the mounted checkout* so one devcontainer can see
+them all. They are real Git worktrees, not copied repositories:
+
+```bash
+# Run once from the main checkout after opening the devcontainer.
+scripts/dev/dev-cache-setup.sh
+
+# Create two independent branches that are visible at /workspace/.worktrees/.
+git worktree add -b feature/one .worktrees/feature-one HEAD
+git worktree add -b feature/two .worktrees/feature-two HEAD
+```
+
+Use a separate terminal for each worktree. Keep its `target/` directory local
+to that worktree—**do not set a shared `CARGO_TARGET_DIR`**. Cargo mutates that
+directory and concurrent builds would contend, invalidate each other's
+incremental state, and encode worktree-specific paths. The dev cache setup
+shares the safe, expensive parts instead: `sccache` and the prebuilt
+`libduckdb_static.a` under the main checkout's `.build-cache/`; the mandatory
+`thdck_spark_funcs` extension is already vendored in every worktree.
+
+```bash
+cd .worktrees/feature-one
+cargo test
+./tests/scripts/run-differential-tests.sh core
+
+cd ../feature-two
+cargo test
+./tests/scripts/run-differential-tests.sh sql_v2
+```
+
+The differential runner resolves Spark, the Python venv, and generated TPC
+data through Git's common directory when they are absent from a linked
+worktree. No `/workspace` export or copied `.spark`, `.venv`, or parquet data
+is needed. Each worktree retains its own release binary, remembered ports,
+Spark PID/log state, DuckDB extension cache, and cleanup scope.
+
 ## Key Data & SQL Paths
 
 | Resource | Path |

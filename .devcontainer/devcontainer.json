@@ -271,14 +271,14 @@
 	// Execution context: Runs as remoteUser (vscode) inside container
 	// Why useful: Automate setup steps, install tools, verify environment
 	// Format: String (shell command) or array (executable + args)
-	// This command: Sets up Claude Code with API key in settings.json env field
+	// This command: Installs and configures Claude Code and Codex CLI.
 	// Why mkdir: Ensures directories exist with correct ownership
-	// Why npm install: Auto-installs Claude Code globally
+	// Why npm install: Auto-installs the agent CLIs globally
 	// Why settings.json env field: Proper way to set ANTHROPIC_API_KEY per Claude Code docs
 	// Why .claude.json: Creates OAuth account config for organization support
 	// Why git --version: Verifies git works (tests safe.directory config)
 	// &&: Chain commands - each must succeed for next to run
-	"postCreateCommand": "mkdir -p /vscode ~/.claude /home/vscode/.vscode-server/extensionsCache && npm install -g @anthropic-ai/claude-code && if [ -f /workspace/.devcontainer/generate-claude-config.sh ]; then /workspace/.devcontainer/generate-claude-config.sh; fi && if [ -f /workspace/.devcontainer/setup-github-auth.sh ]; then /workspace/.devcontainer/setup-github-auth.sh; fi && echo 'DevContainer created successfully! Claude Code installed.' && git --version",
+	"postCreateCommand": "mkdir -p /vscode ~/.claude ~/.codex /home/vscode/.vscode-server/extensionsCache && npm install -g @anthropic-ai/claude-code @openai/codex && if [ -f /workspace/.devcontainer/generate-claude-config.sh ]; then /workspace/.devcontainer/generate-claude-config.sh; fi && if [ -f /workspace/.devcontainer/setup-codex-auth.sh ]; then /workspace/.devcontainer/setup-codex-auth.sh; fi && if [ -f /workspace/.devcontainer/setup-github-auth.sh ]; then /workspace/.devcontainer/setup-github-auth.sh; fi && echo 'DevContainer created successfully! Claude Code and Codex installed.' && git --version",
 
 	// Forward Ports: Automatically forward ports from container to host
 	// Purpose: Makes services running in container accessible from host browser/tools
@@ -312,10 +312,10 @@
 	// Initialize Command: Runs on HOST before container is created
 	// Purpose: Capture environment variables from host system for container authentication
 	// When executed: Before container build/start, runs on your Mac/host OS
-	// How it works: Writes ANTHROPIC_* environment variables to files for container to read
+	// How it works: Writes ANTHROPIC_* and Codex authentication variables to files for container to read
 	// Security: Files are gitignored, only exist locally, deleted on container rebuild
 	// Required: ANTHROPIC_AUTH_TOKEN must be set in host environment
-	"initializeCommand": "[ -n \"$ANTHROPIC_AUTH_TOKEN\" ] && printf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > ${localWorkspaceFolder}/.devcontainer/.claude-auth-token; [ -n \"$ANTHROPIC_BASE_URL\" ] && printf '%s' \"$ANTHROPIC_BASE_URL\" > ${localWorkspaceFolder}/.devcontainer/.claude-base-url; [ -n \"$ANTHROPIC_CUSTOM_HEADERS\" ] && printf '%s' \"$ANTHROPIC_CUSTOM_HEADERS\" > ${localWorkspaceFolder}/.devcontainer/.claude-custom-headers; command -v gh >/dev/null 2>&1 && gh auth token > ${localWorkspaceFolder}/.devcontainer/.github-token 2>/dev/null; echo 'Host config extraction complete'",
+	"initializeCommand": "umask 077; [ -n \"$ANTHROPIC_AUTH_TOKEN\" ] && printf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > ${localWorkspaceFolder}/.devcontainer/.claude-auth-token; [ -n \"$ANTHROPIC_BASE_URL\" ] && printf '%s' \"$ANTHROPIC_BASE_URL\" > ${localWorkspaceFolder}/.devcontainer/.claude-base-url; [ -n \"$ANTHROPIC_CUSTOM_HEADERS\" ] && printf '%s' \"$ANTHROPIC_CUSTOM_HEADERS\" > ${localWorkspaceFolder}/.devcontainer/.claude-custom-headers; [ -n \"$OPENAI_API_KEY\" ] && printf '%s' \"$OPENAI_API_KEY\" > ${localWorkspaceFolder}/.devcontainer/.codex-api-key; [ -n \"$CODEX_ACCESS_TOKEN\" ] && printf '%s' \"$CODEX_ACCESS_TOKEN\" > ${localWorkspaceFolder}/.devcontainer/.codex-access-token; [ -r \"$HOME/.codex/auth.json\" ] && cp \"$HOME/.codex/auth.json\" ${localWorkspaceFolder}/.devcontainer/.codex-auth.json; command -v gh >/dev/null 2>&1 && gh auth token > ${localWorkspaceFolder}/.devcontainer/.github-token 2>/dev/null; echo 'Host config extraction complete'",
 
 	"remoteEnv": {
 		// WORKSPACE_DIR: Path to workspace directory
@@ -357,4 +357,3 @@
 	// Alternative: "none" if you want to keep services running between sessions
 	"shutdownAction": "stopContainer"
 }
-

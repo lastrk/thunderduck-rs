@@ -329,7 +329,7 @@ mod tests {
     //! via `ExpressionString`.
 
     use super::SparkSqlParserV2;
-    use crate::transpiler_v2::Expression;
+    use crate::transpiler_v2::{generate, BaseTypes, Expression};
 
     /// ADR-022 classification of `sqlparser` failures — the
     /// `classify_parse_failure` contract, pinned end-to-end through
@@ -472,6 +472,26 @@ mod tests {
     #[test]
     fn parse_expression_scalar_function_upper() {
         assert_parses_as_function("upper(name)", "upper");
+    }
+
+    #[test]
+    fn direct_sql_uses_emission_not_session_macros() {
+        // Literal-only witnesses cover direct SQL parser → analyzer → emission.
+        for (sql_text, expected) in [
+            ("SELECT endswith('abc', 'c')", "ends_with"),
+            (
+                "SELECT arrays_zip(array(1, 2), array(3, 4))",
+                "list_transform",
+            ),
+            ("SELECT conv('10', 10, 2)", "bin("),
+        ] {
+            let plan = SparkSqlParserV2::parse(sql_text).expect("parse");
+            let emitted = generate(&plan, &BaseTypes::empty()).expect("analyze and emit");
+            assert!(
+                emitted.contains(expected),
+                "expected `{expected}` in emitted SQL for {sql_text:?}, got: {emitted}"
+            );
+        }
     }
 
     // ── Pass 71: bare aggregate fragments ────────────────────────────────

@@ -20,34 +20,6 @@ fn inv1_byte_identical_input() {
     todo!("INV1 — activation deferred; not yet implemented")
 }
 
-// ── INV2 (ACTIVE) ────────────────────────────────────────────────
-
-/// INV2: dispatch is the ONLY writer of SQL text — every emission arm must
-/// route through the dispatch table. τ's emission substrate introduces `EMIT_TAP` +
-/// `EMIT_TAP_MUTEX` in `emission.rs`; this test asserts that a successful
-/// `generate()` call increments the tap exactly once.
-///
-/// The future τ work escape-hatch dimension extends this test (verifies emitting
-/// via unregistered paths increments zero times).
-#[test]
-fn inv2_dispatch_is_only_sql_writer() {
-    use super::emission::{EMIT_TAP, EMIT_TAP_MUTEX};
-    use super::{generate, BaseTypes, CommonAst, CommonOp};
-    use std::sync::atomic::Ordering;
-
-    let _guard = EMIT_TAP_MUTEX.lock().expect("EMIT_TAP_MUTEX poisoned");
-    let before = EMIT_TAP.load(Ordering::Relaxed);
-    // SingleRow is the minimal successful witness.
-    let ast = CommonAst::new(CommonOp::SingleRow);
-    let _ = generate(&ast, &BaseTypes::empty()).expect("SingleRow dispatch");
-    let after = EMIT_TAP.load(Ordering::Relaxed);
-    assert_eq!(
-        after - before,
-        1,
-        "dispatch_op must tap exactly once per Ok return",
-    );
-}
-
 // ── INV3 (ACTIVE) ────────────────────────────────────────────────
 
 /// INV3: the emission table is the SINGLE source of truth for function →

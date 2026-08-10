@@ -35,8 +35,8 @@ impl CommonAst {
 /// Every variant below is analyzed and emitted end-to-end (relational core,
 /// Aggregate incl. Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA
 /// family, Unpivot, Pivot / Crosstab, Stat family, TableFunction, ...) with
-/// one exception: `Unnest`, whose emission arm is still a
-/// Thunderduck-boundary [`super::EmissionError::Unsupported`] per ADR-022.
+/// one exception: `Unnest`, which the analyzer rejects as a
+/// Thunderduck-boundary `PuntedOperator` per ADR-022.
 /// Plan shapes with no variant here surface as
 /// [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) from the
 /// front-ends. There is **no** opaque `Sql` variant — parser_v2 owns SQL

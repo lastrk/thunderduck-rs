@@ -304,7 +304,6 @@ impl RelScope {
             | TypedOp::LocalRelation { .. }
             | TypedOp::FileScan { .. }
             | TypedOp::TableFunction { .. }
-            | TypedOp::Unnest { .. }
             | TypedOp::WithColumns { .. }
             | TypedOp::DropColumns { .. }
             | TypedOp::WithColumnsRenamed { .. }
@@ -540,13 +539,6 @@ pub enum TypedOp {
         name: String,
         /// The function arguments.
         args: Vec<Expression>,
-        /// Whether to emit an ordinality column.
-        with_ordinality: bool,
-    },
-    /// `UNNEST(expr) [WITH ORDINALITY]` — τ's analyzer punts.
-    Unnest {
-        /// The array/map expression being unnested.
-        expr: Expression,
         /// Whether to emit an ordinality column.
         with_ordinality: bool,
     },
@@ -1055,7 +1047,6 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
             .iter()
             .all(|row| row.iter().all(expression_is_fully_resolved)),
         TypedOp::TableFunction { args, .. } => args.iter().all(expression_is_fully_resolved),
-        TypedOp::Unnest { expr, .. } => expression_is_fully_resolved(expr),
         TypedOp::WithColumns { input, assignments } => {
             has_resolved_schema(input)
                 && assignments
@@ -3587,7 +3578,7 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
         // Default recursion: walk every immediate child via the shared
         // walker. Covers Unary / Cast (non-implicit) / CaseWhen / Window /
         // Alias / Between / InList / Like / IsDistinctFrom / ExtractValue /
-        // ArrayLiteral / MapLiteral / StructLiteral / RowConstructor plus the
+        // ArrayLiteral / MapLiteral / StructLiteral plus the
         // leaf variants (Literal, Star) which return themselves unchanged
         // inside `map_children`.
         _ => expr.map_children(|e| resolve_and_stamp(e, ctx)),

@@ -11,6 +11,7 @@
 //! refactor. τ keeps the wrapper minimal.
 
 use super::expression::{Expression, Literal, SortOrder};
+use super::generator::Generator;
 use crate::types::StructType;
 
 /// τ's canonical plan tree — a single wrapper around a [`CommonOp`] variant.
@@ -496,26 +497,11 @@ pub enum CommonOp {
         seed: Option<i64>,
     },
 
-    /// `LATERAL VIEW [OUTER] generator(arg) table_alias AS col1[, col2, ...]`.
-    ///
-    /// Spark models this as a correlated unary operator: the generator
-    /// expression references columns from the input relation (`e.tags`), and
-    /// its output columns are appended (not replaced) to the input schema
-    /// under the specified `table_alias`. Lowering folds the `OUTER` flag
-    /// into the canonical generator name (`explode_outer`) and splits
-    /// `posexplode` into `posexplode_pos`/`posexplode_val` — so `columns`
-    /// always carries fully-canonical `FunctionCall` expressions.
-    ///
-    /// ADR-003 pre-authorizes this variant; composition of existing nodes
-    /// fails concretely when no supported composition exists.
-    LateralView {
-        /// The correlated input relation.
+    /// Append the rows and columns produced by a generator to its input.
+    Generate {
         input: Box<CommonAst>,
-        /// The table alias (e.g. `t` in `LATERAL VIEW explode(e.tags) t AS tag`).
-        table_alias: String,
-        /// Per-output-column `(alias, generator FunctionCall)` pairs. Non-empty
-        /// invariant; all co-project in a single inner SELECT at emission.
-        columns: Vec<(String, Expression)>,
+        generator: Generator,
+        qualifier: Option<String>,
     },
 
     /// `WITH RECURSIVE name(cols) AS (anchor UNION ALL recursive_term)
@@ -607,7 +593,7 @@ macro_rules! common_op_children {
             | CommonOp::Crosstab { input, .. }
             | CommonOp::Sample { input, .. }
             | CommonOp::SampleBy { input, .. }
-            | CommonOp::LateralView { input, .. } => vec![input.$as_child()],
+            | CommonOp::Generate { input, .. } => vec![input.$as_child()],
             CommonOp::RecursiveCte {
                 anchor,
                 recursive_term,

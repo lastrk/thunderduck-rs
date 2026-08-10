@@ -44,6 +44,7 @@ use thunderduck_core::transpiler_v2::expression::{
     StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
     UpdateFieldsExpression, WindowFunction,
 };
+use thunderduck_core::transpiler_v2::generator::Generator;
 use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::types::{DataType, StructField, StructType};
@@ -601,16 +602,11 @@ impl V2RelationConverter {
             Some(i) => self.convert(i)?,
             None => CommonAst::new(CommonOp::SingleRow),
         };
-        let mut projections: Vec<Expression> = Vec::with_capacity(p.expressions.len());
-        for e in &p.expressions {
-            if let Some(pair) = self.expr.try_convert_posexplode_multi_alias(e)? {
-                let (pos_proj, val_proj) = pair;
-                projections.push(pos_proj);
-                projections.push(val_proj);
-            } else {
-                projections.push(self.expr.convert(e)?);
-            }
-        }
+        let projections = p
+            .expressions
+            .iter()
+            .map(|expression| self.expr.convert(expression))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(CommonAst::new(CommonOp::Project {
             input: Box::new(input),
             projections,
@@ -1211,6 +1207,17 @@ impl V2ExpressionConverter {
                 negated: false,
             }));
         }
+        if Generator::is_function(&name) {
+            if func.is_distinct {
+                bail_boundary_proto!(
+                    format!("{name}::distinct"),
+                    "DISTINCT is not valid on a generator function",
+                );
+            }
+            return Ok(Expression::Generator(
+                Generator::from_function(&name, args).expect("generator name checked"),
+            ));
+        }
         Ok(Expression::FunctionCall(FunctionCall {
             name,
             args,
@@ -1227,6 +1234,10 @@ impl V2ExpressionConverter {
             .as_deref()
             .require_proto("Alias::missing_expr", "Alias has no inner expression")?;
         let expr = self.convert(inner)?;
+        if let Expression::Generator(mut generator) = expr {
+            generator.aliases = alias.name.clone();
+            return Ok(Expression::Generator(generator));
+        }
         let name = alias
             .name
             .first()
@@ -1236,71 +1247,6 @@ impl V2ExpressionConverter {
             expr: Box::new(expr),
             alias: name,
         }))
-    }
-
-    /// Expand two-name aliases for generators such as `posexplode` and map
-    /// `explode`; schema-dependent generators remain analyzer work.
-    fn try_convert_posexplode_multi_alias(
-        &mut self,
-        e: &proto::Expression,
-    ) -> Result<Option<(Expression, Expression)>, EmissionError> {
-        use proto::expression::ExprType;
-        let Some(ExprType::Alias(alias)) = e.expr_type.as_ref() else {
-            return Ok(None);
-        };
-        if alias.name.len() != 2 {
-            return Ok(None);
-        }
-        let Some(inner) = alias.expr.as_deref() else {
-            return Ok(None);
-        };
-        let Some(ExprType::UnresolvedFunction(func)) = inner.expr_type.as_ref() else {
-            return Ok(None);
-        };
-        let name_lower = func.function_name.to_ascii_lowercase();
-        let is_pos = matches!(name_lower.as_str(), "posexplode" | "posexplode_outer");
-        let is_map_explode = matches!(name_lower.as_str(), "explode" | "explode_outer");
-        if !is_pos && !is_map_explode {
-            return Ok(None);
-        }
-        if func.arguments.len() != 1 {
-            bail_boundary_proto!(
-                format!("{}::arity", name_lower),
-                format!(
-                    "`{}` with a two-name Alias requires exactly 1 argument, got {}",
-                    func.function_name,
-                    func.arguments.len()
-                ),
-            );
-        }
-        let arg = self.convert(&func.arguments[0])?;
-        let a_name = alias.name[0].clone();
-        let b_name = alias.name[1].clone();
-        let (a_fn_name, b_fn_name) = if is_pos {
-            ("posexplode_pos", "posexplode_val")
-        } else {
-            ("map_explode_key", "map_explode_val")
-        };
-        let a_fn = Expression::FunctionCall(FunctionCall {
-            name: a_fn_name.to_owned(),
-            args: vec![arg.clone()],
-            distinct: false,
-        });
-        let b_fn = Expression::FunctionCall(FunctionCall {
-            name: b_fn_name.to_owned(),
-            args: vec![arg],
-            distinct: false,
-        });
-        Ok(Some((
-            Expression::Alias(AliasExpression {
-                expr: Box::new(a_fn),
-                alias: a_name,
-            }),
-            Expression::Alias(AliasExpression {
-                expr: Box::new(b_fn),
-                alias: b_name,
-            }),
-        )))
     }
 
     fn convert_cast(

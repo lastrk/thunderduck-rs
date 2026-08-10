@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::generator::Generator;
 use super::name_fold::eq_fold;
 use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
@@ -34,7 +35,7 @@ pub(crate) fn int_literal_value(expr: &Expression) -> Option<i32> {
 ///
 /// Returns `None` for any non-literal or non-string expression. Used by the
 /// literal-keyed inference arms (`named_struct`, `to_number`, `from_json`,
-/// `from_csv`, `inline_field`) and the `ExtractValue` field-name lookups.
+/// `from_csv`) and the `ExtractValue` field-name lookups.
 pub(super) fn as_string_literal(e: &Expression) -> Option<&str> {
     match e {
         Expression::Literal(Literal {
@@ -573,6 +574,7 @@ pub enum Expression {
     Binary(BinaryExpression),
     Unary(UnaryExpression),
     FunctionCall(FunctionCall),
+    Generator(Generator),
     Cast(CastExpression),
     CaseWhen(CaseWhenExpression),
     Window(WindowFunction),
@@ -639,6 +641,7 @@ macro_rules! expression_children {
             }
 
             Expression::FunctionCall(f) => Box::new(f.args.$iter()),
+            Expression::Generator(g) => Box::new(g.args.$iter()),
             Expression::ArrayLiteral(a) => Box::new(a.elements.$iter()),
 
             Expression::CaseWhen(cw) => Box::new(
@@ -700,6 +703,7 @@ impl Expression {
                 UnaryOp::Negate => u.operand.data_type(schema),
             },
             Expression::FunctionCall(f) => Self::function_call_data_type(f, schema),
+            Expression::Generator(_) => DataType::Unresolved,
             Expression::Cast(c) => c.to_type.clone(),
             Expression::CaseWhen(cw) => Self::case_when_data_type(cw, schema),
             Expression::Window(w) => Self::window_data_type(w, schema),
@@ -781,6 +785,7 @@ impl Expression {
                 _ => u.operand.nullable(schema),
             },
             Expression::FunctionCall(f) => Self::function_call_nullable(f, schema),
+            Expression::Generator(_) => false,
             Expression::Cast(c) => {
                 if c.try_cast {
                     return true;
@@ -1165,26 +1170,6 @@ impl Expression {
                     }
                 }
             }
-            // Synthetic per-field FunctionCall names produced by the
-            // analyzer's Project pre-pass for `F.inline` / `F.inline_outer`
-            // (see `analyzer::expand_inline_projections`). `args[0]` is the
-            // resolved `Array<Struct<...>>`; `args[1]` is a `Literal::String`
-            // carrying the target field name. Return type = struct field's
-            // type (case-insensitive lookup, matching Spark).
-            "inline_field" | "inline_outer_field" if f.args.len() == 2 => {
-                if let Some(field_name) = as_string_literal(&f.args[1]) {
-                    if let DataType::Array(inner, _) = f.args[0].data_type(schema) {
-                        if let DataType::Struct(st) = *inner {
-                            for field in &st.fields {
-                                if eq_fold(&field.name, field_name) {
-                                    return field.data_type.clone();
-                                }
-                            }
-                        }
-                    }
-                }
-                return DataType::Unresolved;
-            }
             // Spark's 2-arg `ceil(x, t)` / `floor(x, t)` (`RoundCeil`/
             // `RoundFloor`) implicitly cast the child to Decimal and return a
             // scaled Decimal derived from the child type + literal target
@@ -1301,21 +1286,10 @@ impl Expression {
             //   τ's default `any(arg.nullable)` fallback would incorrectly
             //   propagate the timestamp arg's nullable into the struct
             //   itself; pin `false` here to match Spark's observable schema.
-            // * `posexplode_pos` — the position column is a synthetic
-            //   0-indexed integer, never NULL. Non-nullable regardless of the
-            //   input array's nullability.
-            // * `map_explode_key` — synthetic per-column call (map-007; see
-            //   the v2 relation converter's alias-splitter). Spark's
-            //   `explode(map)` produces `(key, value)` rows where keys are
-            //   ALWAYS non-nullable (Spark's MAP invariant); a NULL map arg
-            //   emits zero rows, so a nullable outer map does not propagate
-            //   to the key column. (Values inherit the map's
-            //   `valueContainsNull` flag — see the data-dependent
-            //   `map_explode_val` arm below.)
             "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" | "concat_ws"
             | "format_string" | "printf" | "typeof" | "spark_partition_id"
             | "monotonically_increasing_id" | "array" | "make_array" | "create_map" | "map"
-            | "named_struct" | "struct" | "window" | "posexplode_pos" | "map_explode_key" => false,
+            | "named_struct" | "struct" | "window" => false,
             // Spark scalars declared nullable regardless of arg nullability
             // (overflow / parse-fail / undefined-domain producers).
             "factorial" | "url_encode" | "url_decode" | "parse_url"
@@ -1338,18 +1312,6 @@ impl Expression {
             // `any(arg.nullable)` path which correctly yields false for
             // literal arguments.
             | "to_json" | "to_csv"
-            // `explode_outer(arr)` — always nullable: empty / NULL arrays
-            // emit exactly one row with a NULL value.
-            | "explode_outer"
-            // `inline_outer_field` — always nullable: the empty / NULL array
-            // sentinel row is all-NULL by construction. Mirrors
-            // `explode_outer` in this same list.
-            | "inline_outer_field"
-            // Synthetic `json_tuple_field(json, "<key>")` produced
-            // by the analyzer's Project pre-pass (`expand_json_tuple_projections`).
-            // Always nullable — Spark returns NULL for missing key OR JSON
-            // null value OR NULL `json_str`.
-            | "json_tuple_field"
             // `json_object_keys(jsonStr)` — always nullable: Spark returns
             // NULL for a NULL, invalid-JSON, or non-object input (the
             // `CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT'
@@ -1361,11 +1323,6 @@ impl Expression {
             // literal outer array (`F.array(...)`) produces a nullable
             // result per Spark's schema semantics.
             | "flatten" | "list_flatten"
-            // piv-006 — synthetic per-column call from
-            // `expand_stack_projections`. Spark's `Stack.elementSchema`
-            // pins every output column to `nullable = true` regardless
-            // of whether the individual row-values are non-null literals.
-            | "stack_col"
             // Spark's `ArrayAggregate.nullable` = `argument.nullable ||
             // finish.nullable`. In `bindInternal` the accumulator variable
             // is bound with `nullable = true` (hardcoded), so
@@ -1405,67 +1362,6 @@ impl Expression {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
-            // Generator functions (row-multiplying via UNNEST at emission).
-            // `explode(arr)` / `posexplode_val(arr)` — element nullability
-            // follows the array's `containsNull` flag AND the array arg's own
-            // nullability (a NULL array in `explode` produces zero rows).
-            "explode" | "posexplode_val" => match f.args.first() {
-                Some(arg) => {
-                    let contains_null = matches!(
-                        arg.data_type(schema),
-                        DataType::Array(_, true) | DataType::Map { .. }
-                    );
-                    contains_null || arg.nullable(schema)
-                }
-                None => true,
-            },
-            // Synthetic per-field FunctionCalls for
-            // `F.inline` / `F.inline_outer` (analyzer's Project pre-pass —
-            // `expand_inline_projections`). Args: (arr, field_name_literal).
-            //
-            // `inline_field` — nullability follows Spark's `Inline`:
-            //   * struct field's own nullability (case-insensitive lookup),
-            //   * OR the array's `containsNull` flag,
-            //   * OR the array arg's nullability (a NULL array yields zero
-            //     rows for the inner variant, so array-nullability doesn't
-            //     truly propagate to the produced column; keep the
-            //     conservative disjunction — matches `explode`'s posexplode_val
-            //     arm above for parity).
-            "inline_field" => match (f.args.first(), f.args.get(1).and_then(as_string_literal)) {
-                (Some(arr), Some(field_name)) => {
-                    let arr_ty = arr.data_type(schema);
-                    let (contains_null, field_nullable) = match &arr_ty {
-                        DataType::Array(inner, cn) => match inner.as_ref() {
-                            DataType::Struct(st) => {
-                                let field_null = st
-                                    .fields
-                                    .iter()
-                                    .find(|f0| eq_fold(&f0.name, field_name))
-                                    .map(|f0| f0.nullable)
-                                    .unwrap_or(true);
-                                (*cn, field_null)
-                            }
-                            _ => (true, true),
-                        },
-                        _ => (true, true),
-                    };
-                    arr.nullable(schema) || contains_null || field_nullable
-                }
-                _ => true,
-            },
-            // Synthetic `map_explode_val(m)` (map-007) — values inherit the
-            // map's `valueContainsNull` flag. (Its `map_explode_key` sibling
-            // is pinned non-nullable in the constant-`false` list above.)
-            "map_explode_val" => match f.args.first() {
-                Some(arg) => matches!(
-                    arg.data_type(schema),
-                    DataType::Map {
-                        value_nullable: true,
-                        ..
-                    }
-                ),
-                None => true,
-            },
             _ => f.args.iter().any(|a| a.nullable(schema)),
         }
     }
@@ -2798,152 +2694,6 @@ mod tests {
             expr.nullable(&s),
             "aggregate HOF must be nullable even with nullable array input",
         );
-    }
-
-    /// Schema holding a single `arr : Array<Struct<name STRING?, age INT?>>`
-    /// column used by the inline-field nullability tests.
-    fn inline_test_schema(arr_contains_null: bool) -> ResolvedSchema {
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::nullable("age", DataType::Integer),
-        ]));
-        ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(element), arr_contains_null),
-        )]))
-    }
-
-    fn inline_field_call(arr_col: &str, field: &str, outer: bool) -> Expression {
-        let name = if outer {
-            "inline_outer_field"
-        } else {
-            "inline_field"
-        };
-        fcall(name, vec![UnresolvedColumn::bare(arr_col), str_lit(field)])
-    }
-
-    /// `inline_field(arr, "name")` returns the struct field's own type.
-    #[test]
-    fn inline_field_data_type_is_struct_field_type() {
-        let s = inline_test_schema(true);
-        assert_eq!(
-            inline_field_call("arr", "name", false).data_type(&s),
-            DataType::String
-        );
-        assert_eq!(
-            inline_field_call("arr", "age", false).data_type(&s),
-            DataType::Integer
-        );
-    }
-
-    /// Field lookup is case-insensitive (Spark's `StructType.fieldNames` uses
-    /// case-insensitive resolution by default under ANSI mode).
-    #[test]
-    fn inline_field_data_type_case_insensitive_field_lookup() {
-        let s = inline_test_schema(true);
-        assert_eq!(
-            inline_field_call("arr", "NAME", false).data_type(&s),
-            DataType::String
-        );
-        assert_eq!(
-            inline_field_call("arr", "AgE", false).data_type(&s),
-            DataType::Integer
-        );
-    }
-
-    /// `inline_outer_field` is always nullable (sentinel row is all-NULL).
-    #[test]
-    fn inline_outer_field_is_always_nullable() {
-        // Every struct field non-nullable, containsNull=false, arr non-nullable.
-        // Even with every input dimension "not null", outer still yields
-        // nullable=true because the sentinel row is synthesized as all-NULL.
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::not_null("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element), false),
-        )]));
-        assert!(inline_field_call("arr", "name", true).nullable(&s));
-        assert!(inline_field_call("arr", "age", true).nullable(&s));
-    }
-
-    /// `inline_field` nullability is the disjunction of arr nullability,
-    /// arr's containsNull flag, and the struct field's own nullability.
-    #[test]
-    fn inline_field_nullable_propagates_from_arr() {
-        // Case 1: everything not-null → not nullable.
-        let element_notnull = DataType::Struct(StructType::new(vec![
-            StructField::not_null("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s1 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_notnull.clone()), false),
-        )]));
-        assert!(!inline_field_call("arr", "name", false).nullable(&s1));
-
-        // Case 2: containsNull=true → nullable.
-        let s2 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_notnull.clone()), true),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s2));
-
-        // Case 3: struct field itself nullable → nullable.
-        let element_field_null = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::not_null("age", DataType::Integer),
-        ]));
-        let s3 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "arr",
-            DataType::Array(Box::new(element_field_null), false),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s3));
-        assert!(!inline_field_call("arr", "age", false).nullable(&s3));
-
-        // Case 4: arr nullable → nullable.
-        let s4 = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
-            "arr",
-            DataType::Array(Box::new(element_notnull), false),
-        )]));
-        assert!(inline_field_call("arr", "name", false).nullable(&s4));
-    }
-
-    fn json_tuple_field_call(json_col: &str, key: &str) -> Expression {
-        fcall(
-            "json_tuple_field",
-            vec![UnresolvedColumn::bare(json_col), str_lit(key)],
-        )
-    }
-
-    /// `json_tuple_field(json_str, "<key>")` is always STRING per Spark's
-    /// `JsonTuple.elementSchema`.
-    #[test]
-    fn json_tuple_field_data_type_is_string() {
-        // json_str typed as String, non-null — return type STRING regardless.
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "json_str",
-            DataType::String,
-        )]));
-        assert_eq!(
-            json_tuple_field_call("json_str", "a").data_type(&s),
-            DataType::String
-        );
-    }
-
-    /// `json_tuple_field` is always nullable — missing key OR JSON null OR
-    /// NULL `json_str` all yield NULL.
-    #[test]
-    fn json_tuple_field_is_always_nullable() {
-        // Even with a non-nullable `json_str`, the field lookup can miss →
-        // nullable=true.
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "json_str",
-            DataType::String,
-        )]));
-        assert!(json_tuple_field_call("json_str", "a").nullable(&s));
     }
 
     /// `json_object_keys(jsonStr)` is always nullable — even over a

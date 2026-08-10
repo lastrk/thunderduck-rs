@@ -91,6 +91,16 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 ## ADR-003 — The intermediate representation is a proto-inspired common AST, extended incrementally, not full Catalyst LogicalPlan
 
+> **Generator amendment (2026-08-09):** row-generating functions use a
+> structured `Generator` value and a unary `Generate` operator. A generator in
+> a SELECT projection is an unresolved, projection-only marker until analysis
+> normalizes it to `Project` over `Generate`; it is never a scalar
+> `FunctionCall`. SQL `LATERAL VIEW`, generator table syntax, and Spark Connect
+> projections converge on the same operator. `Generate` appends its resolved
+> output attributes to its child's output, applies an optional qualifier, and
+> marks every generated attribute nullable when `outer` is set. Layer B emits
+> the required DuckDB row-expansion shape from the structured kind.
+
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-002
 **Depended on by:** ADR-004, ADR-005, ADR-009

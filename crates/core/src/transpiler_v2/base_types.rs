@@ -208,8 +208,8 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
             }
         }
         CommonOp::SampleBy { col, .. } => f(col),
-        CommonOp::LateralView { columns, .. } => {
-            for (_, e) in columns {
+        CommonOp::Generate { generator, .. } => {
+            for e in &generator.args {
                 f(e);
             }
         }

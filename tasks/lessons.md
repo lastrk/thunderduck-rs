@@ -403,3 +403,9 @@ newer than the sources it claims to test (`ls -la target/release/... `
 vs the latest edit). Fixed on this branch: the runner now always runs
 `cargo build --release` (a no-op when the tree is unchanged) unless an
 explicit `THUNDERDUCK_BINARY` is supplied.
+## 2026-08-09 — Resolve phase labels from the named plan
+
+- When a request names a plan file and phase, read that exact phase before
+  selecting a branch or implementation target. Nearby branch context can be
+  stale: here, an active plan-origin branch suggested Phase 2 work while the
+  named plan's Phase 3 was the generator-IR migration.

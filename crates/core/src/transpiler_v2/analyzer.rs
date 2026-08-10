@@ -50,12 +50,12 @@ use super::expression::{
     CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
+use super::generator::{Generator, GeneratorKind};
 use super::name_fold::{eq_fold, fold_key};
 use super::schema::{Attribute, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
 };
-use crate::bail_boundary_rule;
 use crate::types::{DataType, StructField, StructType};
 
 // Re-export SetOpKind so downstream callers can use `analyzer::SetOpKind`.
@@ -132,7 +132,7 @@ macro_rules! scope_passthrough {
 }
 
 /// The alias scope a relation's OUTPUT exposes: which qualifiers (table
-/// names, user aliases, lateral-view table aliases) bind to which contiguous
+/// names, user aliases, generator qualifiers) bind to which contiguous
 /// field ranges of the node's `resolved_schema`, plus the plan_id →
 /// join-side bindings used for DataFrame `plan_id` disambiguation.
 ///
@@ -226,8 +226,8 @@ impl RelScope {
     ///   the child's scope verbatim — these clone the input schema
     ///   field-for-field (position/count preserved), so the contiguous-range
     ///   invariant holds through them.
-    /// - `LateralView`: the input's scope, plus `table_alias` bound to the
-    ///   generated columns' range appended after the input fields.
+    /// - `Generate`: preserve the input scope and bind its optional qualifier
+    ///   to the appended generated columns.
     /// - Everything else (`Project` / `Aggregate` / `SetOp` / `WithColumns` /
     ///   `Values` / `LocalRelation` / `TableFunction` / `Pivot` / ...):
     ///   EMPTY — these operators retype or reshuffle columns, so no alias
@@ -268,22 +268,23 @@ impl RelScope {
                 merge_join_scopes(left, right, left_plan_ids, right_plan_ids, right_side)
             }
             scope_passthrough!(input) => input.scope.clone(),
-            // LateralView appends generated columns after the input. Keep the
-            // input's bindings, then bind the table_alias to the generated
-            // columns' contiguous range. This makes `t.tag` resolve via the
-            // qualifier-scoped path while `e.tag` correctly does NOT resolve.
-            TypedOp::LateralView {
+            TypedOp::Generate {
                 input,
-                table_alias,
-                columns,
+                qualifier: Some(qualifier),
+                generator,
             } => {
                 let mut scope = input.scope.clone();
                 let start = input.resolved_schema.len();
                 scope
                     .aliases
-                    .push((table_alias.clone(), start..start + columns.len()));
+                    .push((qualifier.clone(), start..start + generator.aliases.len()));
                 scope
             }
+            TypedOp::Generate {
+                input,
+                qualifier: None,
+                ..
+            } => input.scope.clone(),
             // Everything below retypes or reshuffles columns: no alias
             // binding from further down is valid against the CURRENT schema.
             // Deliberately exhaustive (no `_`) so a new TypedOp variant
@@ -686,16 +687,11 @@ pub enum TypedOp {
         /// Optional RNG seed.
         seed: Option<i64>,
     },
-    /// `LATERAL VIEW [OUTER] generator(arg) table_alias AS col1[, col2]`.
-    /// Analyzer resolves each column expression against the input schema,
-    /// then appends the generated fields to produce the output schema.
-    LateralView {
-        /// The input relation.
+    /// Append a resolved generator's outputs to its input.
+    Generate {
         input: Box<TypedAst>,
-        /// The table alias.
-        table_alias: String,
-        /// Per-output-column `(alias, generator FunctionCall)` pairs.
-        columns: Vec<(String, Expression)>,
+        generator: Generator,
+        qualifier: Option<String>,
     },
     /// `WITH RECURSIVE name(cols) AS (anchor UNION ALL recursive_term)
     /// SELECT * FROM name` — post-analysis recursive CTE. The `union_all`
@@ -1055,10 +1051,9 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
             recursive_term,
             ..
         } => has_resolved_schema(anchor) && has_resolved_schema(recursive_term),
-        TypedOp::LateralView { input, columns, .. } => {
-            has_resolved_schema(input)
-                && columns.iter().all(|(_, e)| expression_is_fully_resolved(e))
-        }
+        TypedOp::Generate {
+            input, generator, ..
+        } => has_resolved_schema(input) && generator.args.iter().all(expression_is_fully_resolved),
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -1244,16 +1239,9 @@ fn analyze_node(
             let typed_input = analyze_node(*input, base_types, outer)?;
             // Expand regex projections before resolution.
             let projections = expand_regex_projections(projections, &typed_input.resolved_schema)?;
-            // Expand inline projections before resolution.
-            let projections = expand_inline_projections(projections, &typed_input.resolved_schema)?;
-            // Expand json_tuple projections before resolution.
-            let projections = expand_json_tuple_projections(projections)?;
-            // piv-006 — expand `stack(N, v11, ..., vNK) AS (a1, ..., aK)`
-            // (wrapped by `parser_v2::SparkSqlParserV2::parse_expression` as
-            // `stack_multi_alias(<stack call>, "a1", ..., "aK")`) into K
-            // per-column projections `Alias(stack_col(v1i, v2i, ..., vNi),
-            // "ai")`. Emission maps `stack_col(...)` to `UNNEST([...])`.
-            let projections = expand_stack_projections(projections)?;
+            if projections.iter().any(contains_generator) {
+                return analyze_generator_project(typed_input, projections, base_types, outer);
+            }
             // Inline earlier SELECT-list aliases for Spark's lateral-column
             // alias behavior before ordinary resolution.
             let projections =
@@ -1603,11 +1591,11 @@ fn analyze_node(
             ))
         }
 
-        CommonOp::LateralView {
+        CommonOp::Generate {
             input,
-            table_alias,
-            columns,
-        } => analyze_lateral_view(*input, table_alias, columns, base_types, outer),
+            generator,
+            qualifier,
+        } => analyze_generate(*input, generator, qualifier, base_types, outer),
 
         CommonOp::RecursiveCte {
             name,
@@ -1667,58 +1655,323 @@ fn analyze_node(
     }
 }
 
-/// Analyze a `LATERAL VIEW` node: resolve each generator column expression
-/// against the input schema, compute generated-field types/nullability, and
-/// produce a merged output schema `input fields ++ generated fields`.
-fn analyze_lateral_view(
+fn analyze_generate(
     input: CommonAst,
-    table_alias: String,
-    columns: Vec<(String, Expression)>,
+    generator: Generator,
+    qualifier: Option<String>,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_input = analyze_node(input, base_types, outer)?;
-    let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
-    let input_schema = &typed_input.resolved_schema;
-    let resolved_columns: Vec<(String, Expression)> = columns
-        .into_iter()
-        .map(|(alias, expr)| {
-            let resolved = resolve_and_stamp(expr, &ctx)?;
-            // Loud-fail if the generated type resolves Unresolved.
-            let dt = resolved.data_type(input_schema);
-            if dt == DataType::Unresolved {
-                return Err(AnalyzerError::PuntedOperator {
-                    op: "LateralView".to_owned(),
-                    reason: format!("generated column `{alias}` resolved to Unresolved type"),
-                });
+    finish_generate(typed_input, generator, qualifier, base_types, outer)
+}
+
+enum ClassifiedGeneratorProjection {
+    Expression(Expression),
+    Generator(Generator),
+}
+
+fn analyze_generator_project(
+    typed_input: TypedAst,
+    projections: Vec<Expression>,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<TypedAst, AnalyzerError> {
+    let mut generator = None;
+    let mut items = Vec::with_capacity(projections.len());
+    for projection in projections {
+        match classify_generator_projection(projection)? {
+            ClassifiedGeneratorProjection::Generator(found) => {
+                if generator.replace(found).is_some() {
+                    return Err(AnalyzerError::SparkEmulated {
+                        class: "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
+                        reason: "only one generator is allowed per SELECT clause".to_owned(),
+                    });
+                }
+                items.push(None);
             }
-            Ok((alias, resolved))
-        })
+            ClassifiedGeneratorProjection::Expression(expression) => {
+                if contains_generator(&expression) {
+                    return Err(AnalyzerError::SparkEmulated {
+                        class: "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
+                        reason: "generator functions may only appear at the top level of SELECT"
+                            .to_owned(),
+                    });
+                }
+                items.push(Some(expression));
+            }
+        }
+    }
+    let generator = generator.ok_or_else(|| AnalyzerError::Internal {
+        reason: "generator projection was detected but not extracted".to_owned(),
+    })?;
+
+    let input_len = typed_input.resolved_schema.len();
+    let typed_generate = finish_generate(typed_input, generator, None, base_types, outer)?;
+    let generated = &typed_generate.resolved_schema.fields[input_len..];
+    let mut expanded = Vec::with_capacity(items.len() + generated.len().saturating_sub(1));
+    for item in items {
+        match item {
+            Some(expression) => expanded.push(expression),
+            None => expanded.extend(
+                generated
+                    .iter()
+                    .map(|attr| Expression::ColumnReference(ColumnReference::from_attr(attr))),
+            ),
+        }
+    }
+    let expanded = expand_lateral_column_aliases(expanded, &typed_generate.resolved_schema)?;
+    let ctx = ResolveContext::of_input(&typed_generate, base_types, outer);
+    let projections = expanded
+        .into_iter()
+        .map(|expression| resolve_and_stamp(expression, &ctx).map(ensure_named))
         .collect::<Result<Vec<_>, _>>()?;
-    // Every generated column here is brand-new — mint a fresh id per column.
-    let generated_schema = ResolvedSchema::new(
-        resolved_columns
-            .iter()
-            .map(|(alias, expr)| {
-                Attribute::minted(
-                    alias.clone(),
-                    expr.data_type(input_schema),
-                    expr.nullable(input_schema),
-                )
-            })
-            .collect(),
-    );
-    // The input side is cloned through (same columns, same ids); only the
-    // generated side mints.
+    let output_schema = project_output_schema(&projections, &typed_generate)?;
+    Ok(TypedAst::new(
+        TypedOp::Project {
+            input: Box::new(typed_generate),
+            projections,
+        },
+        output_schema,
+    ))
+}
+
+fn classify_generator_projection(
+    expression: Expression,
+) -> Result<ClassifiedGeneratorProjection, AnalyzerError> {
+    match expression {
+        Expression::Generator(generator) => Ok(ClassifiedGeneratorProjection::Generator(generator)),
+        Expression::Alias(alias) => match *alias.expr {
+            Expression::Generator(mut generator) => {
+                if generator.aliases.is_empty() {
+                    generator.aliases.push(alias.alias);
+                    Ok(ClassifiedGeneratorProjection::Generator(generator))
+                } else {
+                    Err(AnalyzerError::Internal {
+                        reason: "generator carried both an Alias wrapper and explicit aliases"
+                            .to_owned(),
+                    })
+                }
+            }
+            inner => Ok(ClassifiedGeneratorProjection::Expression(
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(inner),
+                    alias: alias.alias,
+                }),
+            )),
+        },
+        other => Ok(ClassifiedGeneratorProjection::Expression(other)),
+    }
+}
+
+fn contains_generator(expression: &Expression) -> bool {
+    matches!(expression, Expression::Generator(_)) || expression.children().any(contains_generator)
+}
+
+fn finish_generate(
+    typed_input: TypedAst,
+    mut generator: Generator,
+    qualifier: Option<String>,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<TypedAst, AnalyzerError> {
+    let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
+    generator.args = generator
+        .args
+        .into_iter()
+        .map(|arg| resolve_and_stamp(arg, &ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    let generated_schema = generator_output(&mut generator, &typed_input.resolved_schema)?;
     let resolved_schema = ResolvedSchema::merge(&typed_input.resolved_schema, &generated_schema);
     Ok(TypedAst::new(
-        TypedOp::LateralView {
+        TypedOp::Generate {
             input: Box::new(typed_input),
-            table_alias,
-            columns: resolved_columns,
+            generator,
+            qualifier,
         },
         resolved_schema,
     ))
+}
+
+fn generator_output(
+    generator: &mut Generator,
+    input: &ResolvedSchema,
+) -> Result<ResolvedSchema, AnalyzerError> {
+    let mut fields = match generator.kind {
+        GeneratorKind::Explode | GeneratorKind::PosExplode => {
+            expect_generator_arity(generator, 1)?;
+            let positioned = generator.kind == GeneratorKind::PosExplode;
+            match generator.args[0].data_type(input) {
+                DataType::Array(element, contains_null) => {
+                    let mut fields = Vec::with_capacity(if positioned { 2 } else { 1 });
+                    if positioned {
+                        fields.push(StructField::not_null("pos", DataType::Integer));
+                    }
+                    fields.push(StructField::new("col", *element, contains_null));
+                    fields
+                }
+                DataType::Map {
+                    key,
+                    value,
+                    value_nullable,
+                } => {
+                    let mut fields = Vec::with_capacity(if positioned { 3 } else { 2 });
+                    if positioned {
+                        fields.push(StructField::not_null("pos", DataType::Integer));
+                    }
+                    fields.push(StructField::not_null("key", *key));
+                    fields.push(StructField::new("value", *value, value_nullable));
+                    fields
+                }
+                actual => return Err(generator_type_error(generator, actual, "array or map")),
+            }
+        }
+        GeneratorKind::Inline => {
+            expect_generator_arity(generator, 1)?;
+            match generator.args[0].data_type(input) {
+                DataType::Array(element, contains_null) => match *element {
+                    DataType::Struct(st) => st
+                        .fields
+                        .into_iter()
+                        .map(|mut field| {
+                            field.nullable |= contains_null;
+                            field
+                        })
+                        .collect(),
+                    actual => {
+                        return Err(generator_type_error(
+                            generator,
+                            DataType::Array(Box::new(actual), contains_null),
+                            "array<struct>",
+                        ));
+                    }
+                },
+                actual => return Err(generator_type_error(generator, actual, "array<struct>")),
+            }
+        }
+        GeneratorKind::JsonTuple => {
+            if generator.args.len() < 2 {
+                return Err(AnalyzerError::SparkEmulated {
+                    class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+                    reason: format!(
+                        "`json_tuple` requires at least 2 arguments, got {}",
+                        generator.args.len()
+                    ),
+                });
+            }
+            if let Some(actual) = generator
+                .args
+                .iter()
+                .map(|arg| arg.data_type(input))
+                .find(|ty| !matches!(ty, DataType::String | DataType::Null))
+            {
+                return Err(generator_type_error(generator, actual, "string"));
+            }
+            (0..generator.args.len() - 1)
+                .map(|i| StructField::nullable(format!("c{i}"), DataType::String))
+                .collect()
+        }
+        GeneratorKind::Stack => stack_output(generator, input)?,
+    };
+
+    if generator.aliases.is_empty() {
+        generator.aliases = fields.iter().map(|field| field.name.clone()).collect();
+    } else if generator.aliases.len() != fields.len() {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "UDTF_ALIAS_NUMBER_MISMATCH",
+            reason: format!(
+                "`{}` produces {} columns but received {} aliases",
+                generator.name(),
+                fields.len(),
+                generator.aliases.len()
+            ),
+        });
+    }
+    for (field, alias) in fields.iter_mut().zip(&generator.aliases) {
+        field.name = alias.clone();
+        field.nullable |= generator.outer;
+    }
+    Ok(ResolvedSchema::minted(StructType::new(fields)))
+}
+
+fn stack_output(
+    generator: &Generator,
+    input: &ResolvedSchema,
+) -> Result<Vec<StructField>, AnalyzerError> {
+    if generator.args.len() < 2 {
+        return Err(AnalyzerError::SparkEmulated {
+            class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+            reason: "`stack` requires a row count and at least one value".to_owned(),
+        });
+    }
+    let rows = match &generator.args[0] {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(n),
+            ..
+        }) if *n > 0 => *n as usize,
+        Expression::Literal(Literal {
+            value: LiteralValue::Long(n),
+            ..
+        }) if *n > 0 => *n as usize,
+        other => {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "DATATYPE_MISMATCH.VALUE_OUT_OF_RANGE",
+                reason: format!("`stack` row count must be a positive integer literal: {other:?}"),
+            });
+        }
+    };
+    let values = &generator.args[1..];
+    let columns = values.len().div_ceil(rows);
+    let mut output = Vec::with_capacity(columns);
+    for column in 0..columns {
+        let column_types: Vec<DataType> = values
+            .iter()
+            .skip(column)
+            .step_by(columns)
+            .map(|expr| expr.data_type(input))
+            .collect();
+        let data_type = column_types
+            .iter()
+            .find(|ty| **ty != DataType::Null)
+            .cloned()
+            .unwrap_or(DataType::Null);
+        if let Some(actual) = column_types
+            .into_iter()
+            .find(|ty| *ty != DataType::Null && *ty != data_type)
+        {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES",
+                reason: format!("`stack` column {column} mixes `{data_type}` and `{actual}`"),
+            });
+        }
+        output.push(StructField::nullable(format!("col{column}"), data_type));
+    }
+    Ok(output)
+}
+
+fn expect_generator_arity(generator: &Generator, expected: usize) -> Result<(), AnalyzerError> {
+    if generator.args.len() == expected {
+        Ok(())
+    } else {
+        Err(AnalyzerError::SparkEmulated {
+            class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+            reason: format!(
+                "`{}` requires exactly {expected} argument(s), got {}",
+                generator.name(),
+                generator.args.len()
+            ),
+        })
+    }
+}
+
+fn generator_type_error(generator: &Generator, actual: DataType, expected: &str) -> AnalyzerError {
+    AnalyzerError::SparkEmulated {
+        class: "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+        reason: format!(
+            "`{}` requires {expected} input, got `{actual}`",
+            generator.name()
+        ),
+    }
 }
 
 fn analyze_with_columns(
@@ -2645,430 +2898,39 @@ fn expand_regex_projections(
     projections: Vec<Expression>,
     input_schema: &ResolvedSchema,
 ) -> Result<Vec<Expression>, AnalyzerError> {
-    expand_projections(projections, |proj| {
-        let r = match proj {
-            Expression::UnresolvedRegex(r) => r,
-            _ => return Ok(None),
+    let mut out = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let Expression::UnresolvedRegex(regex) = projection else {
+            out.push(projection);
+            continue;
         };
-        let re = regex::Regex::new(&r.pattern).map_err(|e| AnalyzerError::Other {
-            reason: format!("invalid regex `{}`: {e}", r.pattern),
+        let compiled = regex::Regex::new(&regex.pattern).map_err(|error| AnalyzerError::Other {
+            reason: format!("invalid regex `{}`: {error}", regex.pattern),
         })?;
-        let expanded: Vec<Expression> = input_schema
-            .fields
-            .iter()
-            .filter(|f| re.is_match(&f.name))
-            .map(|f| {
-                Expression::UnresolvedColumn(UnresolvedColumn {
-                    name: f.name.clone(),
-                    qualifier: None,
-                    plan_id: r.plan_id,
-                })
-            })
-            .collect();
-        if expanded.is_empty() {
+        let start = out.len();
+        out.extend(
+            input_schema
+                .fields
+                .iter()
+                .filter(|field| compiled.is_match(&field.name))
+                .map(|field| {
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: field.name.clone(),
+                        qualifier: None,
+                        plan_id: regex.plan_id,
+                    })
+                }),
+        );
+        if out.len() == start {
             return Err(AnalyzerError::UnknownColumn {
-                name: r.pattern.clone(),
+                name: regex.pattern,
                 qualifier: None,
             });
-        }
-        Ok(Some(expanded))
-    })
-}
-
-/// Shared driver for the Project pre-pass expanders
-/// ([`expand_regex_projections`], [`expand_inline_projections`],
-/// [`expand_json_tuple_projections`], [`expand_stack_projections`]): walk the
-/// projection list in order, splicing in `try_expand`'s replacement list when
-/// it returns `Some(...)` and passing the projection through unchanged in
-/// place when it returns `None`.
-fn expand_projections(
-    projections: Vec<Expression>,
-    mut try_expand: impl FnMut(&Expression) -> Result<Option<Vec<Expression>>, AnalyzerError>,
-) -> Result<Vec<Expression>, AnalyzerError> {
-    let mut out = Vec::with_capacity(projections.len());
-    for proj in projections {
-        match try_expand(&proj)? {
-            Some(expanded) => out.extend(expanded),
-            None => out.push(proj),
         }
     }
     Ok(out)
 }
 
-/// Build `Alias(FunctionCall(name, args), alias)` — the synthetic-projection
-/// shape shared by the Project pre-pass expanders.
-fn aliased_call(name: &str, args: Vec<Expression>, alias: String) -> Expression {
-    Expression::Alias(AliasExpression {
-        expr: Box::new(Expression::FunctionCall(FunctionCall {
-            name: name.to_owned(),
-            args,
-            distinct: false,
-        })),
-        alias,
-    })
-}
-
-/// Expand every top-level `F.inline(arr)` / `F.inline_outer(arr)` projection
-/// into N synthetic per-struct-field projections. Non-inline projections pass
-/// through unchanged in place. Schema order is preserved.
-///
-/// Each `inline(arr)` where `arr : Array<Struct<f1: T1, ..., fN: TN>>`
-/// becomes:
-///
-/// ```text
-/// Alias(inline_field(arr, "f1"), "f1"), ..., Alias(inline_field(arr, "fN"), "fN")
-/// ```
-///
-/// `inline_outer(arr)` uses `inline_outer_field(...)` — same shape, but the
-/// emission arm wraps `arr` in a struct-typed-NULL sentinel guard so a NULL
-/// or empty array still emits one all-NULL row (matches Spark's `Inline`
-/// with `outer=true`).
-///
-/// Errors (ADR-022 two-category):
-///
-/// * **Spark-emulated** ([`AnalyzerError::TypeMismatch`]) — argument is
-///   proven not `Array<Struct<...>>` (e.g. `Array<Long>` or `String`). Spark
-///   rejects the same input at analysis time.
-/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
-///   prefix `[TDCK-BOUNDARY]`) — argument's type could not be statically
-///   resolved (e.g. `F.inline(F.transform(arr, lam))` with an unresolvable
-///   lambda body). Honest ADR-022 non-implementation, not a silent DuckDB
-///   catalog error.
-/// * **Spark-emulated** ([`AnalyzerError::Other`]) — arity ≠ 1.
-///
-/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
-/// [`expand_regex_projections`] and BEFORE [`resolve_and_stamp`] so
-/// downstream analysis never sees a top-level `inline` / `inline_outer`.
-fn expand_inline_projections(
-    projections: Vec<Expression>,
-    input_schema: &ResolvedSchema,
-) -> Result<Vec<Expression>, AnalyzerError> {
-    expand_projections(projections, |proj| {
-        // Only fire on a bare top-level `FunctionCall("inline"|"inline_outer",...)`.
-        // Aliased or nested forms fall through unchanged.
-        let (name_lower, args, is_outer) = match proj {
-            Expression::FunctionCall(f) => match f.name.as_str() {
-                "inline" => (f.name.clone(), f.args.clone(), false),
-                "inline_outer" => (f.name.clone(), f.args.clone(), true),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
-        if args.len() != 1 {
-            return Err(AnalyzerError::SparkEmulated {
-                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
-                reason: format!(
-                    "`{name_lower}` requires exactly 1 argument, got {}",
-                    args.len()
-                ),
-            });
-        }
-        let arr = args.into_iter().next().expect("checked len == 1 above");
-        let arg_ty = arr.data_type(input_schema);
-        let (elem_struct, contains_null) = match arg_ty {
-            DataType::Array(inner, cn) => match *inner {
-                DataType::Struct(st) => (st, cn),
-                DataType::Unresolved => {
-                    bail_boundary_rule!(
-                        format!("{name_lower}-expansion"),
-                        format!(
-                            "`{name_lower}` argument's element type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
-                        ),
-                    );
-                }
-                other => {
-                    return Err(AnalyzerError::TypeMismatch {
-                        expected: DataType::Struct(StructType::new(vec![])),
-                        actual: other,
-                        context: format!("`{name_lower}` argument element type"),
-                    });
-                }
-            },
-            DataType::Unresolved => {
-                bail_boundary_rule!(
-                    format!("{name_lower}-expansion"),
-                    format!(
-                        "`{name_lower}` argument's type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
-                    ),
-                );
-            }
-            other => {
-                return Err(AnalyzerError::TypeMismatch {
-                    expected: DataType::Array(
-                        Box::new(DataType::Struct(StructType::new(vec![]))),
-                        true,
-                    ),
-                    actual: other,
-                    context: format!("`{name_lower}` argument"),
-                });
-            }
-        };
-        // `contains_null` is carried on the synthesized arr's `DataType`
-        // itself via `Expression::data_type` at emission / nullability time;
-        // no need to thread it through the synthetic call's args.
-        let _ = contains_null;
-        let synthetic_name = if is_outer {
-            "inline_outer_field"
-        } else {
-            "inline_field"
-        };
-        let mut expanded = Vec::with_capacity(elem_struct.fields.len());
-        for field in &elem_struct.fields {
-            let field_name_lit = Expression::Literal(Literal {
-                value: LiteralValue::String(field.name.clone()),
-                data_type: DataType::String,
-            });
-            expanded.push(aliased_call(
-                synthetic_name,
-                vec![arr.clone(), field_name_lit],
-                field.name.clone(),
-            ));
-        }
-        Ok(Some(expanded))
-    })
-}
-
-/// Character set rejected inside a `json_tuple` key literal. See
-/// [`expand_json_tuple_projections`] for rationale.
-fn json_tuple_key_char_is_unsafe(c: char) -> bool {
-    // Quoting hazards for a single-quoted SQL literal, plus JSONPath tokens
-    // that would change Spark's flat-key lookup semantics if forwarded to
-    // DuckDB's `json_extract_string`.
-    matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control()
-}
-
-/// Expand every top-level `F.json_tuple(json, k1, ..., kN)` projection into
-/// N synthetic per-key projections. Non-`json_tuple` projections pass through
-/// unchanged in place. Schema order is preserved.
-///
-/// Each `json_tuple(j, k1, ..., kN)` becomes:
-///
-/// ```text
-/// Alias(json_tuple_field(j, "k1"), "c0"), ..., Alias(json_tuple_field(j, "kN"), "cN-1")
-/// ```
-///
-/// Names are POSITIONAL (`c0, c1, ..., c<N-1>`) — matches Spark's
-/// `Generator.elementSchema`, NOT the key literals. Verified against
-/// The positional names match Spark's generator element schema.
-///
-/// Errors (ADR-022 two-category):
-///
-/// * **Spark-emulated** ([`AnalyzerError::Other`]) — arity < 2 (Spark rejects
-///   `json_tuple(x)` with zero keys at analysis time).
-/// * **Spark-emulated** ([`AnalyzerError::TypeMismatch`]) — a key arg is not
-///   a `Literal::String` (Catalyst's `JsonTuple.checkInputDataTypes` rejects
-///   non-literal field names).
-/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
-///   prefix `[TDCK-BOUNDARY]`, `rule = "json_tuple-expansion"`) — a key
-///   contains a character in `json_tuple_key_char_is_unsafe`. `'` / `\` / `"`
-///   / ASCII control would break the bare single-quoted SQL literal; `.` /
-///   `[` / `]` would cause DuckDB's `json_extract_string('$.<key>')` to
-///   path-walk whereas Spark treats those characters as flat key literals.
-///
-/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
-/// [`expand_inline_projections`] and BEFORE [`resolve_and_stamp`], so
-/// downstream analysis never sees a top-level `json_tuple`.
-fn expand_json_tuple_projections(
-    projections: Vec<Expression>,
-) -> Result<Vec<Expression>, AnalyzerError> {
-    expand_projections(projections, |proj| {
-        // Only fire on a bare top-level `FunctionCall("json_tuple", ...)`.
-        // Aliased or nested forms fall through unchanged (multi-alias
-        // `.alias("k1", ...)` and non-Project contexts fall through
-        // downstream if the corpus ever exercises them).
-        let args = match proj {
-            Expression::FunctionCall(f) if f.name == "json_tuple" => f.args.clone(),
-            _ => return Ok(None),
-        };
-        if args.len() < 2 {
-            return Err(AnalyzerError::SparkEmulated {
-                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
-                reason: format!(
-                    "`json_tuple` requires at least 2 arguments (json_str, key_1, ...), got {}",
-                    args.len()
-                ),
-            });
-        }
-        let mut args_iter = args.into_iter();
-        let json_expr = args_iter.next().expect("checked args.len() >= 2 above");
-        let key_args: Vec<Expression> = args_iter.collect();
-        let mut expanded = Vec::with_capacity(key_args.len());
-        for (i, key_arg) in key_args.into_iter().enumerate() {
-            let key = match &key_arg {
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(s),
-                    ..
-                }) => s.clone(),
-                other => {
-                    return Err(AnalyzerError::TypeMismatch {
-                        expected: DataType::String,
-                        actual: other.data_type(&ResolvedSchema::empty()),
-                        context: format!(
-                            "`json_tuple` field-name at position {} must be a string literal",
-                            i + 1
-                        ),
-                    });
-                }
-            };
-            if key.chars().any(json_tuple_key_char_is_unsafe) {
-                bail_boundary_rule!(
-                    "json_tuple-expansion",
-                    format!(
-                        "`json_tuple` key `{key}` contains a character τ does not \
-                         safely forward to DuckDB's `json_extract_string` — reject \
-                         to avoid diverging from Spark's flat-key semantics or \
-                         breaking the SQL string literal"
-                    ),
-                );
-            }
-            let key_lit = Expression::Literal(Literal {
-                value: LiteralValue::String(key),
-                data_type: DataType::String,
-            });
-            expanded.push(aliased_call(
-                "json_tuple_field",
-                vec![json_expr.clone(), key_lit],
-                format!("c{i}"),
-            ));
-        }
-        Ok(Some(expanded))
-    })
-}
-
-/// Expand every top-level `stack_multi_alias(<stack call>, "a1", ..., "aK")`
-/// projection into K per-column projections
-/// `Alias(stack_col(v1i, v2i, ..., vNi), "ai")`.
-///
-/// The wrapper is synthesized by
-/// [`crate::parser_v2::SparkSqlParserV2::parse_expression`] when it detects a
-/// trailing multi-column alias `AS (a1, ..., aK)` on a `stack(...)` call — a
-/// shape sqlparser-rs 0.61's `SelectItem::ExprWithAlias { alias: Ident }`
-/// cannot represent. Non-`stack_multi_alias` projections pass through
-/// unchanged; schema order is preserved.
-///
-/// Errors (ADR-022 two-category):
-///
-/// * **Spark-emulated** ([`AnalyzerError::Other`]) — `stack`'s first argument
-///   is not a positive-integer literal `N`, or `stack`'s value-argument
-///   count is not `1 + N*K` (Spark's `Stack.checkInputDataTypes` matches
-///   this shape).
-/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
-///   prefix `[TDCK-BOUNDARY]`, `rule = "stack-multi-alias-expansion"`) — the
-///   wrapped inner expression is not a `stack(...)` FunctionCall (the parser
-///   wrap-site guards this, but the analyzer double-checks).
-///
-/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
-/// [`expand_json_tuple_projections`] and BEFORE [`expand_lateral_column_aliases`]
-/// / [`resolve_and_stamp`], so downstream analysis only ever sees the
-/// fanned-out `stack_col` calls.
-///
-fn expand_stack_projections(
-    projections: Vec<Expression>,
-) -> Result<Vec<Expression>, AnalyzerError> {
-    expand_projections(projections, |proj| {
-        // Only fire on a bare top-level `FunctionCall("stack_multi_alias", ...)`.
-        // Aliased or nested forms fall through unchanged — non-Project
-        // contexts are Spark-invalid for generator functions and surface
-        // as boundary errors downstream.
-        let args = match proj {
-            Expression::FunctionCall(f) if f.name == "stack_multi_alias" => f.args.clone(),
-            _ => return Ok(None),
-        };
-        // args[0] = inner `stack` FunctionCall, args[1..] = K string-literal
-        // aliases.
-        if args.len() < 2 {
-            bail_boundary_rule!(
-                "stack-multi-alias-expansion",
-                format!(
-                    "`stack_multi_alias` wrapper must carry the inner stack call \
-                     plus at least one alias, got {} arg(s)",
-                    args.len()
-                ),
-            );
-        }
-        let mut args_iter = args.into_iter();
-        let inner = args_iter.next().expect("checked args.len() >= 2 above");
-        let aliases: Vec<String> = args_iter
-            .map(|a| match a {
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(s),
-                    ..
-                }) => Ok(s),
-                other => Err(AnalyzerError::Internal {
-                    reason: format!(
-                        "`stack_multi_alias` alias slots must be string literals, got {other:?}"
-                    ),
-                }),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let k = aliases.len();
-
-        let stack_args = match inner {
-            Expression::FunctionCall(fc) if fc.name == "stack" => fc.args,
-            other => {
-                bail_boundary_rule!(
-                    "stack-multi-alias-expansion",
-                    format!(
-                        "multi-alias `AS ( ... )` on a non-`stack` generator is not \
-                         implemented in τ's SparkSQL path: got {other:?}"
-                    ),
-                );
-            }
-        };
-        if stack_args.is_empty() {
-            return Err(AnalyzerError::SparkEmulated {
-                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
-                reason: "`stack` requires at least one argument (row count N)".to_owned(),
-            });
-        }
-        // stack_args[0] is the row-count literal N; validate it's a positive
-        // integer and that the remaining k*N value slots line up with the
-        // alias count.
-        let n = match &stack_args[0] {
-            Expression::Literal(Literal {
-                value: LiteralValue::Int(i),
-                ..
-            }) if *i >= 1 => *i as usize,
-            Expression::Literal(Literal {
-                value: LiteralValue::Long(i),
-                ..
-            }) if *i >= 1 => *i as usize,
-            other => {
-                return Err(AnalyzerError::SparkEmulated {
-                    class: "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
-                    reason: format!(
-                        "`stack`'s first argument must be a positive integer literal, got {other:?}"
-                    ),
-                });
-            }
-        };
-        let values = &stack_args[1..];
-        if values.len() != n * k {
-            return Err(AnalyzerError::SparkEmulated {
-                class: "UDTF_ALIAS_NUMBER_MISMATCH",
-                reason: format!(
-                    "`stack({n}, ...)` with a {k}-alias tail requires {} value arguments, got {}",
-                    n * k,
-                    values.len()
-                ),
-            });
-        }
-        // For column i in [0, k), gather values at positions [i, k+i, 2k+i,
-        // ..., (n-1)k+i] — Spark's `stack` is row-major, so the i-th column
-        // spans one slot per row.
-        let mut expanded = Vec::with_capacity(k);
-        for (i, alias) in aliases.into_iter().enumerate() {
-            let mut col_vals: Vec<Expression> = Vec::with_capacity(n);
-            for row in 0..n {
-                col_vals.push(values[row * k + i].clone());
-            }
-            expanded.push(aliased_call("stack_col", col_vals, alias));
-        }
-        Ok(Some(expanded))
-    })
-}
-
-//
 // `SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp`: Spark
 // lets a later SELECT-list item reference an earlier item's alias. τ's
 // resolver (`resolve_and_stamp` / `ResolveContext`) is schema/scope-shaped —
@@ -3147,12 +3009,8 @@ impl LateralAliasTable {
 /// what makes a multi-hop chain (`a` -> `b` referencing `a` -> `c`
 /// referencing `b`) resolve fully-inlined in a single pass.
 ///
-/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
-/// [`expand_stack_projections`] (last among the pre-passes — Spark's own LCA
-/// rule runs over the fully-expanded project list too) and BEFORE
-/// `ResolveContext::of_input` / `resolve_and_stamp`, so downstream resolution
-/// never has to know LCA exists — every item it sees is already a plain,
-/// fully-inlined tree.
+/// Called by the `CommonOp::Project` arm after generator normalization and
+/// before ordinary expression resolution.
 fn expand_lateral_column_aliases(
     projections: Vec<Expression>,
     input_schema: &ResolvedSchema,
@@ -3238,12 +3096,8 @@ fn resolve_boolean_predicate(
 /// ref correctly fails `UnknownColumn`. `range(end)` / `range(start, end)` /
 /// `range(start, end, step)` / `range(start, end, step, numPartitions)` (arity
 /// 1..=4) resolves to a single non-nullable `id: Long` column, end-exclusive
-/// (ADR-005; Spark 4.1.1 `range`). `explode`/`explode_outer` over a resolved
-/// `Array` argument (exactly 1 arg) resolves to a single `col` column typed/
-/// nulled via the shared `Expression::data_type`/`nullable` arms (same logic
-/// SELECT-position explode already uses — not duplicated here). Any other TVF,
-/// `range` with the wrong arity, or `explode` over a non-`Array` argument is an
-/// honest Thunderduck boundary (`PuntedOperator`, ADR-022).
+/// (ADR-005; Spark 4.1.1 `range`). Generators use `CommonOp::Generate`, so any
+/// other table function is an honest Thunderduck boundary.
 fn analyze_table_function(
     name: String,
     args: Vec<Expression>,
@@ -3265,44 +3119,6 @@ fn analyze_table_function(
                 false,
             )])),
         )),
-        // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
-        // Derive the output schema from the resolved arg's element type via the
-        // existing single-homed `.data_type()` / `.nullable()` arms (type_inference
-        // + expression.rs). Spark's default output column is named `"col"`.
-        "explode" | "explode_outer" if resolved_args.len() == 1 => {
-            // The argument must resolve to Array; other types are unsupported.
-            let arg = &resolved_args[0];
-            let arg_type = arg.data_type(&empty_schema);
-            if !matches!(arg_type, DataType::Array(..)) {
-                return Err(AnalyzerError::PuntedOperator {
-                    op: format!("TableFunction[{name}]"),
-                    reason: format!(
-                        "bare {name} with non-Array argument type ({arg_type:?}) \
-                         not implemented in τ"
-                    ),
-                });
-            }
-            // Build the canonical FunctionCall shape to derive element type and
-            // nullability via the existing single-homed arms in type_inference.rs
-            // and expression.rs (no duplication).
-            let fc_expr = Expression::FunctionCall(FunctionCall {
-                name: name.clone(),
-                args: resolved_args.clone(),
-                distinct: false,
-            });
-            let elem_type = fc_expr.data_type(&empty_schema);
-            let nullable = fc_expr.nullable(&empty_schema);
-            Ok(TypedAst::new(
-                TypedOp::TableFunction {
-                    name,
-                    args: resolved_args,
-                    with_ordinality,
-                },
-                ResolvedSchema::minted(StructType::new(vec![StructField::new(
-                    "col", elem_type, nullable,
-                )])),
-            ))
-        }
         _ => Err(AnalyzerError::PuntedOperator {
             op: format!("TableFunction[{name}]"),
             reason: "table-function analysis (not implemented in τ)".to_owned(),
@@ -3400,6 +3216,13 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             );
             Expression::FunctionCall(f).map_children(|e| resolve_and_stamp(e, ctx))
         }
+        Expression::Generator(generator) => Err(AnalyzerError::SparkEmulated {
+            class: "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
+            reason: format!(
+                "generator `{}` may only appear at the top level of SELECT",
+                generator.name()
+            ),
+        }),
         // Default recursion: walk every immediate child via the shared
         // walker. Covers Unary / Cast (non-implicit) / CaseWhen / Window /
         // Alias / Between / InList / Like / IsDistinctFrom / ExtractValue /
@@ -6078,10 +5901,11 @@ mod tests {
     }
 
     #[test]
-    fn rel_scope_lateral_view_appends_generated_range() {
+    fn rel_scope_generate_appends_generated_range() {
         let bt = base_types_with_emp_dept();
         let input = analyze(aliased_scan("emp", "e"), &bt).unwrap();
-        let columns = vec![("tag".to_owned(), lit_str("x"))];
+        let mut generator = Generator::from_function("explode", vec![lit_str("x")]).unwrap();
+        generator.aliases.push("tag".to_owned());
         let merged = ResolvedSchema::merge(
             &input.resolved_schema,
             &ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
@@ -6090,10 +5914,10 @@ mod tests {
             )])),
         );
         let typed = TypedAst::new(
-            TypedOp::LateralView {
+            TypedOp::Generate {
                 input: Box::new(input),
-                table_alias: "t".to_owned(),
-                columns,
+                generator,
+                qualifier: Some("t".to_owned()),
             },
             merged,
         );
@@ -8735,72 +8559,6 @@ mod tests {
     }
 
     #[test]
-    fn table_function_explode_array_resolves_single_col_column() {
-        let bt = BaseTypes::empty();
-        let arr = func("array", vec![int_lit(1), int_lit(2), int_lit(3)]);
-        let ast = CommonAst::new(CommonOp::TableFunction {
-            name: "explode".to_owned(),
-            args: vec![arr],
-            with_ordinality: false,
-        });
-        let typed = analyze(ast, &bt).expect("explode(array(1,2,3)) should analyze");
-        assert_eq!(typed.resolved_schema.fields.len(), 1);
-        let f = &typed.resolved_schema.fields[0];
-        assert_eq!(f.name, "col");
-        assert_eq!(f.data_type, DataType::Integer);
-        assert!(!f.nullable, "explode of non-null array is non-nullable");
-    }
-
-    #[test]
-    fn table_function_explode_non_array_arg_punts() {
-        let bt = BaseTypes::empty();
-        let ast = CommonAst::new(CommonOp::TableFunction {
-            name: "explode".to_owned(),
-            args: vec![int_lit(1)],
-            with_ordinality: false,
-        });
-        let err = analyze(ast, &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
-        assert!(
-            err.to_string().contains("non-Array"),
-            "error should mention non-Array: {err}"
-        );
-    }
-
-    #[test]
-    fn table_function_explode_unresolvable_arg_is_unknown_column() {
-        let bt = BaseTypes::empty();
-        let col = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "some_col".to_owned(),
-            qualifier: None,
-            plan_id: None,
-        });
-        let ast = CommonAst::new(CommonOp::TableFunction {
-            name: "explode".to_owned(),
-            args: vec![col],
-            with_ordinality: false,
-        });
-        let err = analyze(ast, &bt).unwrap_err();
-        assert!(
-            matches!(err, AnalyzerError::UnknownColumn { .. }),
-            "expected UnknownColumn, got: {err}"
-        );
-    }
-
-    #[test]
-    fn table_function_posexplode_still_punts() {
-        let bt = BaseTypes::empty();
-        let arr = func("array", vec![int_lit(1), int_lit(2)]);
-        let ast = CommonAst::new(CommonOp::TableFunction {
-            name: "posexplode".to_owned(),
-            args: vec![arr],
-            with_ordinality: false,
-        });
-        let err = analyze(ast, &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
-    }
-
-    #[test]
     fn setop_union_by_name_skips_positional_cast_pushdown() {
         let bt = BaseTypes::empty();
         let left = CommonAst::new(CommonOp::Values {
@@ -8824,7 +8582,7 @@ mod tests {
                 *by_name,
                 children
                     .iter()
-                    .map(|c| c.resolved_schema.clone())
+                    .map(|child| child.resolved_schema.clone())
                     .collect::<Vec<_>>(),
             ),
             other => panic!("expected SetOp, got {other:?}"),
@@ -8855,10 +8613,7 @@ mod tests {
         assert_eq!(widened.fields[0].name, "a");
         assert!(widened.fields[0].nullable, "a is padded on RIGHT");
         assert_eq!(widened.fields[1].name, "b");
-        assert!(
-            !widened.fields[1].nullable,
-            "b present in both non-null children"
-        );
+        assert!(!widened.fields[1].nullable);
         assert_eq!(widened.fields[2].name, "c");
         assert!(widened.fields[2].nullable, "c is padded on LEFT");
     }
@@ -10602,310 +10357,149 @@ mod tests {
         });
         assert!(!expression_is_fully_resolved(&expr));
     }
-
-    fn array_of_struct_name_salary() -> Expression {
-        let struct_call = func(
-            "struct",
-            vec![unresolved_col("name"), unresolved_col("salary")],
-        );
-        func("array", vec![struct_call])
-    }
-
-    fn inline_call(outer: bool, arg: Expression) -> Expression {
-        func(if outer { "inline_outer" } else { "inline" }, vec![arg])
+    fn generator_expr(name: &str, args: Vec<Expression>, aliases: &[&str]) -> Expression {
+        let mut generator = Generator::from_function(name, args).expect("generator name");
+        generator.aliases = aliases.iter().map(|alias| (*alias).to_owned()).collect();
+        Expression::Generator(generator)
     }
 
     #[test]
-    fn expand_inline_projections_widens_into_n_fields() {
-        let bt = base_types_with_emp_dept();
+    fn project_generator_normalizes_to_generate() {
+        let structs = func(
+            "array",
+            vec![func(
+                "struct",
+                vec![unresolved_col("name"), unresolved_col("salary")],
+            )],
+        );
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![
                 unresolved_col("id"),
-                inline_call(false, array_of_struct_name_salary()),
+                generator_expr("inline", vec![structs], &[]),
             ],
         });
-        let typed = analyze(ast, &bt).expect("analyze ok");
-        assert_eq!(field_names(&typed), vec!["id", "name", "salary"],);
-        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
-        assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::Double);
-        match &typed.op {
-            TypedOp::Project { projections, .. } => {
-                assert_eq!(projections.len(), 3);
-                for (i, expected) in ["name", "salary"].iter().enumerate() {
-                    match &projections[i + 1] {
-                        Expression::Alias(a) => {
-                            assert_eq!(a.alias, *expected);
-                            match a.expr.as_ref() {
-                                Expression::FunctionCall(f) => {
-                                    assert_eq!(f.name, "inline_field");
-                                    assert_eq!(f.args.len(), 2);
-                                    match &f.args[1] {
-                                        Expression::Literal(Literal {
-                                            value: LiteralValue::String(s),
-                                            ..
-                                        }) => assert_eq!(s, *expected),
-                                        other => {
-                                            panic!("expected string literal, got {other:?}")
-                                        }
-                                    }
-                                }
-                                other => panic!("expected FunctionCall, got {other:?}"),
-                            }
-                        }
-                        other => panic!("expected Alias, got {other:?}"),
-                    }
-                }
-            }
-            _ => panic!("expected Project op"),
-        }
-    }
-
-    #[test]
-    fn expand_inline_outer_projections_marks_all_nullable() {
-        let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("emp")),
-            projections: vec![inline_call(true, array_of_struct_name_salary())],
-        });
-        let typed = analyze(ast, &bt).expect("analyze ok");
-        assert_eq!(typed.resolved_schema.fields.len(), 2);
-        for f in &typed.resolved_schema.fields {
-            assert!(
-                f.nullable,
-                "inline_outer output field `{}` must be nullable",
-                f.name
-            );
-        }
-    }
-
-    #[test]
-    fn expand_inline_preserves_prefix_and_suffix_projections() {
-        let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("emp")),
-            projections: vec![
-                unresolved_col("id"),
-                inline_call(false, array_of_struct_name_salary()),
-                int_lit(1),
-            ],
-        });
-        let typed = analyze(ast, &bt).expect("analyze ok");
-        let names = field_names(&typed);
-        assert_eq!(names.len(), 4);
-        assert_eq!(names[0], "id");
-        assert_eq!(names[1], "name");
-        assert_eq!(names[2], "salary");
-    }
-
-    #[test]
-    fn expand_inline_rejects_non_array_of_struct() {
-        let bad_arg = func("array", vec![int_lit(1)]);
-        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "id",
-            DataType::Long,
-        )]));
-        let err = expand_inline_projections(vec![inline_call(false, bad_arg)], &schema)
-            .expect_err("must reject non-Array<Struct<...>>");
-        assert!(matches!(err, AnalyzerError::TypeMismatch { .. }));
-        assert!(
-            err.to_string().starts_with("[SPARK-EMULATED]"),
-            "err: {err}"
-        );
-    }
-
-    #[test]
-    fn expand_inline_boundary_rejects_unresolved_element_type() {
-        let unresolved_arg = unresolved_col("no_such_col");
-        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "id",
-            DataType::Long,
-        )]));
-        let err = expand_inline_projections(vec![inline_call(false, unresolved_arg)], &schema)
-            .expect_err("must reject Unresolved arg type");
-        match &err {
-            AnalyzerError::UnsupportedRule { rule, reason } => {
-                assert_eq!(rule, "inline-expansion");
-                assert!(
-                    reason.contains("could not be statically resolved"),
-                    "reason must diagnose the unresolved type; got: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
-        }
-        assert!(
-            err.to_string().starts_with("[TDCK-BOUNDARY]"),
-            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
-        );
-    }
-
-    #[test]
-    fn expand_inline_outer_boundary_rejects_unresolved_element_type_with_tdck_prefix() {
-        let unresolved_arg = unresolved_col("no_such_col");
-        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
-            "id",
-            DataType::Long,
-        )]));
-        let err = expand_inline_projections(vec![inline_call(true, unresolved_arg)], &schema)
-            .expect_err("must reject Unresolved arg type for inline_outer");
-        match &err {
-            AnalyzerError::UnsupportedRule { rule, .. } => {
-                assert_eq!(rule, "inline_outer-expansion");
-            }
-            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
-        }
-        assert!(
-            err.to_string().starts_with("[TDCK-BOUNDARY]"),
-            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
-        );
-    }
-
-    fn json_tuple_call(json_col: &str, keys: &[&str]) -> Expression {
-        let mut args: Vec<Expression> = Vec::with_capacity(keys.len() + 1);
-        args.push(unresolved_col(json_col));
-        for k in keys {
-            args.push(lit_str(k));
-        }
-        func("json_tuple", args)
-    }
-
-    fn raw_schema_with_json_str() -> StructType {
-        StructType::new(vec![
-            StructField::not_null("id", DataType::Long),
-            StructField::nullable("json_str", DataType::String),
-        ])
-    }
-
-    fn base_types_with_raw() -> BaseTypes {
-        base_types_for(&[("raw", raw_schema_with_json_str())])
-    }
-
-    #[test]
-    fn expand_json_tuple_widens_into_n_fields_with_positional_names() {
-        let bt = base_types_with_raw();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("raw")),
-            projections: vec![
-                unresolved_col("id"),
-                json_tuple_call("json_str", &["a", "e"]),
-            ],
-        });
-        let typed = analyze(ast, &bt).expect("analyze ok");
-        let names = field_names(&typed);
-        assert_eq!(names, vec!["id", "c0", "c1"]);
-        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
-        assert!(typed.resolved_schema.fields[1].nullable);
-        assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::String);
-        assert!(typed.resolved_schema.fields[2].nullable);
-        match &typed.op {
-            TypedOp::Project { projections, .. } => {
-                assert_eq!(projections.len(), 3);
-                for (i, expected_key) in ["a", "e"].iter().enumerate() {
-                    match &projections[i + 1] {
-                        Expression::Alias(a) => {
-                            assert_eq!(a.alias, format!("c{i}"));
-                            match a.expr.as_ref() {
-                                Expression::FunctionCall(f) => {
-                                    assert_eq!(f.name, "json_tuple_field");
-                                    assert_eq!(f.args.len(), 2);
-                                    match &f.args[1] {
-                                        Expression::Literal(Literal {
-                                            value: LiteralValue::String(s),
-                                            ..
-                                        }) => assert_eq!(s, *expected_key),
-                                        other => {
-                                            panic!("expected string literal, got {other:?}")
-                                        }
-                                    }
-                                }
-                                other => panic!("expected FunctionCall, got {other:?}"),
-                            }
-                        }
-                        other => panic!("expected Alias, got {other:?}"),
-                    }
-                }
-            }
-            _ => panic!("expected Project op"),
-        }
-    }
-
-    #[test]
-    fn expand_json_tuple_preserves_prefix_and_suffix_projections() {
-        let bt = base_types_with_raw();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("raw")),
-            projections: vec![
-                unresolved_col("id"),
-                json_tuple_call("json_str", &["a", "e"]),
-                int_lit(1),
-            ],
-        });
-        let typed = analyze(ast, &bt).expect("analyze ok");
-        let names = field_names(&typed);
-        assert_eq!(names.len(), 4);
-        assert_eq!(names[0], "id");
-        assert_eq!(names[1], "c0");
-        assert_eq!(names[2], "c1");
-    }
-
-    #[test]
-    fn expand_json_tuple_rejects_zero_keys() {
-        let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[])])
-            .expect_err("must reject arity < 2");
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("analyze");
+        assert_eq!(field_names(&typed), ["id", "name", "salary"]);
+        let TypedOp::Project { input, .. } = typed.op else {
+            panic!("expected Project");
+        };
         assert!(matches!(
-            err,
-            AnalyzerError::SparkEmulated {
-                class: "WRONG_NUM_ARGS.WITHOUT_SUGGESTION",
+            input.op,
+            TypedOp::Generate {
+                generator: Generator {
+                    kind: GeneratorKind::Inline,
+                    ..
+                },
                 ..
             }
         ));
-        assert!(
-            err.to_string().starts_with("[SPARK-EMULATED]"),
-            "err: {err}"
-        );
     }
 
     #[test]
-    fn expand_json_tuple_rejects_non_literal_key() {
-        let bad_call = func(
-            "json_tuple",
-            vec![unresolved_col("json_str"), unresolved_col("k")],
-        );
-        let err =
-            expand_json_tuple_projections(vec![bad_call]).expect_err("must reject non-literal key");
-        assert!(matches!(err, AnalyzerError::TypeMismatch { .. }));
-        assert!(
-            err.to_string().starts_with("[SPARK-EMULATED]"),
-            "err: {err}"
-        );
+    fn json_tuple_and_stack_derive_output_once() {
+        let raw = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("json", DataType::String),
+        ]);
+        let json = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("raw")),
+            projections: vec![generator_expr(
+                "json_tuple",
+                vec![unresolved_col("json"), lit_str("a"), lit_str("b")],
+                &[],
+            )],
+        });
+        let typed = analyze(json, &base_types_for(&[("raw", raw)])).expect("json_tuple");
+        assert_eq!(field_names(&typed), ["c0", "c1"]);
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .all(|field| field.data_type == DataType::String && field.nullable));
+
+        let stack = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![generator_expr(
+                "stack",
+                vec![
+                    int_lit(2),
+                    lit_str("a"),
+                    int_lit(1),
+                    lit_str("b"),
+                    int_lit(2),
+                ],
+                &["key", "value"],
+            )],
+        });
+        let typed = analyze(stack, &base_types_for(&[])).expect("stack");
+        assert_eq!(field_names(&typed), ["key", "value"]);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::String);
+        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::Integer);
     }
 
     #[test]
-    fn expand_json_tuple_boundary_rejects_unsafe_key_chars() {
-        let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &["a'b"])])
-            .expect_err("must reject key containing '");
-        match &err {
-            AnalyzerError::UnsupportedRule { rule, .. } => {
-                assert_eq!(rule, "json_tuple-expansion");
+    fn generator_alias_arity_is_checked_after_input_resolution() {
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![generator_expr(
+                "inline",
+                vec![func(
+                    "array",
+                    vec![func(
+                        "struct",
+                        vec![unresolved_col("name"), unresolved_col("salary")],
+                    )],
+                )],
+                &["only_one"],
+            )],
+        });
+        let err = analyze(ast, &base_types_with_emp_dept()).expect_err("alias mismatch");
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class: "UDTF_ALIAS_NUMBER_MISMATCH",
+                ..
             }
-            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
-        }
-        assert!(
-            err.to_string().starts_with("[TDCK-BOUNDARY]"),
-            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
-        );
-        for bad_key in ["a.b", "a[0]"] {
-            let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[bad_key])])
-                .expect_err("must reject JSONPath metachars in key");
-            match &err {
-                AnalyzerError::UnsupportedRule { rule, .. } => {
-                    assert_eq!(rule, "json_tuple-expansion");
-                }
-                other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
-            }
-        }
+        ));
     }
 
+    #[test]
+    fn nested_and_multiple_generators_are_rejected() {
+        let array = func("array", vec![int_lit(1)]);
+        let nested = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![func(
+                "coalesce",
+                vec![
+                    generator_expr("explode", vec![array.clone()], &[]),
+                    int_lit(0),
+                ],
+            )],
+        });
+        assert!(matches!(
+            analyze(nested, &base_types_for(&[])),
+            Err(AnalyzerError::SparkEmulated {
+                class: "UNSUPPORTED_GENERATOR.NESTED_IN_EXPRESSIONS",
+                ..
+            })
+        ));
+
+        let multiple = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![
+                generator_expr("explode", vec![array.clone()], &[]),
+                generator_expr("explode", vec![array], &[]),
+            ],
+        });
+        assert!(matches!(
+            analyze(multiple, &base_types_for(&[])),
+            Err(AnalyzerError::SparkEmulated {
+                class: "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
+                ..
+            })
+        ));
+    }
     #[test]
     fn na_fill_compatible_matches_spark_fill_value_rules() {
         for c in [
@@ -11639,190 +11233,106 @@ mod tests {
         ])
     }
 
-    fn lateral_view_plan(columns: Vec<(String, Expression)>) -> CommonAst {
-        CommonAst::new(CommonOp::LateralView {
+    fn generate_plan(name: &str, arg: Expression, aliases: &[&str]) -> CommonAst {
+        let mut generator = Generator::from_function(name, vec![arg]).expect("generator name");
+        generator.aliases = aliases.iter().map(|alias| (*alias).to_owned()).collect();
+        CommonAst::new(CommonOp::Generate {
             input: Box::new(aliased("emp", "e")),
-            table_alias: "t".to_owned(),
-            columns,
-        })
-    }
-
-    fn explode_call(arg: Expression) -> Expression {
-        Expression::FunctionCall(FunctionCall {
-            name: "explode".to_owned(),
-            args: vec![arg],
-            distinct: false,
-        })
-    }
-
-    fn explode_outer_call(arg: Expression) -> Expression {
-        Expression::FunctionCall(FunctionCall {
-            name: "explode_outer".to_owned(),
-            args: vec![arg],
-            distinct: false,
+            generator,
+            qualifier: Some("t".to_owned()),
         })
     }
 
     #[test]
-    fn lateral_view_schema_union_is_input_then_generated() {
-        let plan = lateral_view_plan(vec![("tag".to_owned(), explode_call(qcol("e", "tags")))]);
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
-        );
-        let typed = analyze(plan, &bt).expect("analyze");
-        assert_eq!(typed.resolved_schema.len(), 4);
-        assert_eq!(typed.resolved_schema.fields[0].name, "id");
-        assert_eq!(typed.resolved_schema.fields[1].name, "name");
-        assert_eq!(typed.resolved_schema.fields[2].name, "tags");
-        assert_eq!(typed.resolved_schema.fields[3].name, "tag");
-        assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::String);
-    }
-
-    #[test]
-    fn lateral_view_qualifier_binding_t_tag_resolves() {
+    fn generate_appends_schema_and_binds_qualifier() {
+        let generated = generate_plan("explode", qcol("e", "tags"), &["tag"]);
         let plan = CommonAst::new(CommonOp::Project {
-            input: Box::new(lateral_view_plan(vec![(
-                "tag".to_owned(),
-                explode_call(qcol("e", "tags")),
-            )])),
-            projections: vec![qcol("t", "tag")],
+            input: Box::new(generated),
+            projections: vec![qcol("e", "id"), qcol("t", "tag")],
         });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
-        );
-        let typed = analyze(plan, &bt).expect("analyze must succeed for t.tag");
-        assert_eq!(typed.resolved_schema.fields[0].name, "tag");
+        let typed = analyze(plan, &base_types_for(&[("emp", emp_tags_schema())]))
+            .expect("qualified generator columns");
+        assert_eq!(field_names(&typed), ["id", "tag"]);
+        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
     }
 
     #[test]
-    fn lateral_view_qualifier_binding_e_id_resolves() {
+    fn generate_qualifier_does_not_capture_input_columns() {
         let plan = CommonAst::new(CommonOp::Project {
-            input: Box::new(lateral_view_plan(vec![(
-                "tag".to_owned(),
-                explode_call(qcol("e", "tags")),
-            )])),
-            projections: vec![qcol("e", "id")],
-        });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
-        );
-        let typed = analyze(plan, &bt).expect("analyze must succeed for e.id");
-        assert_eq!(typed.resolved_schema.fields[0].name, "id");
-    }
-
-    #[test]
-    fn lateral_view_qualifier_t_nope_is_unknown_column() {
-        let plan = CommonAst::new(CommonOp::Project {
-            input: Box::new(lateral_view_plan(vec![(
-                "tag".to_owned(),
-                explode_call(qcol("e", "tags")),
-            )])),
-            projections: vec![qcol("t", "nope")],
-        });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
-        );
-        let err = analyze(plan, &bt).expect_err("t.nope must fail");
-        match err {
-            AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "nope");
-                assert_eq!(qualifier, Some("t".to_owned()));
-            }
-            other => panic!("expected UnknownColumn, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lateral_view_qualifier_e_tag_is_unknown_column() {
-        let plan = CommonAst::new(CommonOp::Project {
-            input: Box::new(lateral_view_plan(vec![(
-                "tag".to_owned(),
-                explode_call(qcol("e", "tags")),
-            )])),
+            input: Box::new(generate_plan("explode", qcol("e", "tags"), &["tag"])),
             projections: vec![qcol("e", "tag")],
         });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
-        );
-        let err = analyze(plan, &bt).expect_err("e.tag must fail");
-        match err {
-            AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "tag");
-                assert_eq!(qualifier, Some("e".to_owned()));
-            }
-            other => panic!("expected UnknownColumn, got {other:?}"),
-        }
+        let err = analyze(plan, &base_types_for(&[("emp", emp_tags_schema())]))
+            .expect_err("input qualifier must not bind generated columns");
+        assert!(matches!(
+            err,
+            AnalyzerError::UnknownColumn {
+                name,
+                qualifier: Some(qualifier)
+            } if name == "tag" && qualifier == "e"
+        ));
     }
 
     #[test]
-    fn lateral_view_outer_always_nullable() {
-        let non_null_array_schema = StructType::new(vec![
+    fn posexplode_outer_makes_position_and_value_nullable() {
+        let schema = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::not_null("tags", DataType::Array(Box::new(DataType::String), false)),
         ]);
-        let plan = CommonAst::new(CommonOp::LateralView {
-            input: Box::new(aliased("emp", "e")),
-            table_alias: "t".to_owned(),
-            columns: vec![("tag".to_owned(), explode_outer_call(qcol("e", "tags")))],
-        });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), non_null_array_schema)]
-                .into_iter()
-                .collect(),
-        );
-        let typed = analyze(plan, &bt).expect("analyze");
-        assert!(typed.resolved_schema.fields[2].nullable);
+        let typed = analyze(
+            generate_plan("posexplode_outer", qcol("e", "tags"), &["pos", "tag"]),
+            &base_types_for(&[("emp", schema)]),
+        )
+        .expect("posexplode_outer");
+        let generated = &typed.resolved_schema.fields[2..];
+        assert_eq!(generated[0].data_type, DataType::Integer);
+        assert_eq!(generated[1].data_type, DataType::String);
+        assert!(generated.iter().all(|field| field.nullable));
     }
 
     #[test]
-    fn lateral_view_posexplode_pos_not_nullable() {
-        let plan = CommonAst::new(CommonOp::LateralView {
-            input: Box::new(aliased("emp", "e")),
-            table_alias: "t".to_owned(),
-            columns: vec![
-                (
-                    "pos".to_owned(),
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_pos".to_owned(),
-                        args: vec![qcol("e", "tags")],
-                        distinct: false,
-                    }),
-                ),
-                (
-                    "tag".to_owned(),
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_val".to_owned(),
-                        args: vec![qcol("e", "tags")],
-                        distinct: false,
-                    }),
-                ),
-            ],
-        });
-        let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp_tags_schema())]
-                .into_iter()
-                .collect(),
+    fn map_posexplode_outer_derives_three_nullable_columns() {
+        let schema = StructType::new(vec![StructField::not_null(
+            "attrs",
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Long),
+                value_nullable: false,
+            },
+        )]);
+        let typed = analyze(
+            generate_plan(
+                "posexplode_outer",
+                qcol("e", "attrs"),
+                &["pos", "key", "value"],
+            ),
+            &base_types_for(&[("emp", schema)]),
+        )
+        .expect("map posexplode_outer");
+        let generated = &typed.resolved_schema.fields[1..];
+        assert_eq!(
+            generated
+                .iter()
+                .map(|field| (&field.name, &field.data_type))
+                .collect::<Vec<_>>(),
+            [
+                (&"pos".to_owned(), &DataType::Integer),
+                (&"key".to_owned(), &DataType::String),
+                (&"value".to_owned(), &DataType::Long),
+            ]
         );
-        let typed = analyze(plan, &bt).expect("analyze");
-        assert_eq!(typed.resolved_schema.fields[3].name, "pos");
-        assert!(
-            !typed.resolved_schema.fields[3].nullable,
-            "posexplode_pos is non-nullable"
-        );
-        assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::Integer);
-        assert_eq!(typed.resolved_schema.fields[4].name, "tag");
+        assert!(generated.iter().all(|field| field.nullable));
+    }
+
+    #[test]
+    fn inner_position_is_non_nullable() {
+        let typed = analyze(
+            generate_plan("posexplode", qcol("e", "tags"), &["pos", "tag"]),
+            &base_types_for(&[("emp", emp_tags_schema())]),
+        )
+        .expect("posexplode");
+        assert!(!typed.resolved_schema.fields[3].nullable);
         assert!(typed.resolved_schema.fields[4].nullable);
-        assert_eq!(typed.resolved_schema.fields[4].data_type, DataType::String);
     }
 
     fn lateral_join(
@@ -13812,33 +13322,47 @@ mod tests {
             input: Box::new(scan("emp")),
             projections: vec![
                 unresolved_col("id"),
-                inline_call(false, array_of_struct_name_salary()),
+                generator_expr(
+                    "inline",
+                    vec![func(
+                        "array",
+                        vec![func(
+                            "struct",
+                            vec![unresolved_col("name"), unresolved_col("salary")],
+                        )],
+                    )],
+                    &[],
+                ),
             ],
         });
-        assert_n8_output_list_invariant(&analyze(inline_ast, &bt).expect("inline expands"));
+        assert_n8_output_list_invariant(&analyze(inline_ast, &bt).expect("inline analyzes"));
 
-        let json_bt = base_types_with_raw();
+        let json_bt = base_types_for(&[(
+            "raw",
+            StructType::new(vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("json_str", DataType::String),
+            ]),
+        )]);
         let json_ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("raw")),
             projections: vec![
                 unresolved_col("id"),
-                json_tuple_call("json_str", &["a", "e"]),
+                generator_expr(
+                    "json_tuple",
+                    vec![unresolved_col("json_str"), lit_str("a"), lit_str("e")],
+                    &[],
+                ),
             ],
         });
-        assert_n8_output_list_invariant(&analyze(json_ast, &json_bt).expect("json_tuple expands"));
+        assert_n8_output_list_invariant(&analyze(json_ast, &json_bt).expect("json_tuple analyzes"));
 
-        let stack_call = func(
-            "stack_multi_alias",
-            vec![
-                func("stack", vec![int_lit(2), int_lit(10), int_lit(20)]),
-                lit_str("x"),
-            ],
-        );
+        let stack = generator_expr("stack", vec![int_lit(2), int_lit(10), int_lit(20)], &["x"]);
         let stack_ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![stack_call],
+            projections: vec![stack],
         });
-        assert_n8_output_list_invariant(&analyze(stack_ast, &bt).expect("stack expands"));
+        assert_n8_output_list_invariant(&analyze(stack_ast, &bt).expect("stack analyzes"));
 
         let promote_agg = aggregate(
             emp_scan(),

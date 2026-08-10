@@ -1,7 +1,6 @@
 # τ architecture simplification and code-reduction plan
 
-**Status:** In progress — safe-deletion checkpoint complete; no architectural
-migration started
+**Status:** In progress — Phase 3 complete; Phase 4 not started
 
 **Recorded:** 2026-08-07
 
@@ -290,6 +289,40 @@ between a dedicated `GeneratorProjection` and normalization to the existing
 lateral-view/table-function representation based on which deletes more
 special-case code.
 
+### Semantic matrix (Spark 4.1.1)
+
+The implementation source of truth is Catalyst's `Generator`, `Generate`,
+`GeneratorResolution`, `Stack`, `ExplodeBase`, `Inline`, and `JsonTuple`.
+Aliases are either absent (use the default names below) or must match the
+resolved output arity exactly.
+
+| Kind | Arguments and input | Default output | Rows per input | `outer` |
+|---|---|---|---|---|
+| `explode` | One array or map | array: `col`; map: `key`, `value` | One per element; none for null/empty | Emits one all-null row for null/empty and makes every output nullable |
+| `posexplode` | One array or map | array: `pos`, `col`; map: `pos`, `key`, `value` | As `explode`, with zero-based position | Same outer-row rule; `pos` is null on the synthetic row |
+| `inline` | One `array<struct<...>>` | Struct field names, types, and nullability; nullable array elements make every field nullable | One per struct; none for null/empty | Emits one all-null struct row for null/empty |
+| `json_tuple` | JSON string plus one or more string field expressions | `c0..cN`, nullable strings | Exactly one, including null/invalid JSON | Not an outer generator |
+| `stack` | Positive foldable integer `N` plus values | `col0..colK`, nullable; `K = ceil(values/N)` and values are row-major | Exactly `N`; missing final-row slots are null | Not an outer generator |
+
+### Representation decision
+
+Normalize to a structured unary `Generate` operator, matching Spark's logical
+shape, rather than adding a combined `GeneratorProjection`. A projection-only
+unresolved marker lets output arity remain schema-dependent until analysis;
+analysis then produces ordinary `Project(Generate(input))`. This also subsumes
+the existing `LateralView` node and the `explode` special case in
+`TableFunction`. The decision is viable only if the inline, JSON-tuple, and
+stack expansion passes disappear and the fake scalar names are deleted.
+
+The sqlparser alias workaround remains because neither an upstream grammar
+fork nor a projection-path side table is smaller. Its sentinel is now scoped
+per statement: lowering chooses a prefix absent from every input identifier and
+passes that exact prefix to the splice, so user aliases cannot collide with it.
+
+The migration preserves the prior literal-only subset of Spark's foldable
+`stack` row-count rule. General constant folding is a parity concern separate
+from replacing the synthetic representation.
+
 ### Work
 
 1. Specify the semantic matrix: input arity/type, output cardinality and
@@ -314,6 +347,21 @@ special-case code.
 - Both frontends share one semantic implementation after lowering.
 - Alias and outer semantics remain corpus-identical.
 - Net production code and number of recognition sites decrease.
+
+### Phase 3 result (2026-08-10)
+
+- Both frontends now lower `explode`, `posexplode`, `inline`, `json_tuple`, and
+  `stack` to one structured `Generator` / `Generate` representation.
+- `LateralView`, the explode table-function special case, three projection
+  expansion passes, and all private fake scalar generator names are gone.
+- Multi-column aliases now attach to the generator without 1:N AST expansion;
+  statement sentinels and emission's internal generator alias are
+  collision-free.
+- Production Rust decreased by 640 physical lines, measured before each
+  file's first `#[cfg(test)]` module from the branch base to this worktree.
+- `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test` pass.
+  The DataFrame corpus remains at 421 green plus the same 7 known deferred
+  cases; the SQL corpus remains at 424 green with 2 intentional skips.
 
 ## Phase 4 — create one live function-spec registry
 

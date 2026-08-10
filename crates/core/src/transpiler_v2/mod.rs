@@ -22,6 +22,7 @@ pub mod emission;
 pub mod error;
 pub mod expression;
 pub mod function_catalog;
+pub mod generator;
 pub mod invariants;
 pub mod macros;
 /// Re-export, not a module: [`name_fold`](crate::types::name_fold) moved to
@@ -46,6 +47,7 @@ pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
+pub use generator::{Generator, GeneratorKind};
 pub use schema::{Attribute, ExprId, ResolvedSchema};
 pub use statement::{render_ddl, DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;

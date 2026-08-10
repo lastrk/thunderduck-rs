@@ -293,6 +293,8 @@ def _atomic_write(path, value):
 
 
 def _record_last_snapshot(fingerprint):
+    if _read(LAST_FP_PATH) == fingerprint:
+        return
     _atomic_write(LAST_FP_PATH, fingerprint)
 
 

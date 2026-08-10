@@ -1,21 +1,12 @@
 //! τ's supported-function roster for Spark Connect catalog operations.
 //!
-//! This module provides a curated list of Spark function names that τ can
-//! translate to DuckDB SQL.  The list is derived from the match arms in
-//! [`emission::render_function_call`](super::emission) and
-//! [`type_inference::TypeInferenceEngine::function_return_type`](super::type_inference).
+//! This module provides Spark Connect catalog operations with the function
+//! names τ supports.
 //!
 //! INV10-safe: pure data, no runtime imports.
 
-/// Alphabetically sorted, deduplicated list of Spark function names that τ
-/// supports.  Each entry is a lowercase canonical name matching the
-/// case-insensitive lookup in `render_function_call` / `function_return_type`.
-///
-/// The list is intentionally conservative — it includes functions that both
-/// the emission layer AND the type inference layer handle end-to-end.
-/// Internal/synthetic names (e.g. `posexplode_pos`, `stack_col`,
-/// `inline_field`) are excluded because they are not user-visible Spark
-/// functions.
+/// Sorted, deduplicated lowercase names exposed through catalog APIs.
+/// Synthetic/internal names are excluded.
 pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "abs",
     "acos",
@@ -122,10 +113,13 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "ifnull",
     "ilike",
     "initcap",
+    "inline",
+    "inline_outer",
     "instr",
     "isnan",
     "isnotnull",
     "isnull",
+    "json_tuple",
     "kurtosis",
     "lag",
     "last",
@@ -182,6 +176,8 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "percentile",
     "percentile_approx",
     "pmod",
+    "posexplode",
+    "posexplode_outer",
     "pow",
     "power",
     "quarter",
@@ -219,6 +215,7 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "sort_array",
     "split",
     "sqrt",
+    "stack",
     "starts_with",
     "startswith",
     "std",

@@ -905,44 +905,13 @@ impl TypeInferenceEngine {
             // the first arg's type (Long by default).
             "sequence" => Array(Box::new(first_arg_or(Long)), false),
 
-            // Spark's `explode(arr)` / `explode_outer(arr)` emit one row
-            // per element and return the array's element type. Emission
-            // handles the row-multiplying `UNNEST(...)` in SELECT context.
-            //
-            // `posexplode_val` / `posexplode_pos` are internal FunctionCall
-            // shapes synthesized by the converter when it splits a
-            // multi-name `Alias(names=[pos, val], inner=posexplode(arr))`
-            // into two projections.
-            //
-            // `element_at(coll, k)` shares the exact same reduction: Array →
-            // element type; Map → value type (always nullable — missing key
-            // returns NULL).
-            "explode" | "explode_outer" | "posexplode_val" | "element_at" => match first_arg_type {
+            // `element_at(coll, k)` reduces Array to its element type and Map
+            // to its value type.
+            "element_at" => match first_arg_type {
                 Some(DataType::Array(elem, _)) => (**elem).clone(),
                 Some(DataType::Map { value, .. }) => (**value).clone(),
                 _ => Unresolved,
             },
-            "posexplode_pos" => Integer,
-            // Synthetic `map_explode_key(m)` / `map_explode_val(m)` — see the
-            // v2 relation converter's alias-splitter (map-007). Return the
-            // map's key / value type respectively.
-            "map_explode_key" => match first_arg_type {
-                Some(DataType::Map { key, .. }) => (**key).clone(),
-                _ => Unresolved,
-            },
-            "map_explode_val" => match first_arg_type {
-                Some(DataType::Map { value, .. }) => (**value).clone(),
-                _ => Unresolved,
-            },
-            // Synthetic `stack_col(v1, v2, ..., vN)` — one per output
-            // column of Spark's `stack(N, ...) AS (...)`. Analyzer pre-pass
-            // (`expand_stack_projections`) fans a wrapped
-            // `stack_multi_alias(...)` projection out into K per-column
-            // `stack_col` calls with N row-values apiece. Every arg shares
-            // a type in Spark (Stack.checkInputDataTypes coerces across
-            // rows); take the first arg's type as the column type.
-            // Emission maps `stack_col(v1, ..., vN)` to `UNNEST([v1, ..., vN])`.
-            "stack_col" => first_arg_or(Unresolved),
 
             // `array_append` / `array_prepend`: Spark stamps containsNull
             // = true (a NULL element may be appended).
@@ -1017,24 +986,6 @@ impl TypeInferenceEngine {
             // object). Emission remaps to DuckDB's native `json_keys`, which
             // already returns `VARCHAR[]`.
             "json_object_keys" => Array(Box::new(String), true),
-            // Synthetic per-key `FunctionCall` produced by the
-            // analyzer's Project pre-pass for `F.json_tuple` (the sole
-            // choke point creating this name: see
-            // `analyzer::expand_json_tuple_projections`, which already
-            // enforces arity ≥ 2 pre-expansion and stamps exactly 2 args
-            // — json expr + one literal key — per expanded call). Return
-            // type is always `String` per Spark's `JsonTuple.elementSchema`
-            // — an arity-only rule (no per-arg *expression* nullability
-            // needed), so its single home is this resolver, not the
-            // `function_call_data_type` pre-pass. The exact-2 slice pattern
-            // mirrors `map_from_arrays`'s arity guard above; anything else
-            // is malformed and falls through to the shared `Unresolved`
-            // default.
-            "json_tuple_field" => match arg_types {
-                [_, _] => String,
-                _ => Unresolved,
-            },
-
             // `array_agg` is routed through the aggregate delegation list
             // above (unified with `collect_list`/`collect_set`), so it never
             // falls through here. Removed the scalar arm to eliminate the
@@ -1902,34 +1853,12 @@ mod tests {
         );
     }
 
-    /// `explode(Array<T>)`, `explode_outer(Array<T>)`, and
-    /// `posexplode_val(Array<T>)` return the element type T.
-    #[test]
-    fn explode_returns_array_element_type() {
-        let arr = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(frt("explode", std::slice::from_ref(&arr)), DataType::String);
-        assert_eq!(
-            frt("explode_outer", std::slice::from_ref(&arr)),
-            DataType::String
-        );
-        assert_eq!(frt("posexplode_val", &[arr]), DataType::String);
-    }
-
-    /// `posexplode_pos(arr)` returns the 0-indexed synthetic position as an
-    /// Integer.
-    #[test]
-    fn posexplode_pos_returns_integer() {
-        let arr = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(frt("posexplode_pos", &[arr]), DataType::Integer);
-    }
-
     #[test]
     fn sequence_returns_array_of_first_arg() {
         assert_eq!(
             frt("sequence", &[DataType::Integer]),
             DataType::Array(Box::new(DataType::Integer), false)
         );
-        // No arg → default element type is Long (start/stop unknown).
         assert_eq!(
             frt("sequence", &[]),
             DataType::Array(Box::new(DataType::Long), false)

@@ -101,8 +101,7 @@ pub(crate) enum FromItem {
         /// Render `LATERAL` before the right side.
         lateral: bool,
     },
-    /// Verbatim FROM body (lateral-view chains). Carries the aliases it
-    /// exposes so the block's scope stays truthful.
+    /// A verbatim FROM body and the aliases it exposes.
     Raw {
         /// The FROM-body SQL.
         sql: String,
@@ -171,9 +170,7 @@ pub(crate) enum DistinctKind {
 /// nothing binds through it.
 pub(crate) const WRAP_ALIAS: &str = "__td_sub";
 
-/// One soft SELECT slot: the analyzer-declared output column name plus its
-/// rendered SQL. Named so consumers can filter (`DropColumns`) or extend
-/// (`LateralView`) the list without parsing SQL text.
+/// One analyzer-named, rendered SELECT slot.
 #[derive(Debug, Clone)]
 pub(crate) struct DefaultSlot {
     /// The output column name, in analyzer casing.
@@ -258,9 +255,7 @@ impl SelectBlock {
         &self.from
     }
 
-    /// Extend the FROM body in place (lateral-view chaining):
-    /// `FROM <old-from><suffix>`, exposing `extra_aliases` in addition to the
-    /// current scope. Caller must have checked `max_clause == From`.
+    /// Append `suffix` to FROM and expose `extra_aliases`.
     pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<String>) {
         debug_assert_eq!(self.max_clause, Clause::From);
         let sql = format!("{}{suffix}", self.from.to_sql());
@@ -282,10 +277,7 @@ impl SelectBlock {
         self.default_projections.as_deref()
     }
 
-    /// Extend the soft SELECT slot list with `extra` (lateral-view
-    /// chaining's generated columns) — a no-op when defaults are `None`,
-    /// since a free block already renders `*`, which covers appended
-    /// columns without an explicit slot list.
+    /// Add soft SELECT slots when a default list exists.
     pub(crate) fn extend_default_projections(&mut self, extra: Vec<DefaultSlot>) {
         if let Some(slots) = &mut self.default_projections {
             slots.extend(extra);

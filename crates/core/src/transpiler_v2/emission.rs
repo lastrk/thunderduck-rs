@@ -22,6 +22,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::generator::{Generator, GeneratorKind};
 use super::name_fold::{eq_fold, fold_key};
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
@@ -105,11 +106,11 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             grouping_sets,
             having.as_ref(),
         ),
-        TypedOp::LateralView {
+        TypedOp::Generate {
             input,
-            table_alias,
-            columns,
-        } => build_lateral_view(input, table_alias, columns),
+            generator,
+            qualifier,
+        } => build_generate(input, generator, qualifier.as_deref(), schema),
         TypedOp::SetOp {
             kind,
             all,
@@ -494,16 +495,25 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
 /// Wrap `item` under the first unused alias in the `base`, `base_2`, …
 /// sequence.
 fn fresh_alias_wrap(item: FromItem, base: &str, other_exposed: &[String]) -> FromItem {
-    let alias = std::iter::once(base.to_owned())
-        .chain((2..=64).map(|n| format!("{base}_{n}")))
-        .find(|cand| !other_exposed.iter().any(|o| eq_fold(o, cand)))
-        // Keep the candidate search bounded even if every generated alias is
-        // occupied.
-        .unwrap_or_else(|| format!("{base}_64"));
+    let alias = fresh_alias(base, other_exposed);
     FromItem::Derived {
         unit: Box::new(SqlUnit::from(SelectBlock::from_item(item))),
         alias,
     }
+}
+
+fn fresh_alias(base: &str, occupied: &[String]) -> String {
+    for ordinal in 1..=occupied.len() + 1 {
+        let candidate = if ordinal == 1 {
+            base.to_owned()
+        } else {
+            format!("{base}_{ordinal}")
+        };
+        if occupied.iter().all(|name| !eq_fold(name, &candidate)) {
+            return candidate;
+        }
+    }
+    unreachable!("one more alias candidate than occupied names must be free")
 }
 
 fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
@@ -770,46 +780,191 @@ fn build_aggregate(
     Ok(block.into())
 }
 
-fn build_lateral_view(
+fn build_generate(
     input: &TypedAst,
-    table_alias: &str,
-    columns: &[(String, Expression)],
+    generator: &Generator,
+    qualifier: Option<&str>,
+    schema: &Schema,
 ) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
-    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
-        let expr_sql = render_expr(expr, input_schema)?;
-        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
-    })?;
+    let columns = render_generator(generator, input_schema, schema)?;
+    let inner_select = columns
+        .iter()
+        .map(|(_, sql)| sql.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let column_names = columns
+        .iter()
+        .map(|(alias, _)| quote_ident(alias))
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut block = open_block(input)?;
-    // Generator expressions reference the input FROM scope, so extension is
-    // safe only for a pure-FROM block that preserves that scope.
-    let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block, &input.scope);
+    let vis = exprs_visible_in(generator.args.iter(), &block, &input.scope);
     if !(block.pure_from() && vis) {
         block = SelectBlock::wrap(block.into());
     }
+    let qualifier = qualifier
+        .map(str::to_owned)
+        .unwrap_or_else(|| fresh_alias("__td_gen", &block.from_ref().exposed()));
     block.extend_from(
         &format!(
-            ", LATERAL (SELECT {inner_select}) AS {}",
-            quote_ident(table_alias)
+            ", LATERAL (SELECT {inner_select}) AS {}({column_names})",
+            quote_ident(&qualifier),
         ),
-        vec![table_alias.to_owned()],
+        vec![qualifier.clone()],
     );
-    // A merged block's default slots must include generated lateral-view
-    // columns; a wrapped or slot-less block needs no widening.
-    let ta_q = quote_ident(table_alias);
-    block.extend_default_projections(
-        columns
-            .iter()
-            .map(|(alias, _)| {
-                let a_q = quote_ident(alias);
-                DefaultSlot {
-                    name: alias.clone(),
-                    sql: format!("{ta_q}.{a_q}"),
-                }
-            })
-            .collect(),
-    );
+    let qualifier = quote_ident(&qualifier);
+    let generated = columns
+        .iter()
+        .map(|(alias, _)| {
+            let alias_sql = quote_ident(alias);
+            DefaultSlot {
+                name: alias.clone(),
+                sql: format!("{qualifier}.{alias_sql}"),
+            }
+        })
+        .collect();
+    if input_schema.is_empty() {
+        block.set_default_projections(generated);
+    } else {
+        block.extend_default_projections(generated);
+    }
     Ok(block.into())
+}
+
+fn render_generator(
+    generator: &Generator,
+    input: &Schema,
+    output: &Schema,
+) -> Result<Vec<(String, String)>, EmissionError> {
+    let arg = |index: usize| render_expr(&generator.args[index], input);
+    match generator.kind {
+        GeneratorKind::Explode | GeneratorKind::PosExplode => {
+            let collection = arg(0)?;
+            let collection_type = generator.args[0].data_type(input);
+            let (empty, values): (String, Vec<String>) = match &collection_type {
+                DataType::Array(..) => (
+                    format!("{collection} IS NULL OR len({collection}) = 0"),
+                    vec![collection.clone()],
+                ),
+                DataType::Map { .. } => (
+                    format!("{collection} IS NULL OR cardinality({collection}) = 0"),
+                    vec![
+                        format!("map_keys({collection})"),
+                        format!("map_values({collection})"),
+                    ],
+                ),
+                _ => {
+                    return Err(EmissionError::Internal {
+                        message: format!(
+                            "analyzed `{}` generator has non-collection input",
+                            generator.name()
+                        ),
+                    });
+                }
+            };
+            let mut sql = Vec::with_capacity(generator.aliases.len());
+            if generator.kind == GeneratorKind::PosExplode {
+                let positions = match &collection_type {
+                    DataType::Array(..) => collection.clone(),
+                    DataType::Map { .. } => format!("map_keys({collection})"),
+                    _ => unreachable!("collection type checked above"),
+                };
+                let pos = format!("generate_subscripts({positions}, 1) - 1");
+                sql.push(if generator.outer {
+                    format!("CASE WHEN {empty} THEN NULL ELSE {pos} END")
+                } else {
+                    pos
+                });
+            }
+            sql.extend(values.into_iter().map(|value| {
+                let value = if generator.outer {
+                    format!("CASE WHEN {empty} THEN [NULL] ELSE {value} END")
+                } else {
+                    value
+                };
+                format!("UNNEST({value})")
+            }));
+            Ok(generator.aliases.iter().cloned().zip(sql).collect())
+        }
+        GeneratorKind::Inline => {
+            let collection = arg(0)?;
+            let collection = if generator.outer {
+                format!(
+                    "CASE WHEN {collection} IS NULL OR len({collection}) = 0 \
+                     THEN [NULL] ELSE {collection} END"
+                )
+            } else {
+                collection
+            };
+            let DataType::Array(element, _) = generator.args[0].data_type(input) else {
+                unreachable!("inline input type checked by analyzer")
+            };
+            let DataType::Struct(struct_type) = *element else {
+                unreachable!("inline element type checked by analyzer")
+            };
+            Ok(generator
+                .aliases
+                .iter()
+                .zip(struct_type.fields)
+                .map(|(alias, field)| {
+                    (
+                        alias.clone(),
+                        format!("UNNEST({collection}).{}", quote_ident(&field.name)),
+                    )
+                })
+                .collect())
+        }
+        GeneratorKind::JsonTuple => {
+            let json = arg(0)?;
+            generator
+                .aliases
+                .iter()
+                .zip(&generator.args[1..])
+                .map(|(alias, key)| {
+                    let key = render_expr(key, input)?;
+                    let path = format!("'/' || replace(replace({key}, '~', '~0'), '/', '~1')");
+                    Ok((
+                        alias.clone(),
+                        format!("json_extract_string({json}, {path})"),
+                    ))
+                })
+                .collect()
+        }
+        GeneratorKind::Stack => {
+            let rows = match &generator.args[0] {
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(rows),
+                    ..
+                }) => *rows as usize,
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(rows),
+                    ..
+                }) => *rows as usize,
+                _ => unreachable!("stack row count checked by analyzer"),
+            };
+            let columns = generator.aliases.len();
+            let values = &generator.args[1..];
+            let output_offset = input.len();
+            generator
+                .aliases
+                .iter()
+                .enumerate()
+                .map(|(column, alias)| {
+                    let items = (0..rows)
+                        .map(|row| match values.get(row * columns + column) {
+                            Some(value) => render_expr(value, input),
+                            None => Ok(format!(
+                                "CAST(NULL AS {})",
+                                render_data_type(&output.fields[output_offset + column].data_type)
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((alias.clone(), format!("UNNEST([{}])", items.join(", "))))
+                })
+                .collect()
+        }
+    }
 }
 
 /// Open the child's block, wrapping an opaque `Raw` unit as `(…) AS __td_sub`.
@@ -2385,32 +2540,6 @@ fn build_table_function(
             }]);
             Ok(block.into())
         }
-        // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
-        // Build the canonical FunctionCall and render via the existing render_expr
-        // path, which already handles UNNEST emission for explode/explode_outer
-        // (single-homed — no duplication of the CASE wrapper logic).
-        "explode" | "explode_outer" => {
-            // Defensive: the analyzer guarantees exactly 1 output column.
-            if schema.fields.len() != 1 {
-                bail_boundary_op!(
-                    "TableFunction",
-                    format!(
-                        "explode TVF schema must have exactly 1 field, got {}",
-                        schema.fields.len()
-                    )
-                );
-            }
-            let fc = FunctionCall {
-                name: name.to_owned(),
-                args: args.to_vec(),
-                distinct: false,
-            };
-            let unnest_sql = render_function_call(&fc, schema)?;
-            let col_name = quote_ident(&schema.fields[0].name);
-            // A FROM-less `SELECT unnest(…) AS col` — a genuine SELECT
-            // statement, not a FROM-item generator; stays a Raw unit.
-            Ok(SqlUnit::Raw(format!("SELECT {unnest_sql} AS {col_name}")))
-        }
         _ => bail_boundary_op!(
             "TableFunction",
             format!("table-function `{name}` emission (not implemented in τ)")
@@ -2454,6 +2583,12 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                 render_function_call(f, schema)
             }
         }
+        Expression::Generator(g) => Err(EmissionError::Internal {
+            message: format!(
+                "generator `{}` reached scalar expression emission",
+                g.name()
+            ),
+        }),
         Expression::Cast(c) => render_cast(c, schema),
         Expression::CaseWhen(cw) => render_case_when(cw, schema),
         Expression::Window(w) => render_window(w, schema),
@@ -3488,185 +3623,6 @@ fn render_function_call_dispatch(
         "trunc" if f.args.len() == 2 => {
             let [d, fmt] = rendered_args(f, schema)?;
             return Ok(format!("date_trunc({fmt}, {d})"));
-        }
-        // Spark generator functions — row-multiplying `explode` / `explode_outer`
-        // / `posexplode` land in the SELECT list; DuckDB expands `UNNEST(list)`
-        // to one row per element when it appears in a SELECT projection. The
-        // POSEXPLODE case is handled in the converter by splitting the
-        // multi-name Alias into two projections: a synthetic
-        // `posexplode_pos(arr)` (0-indexed position) plus
-        // `posexplode_val(arr)` (element value). Corpus: arr-015, arr-016,
-        // arr-017.
-        "explode" => {
-            let [a] = exact_args(f, schema, "`explode` requires exactly 1 argument")?;
-            return Ok(format!("UNNEST({a})"));
-        }
-        "explode_outer" => {
-            let [a] = exact_args(f, schema, "`explode_outer` requires exactly 1 argument")?;
-            // Spark semantics: NULL arrays and empty arrays each produce one
-            // row with a NULL element. DuckDB's raw UNNEST drops both; we
-            // rewrite to `UNNEST(CASE WHEN a IS NULL OR len(a) = 0 THEN
-            // [NULL] ELSE a END)` so the one-row-per-empty guarantee holds.
-            return Ok(format!(
-                "UNNEST(CASE WHEN {a} IS NULL OR len({a}) = 0 THEN [NULL] ELSE {a} END)"
-            ));
-        }
-        // Synthetic FunctionCall names produced by the v2 converter when it
-        // splits `F.posexplode(arr).alias("pos", "val")` into two projections.
-        // See `V2ExpressionConverter::convert_alias` and
-        // `V2RelationConverter::convert_project`. Never emitted by user code.
-        "posexplode_pos" => {
-            let [a] = exact_args(f, schema, "`posexplode_pos` requires exactly 1 argument")?;
-            // DuckDB's `generate_subscripts(list, 1)` is 1-indexed; Spark's
-            // `posexplode` is 0-indexed. Subtract 1 to align.
-            return Ok(format!("(generate_subscripts({a}, 1) - 1)"));
-        }
-        "posexplode_val" => {
-            let [a] = exact_args(f, schema, "`posexplode_val` requires exactly 1 argument")?;
-            return Ok(format!("UNNEST({a})"));
-        }
-        // Synthetic FunctionCall names produced by the v2 converter when it
-        // splits `F.explode(map_col).alias("k", "v")` into two projections.
-        // Emission expands each column via `UNNEST(map_keys(m))` /
-        // `UNNEST(map_values(m))` — DuckDB's MAP is a list-pair internally,
-        // so co-UNNESTed sibling projections stay row-aligned. Corpus: map-007.
-        "map_explode_key" => {
-            let [m] = exact_args(f, schema, "`map_explode_key` requires exactly 1 argument")?;
-            return Ok(format!("UNNEST(map_keys({m}))"));
-        }
-        "map_explode_val" => {
-            let [m] = exact_args(f, schema, "`map_explode_val` requires exactly 1 argument")?;
-            return Ok(format!("UNNEST(map_values({m}))"));
-        }
-        // piv-006 — synthetic per-column call produced by the analyzer's
-        // Project pre-pass (`expand_stack_projections`) when it fans out a
-        // `stack(N, ...) AS (a1, ..., aK)` fragment. Args are the K row
-        // values for one output column; emission emits
-        // `UNNEST([v1, v2, ..., vN])`. Sibling `stack_col` UNNESTs in a
-        // SELECT list co-multiply row-aligned, matching the `inline_field`
-        // consolidation verified by the corresponding emission tests.
-        // Type coercion across rows is Spark's job (`Stack.checkInputDataTypes`
-        // requires the K expressions per column to share a type; users write
-        // explicit `CAST` in the fragment). DuckDB's list-literal element
-        // widening handles the well-typed shape; a genuinely mixed-type
-        // input arrives here only if Spark itself would have rejected it,
-        // in which case DuckDB emits its own type-mismatch error.
-        "stack_col" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`stack_col` requires at least 1 argument (one per stack row)"
-                );
-            }
-            let items = sql_join(f.args.iter(), ", ", |a| render_expr(a, schema))?;
-            return Ok(format!("UNNEST([{items}])"));
-        }
-        // synthetic FunctionCall names produced by the analyzer's
-        // Project pre-pass (`expand_inline_projections`) when it fans
-        // `F.inline(arr)` / `F.inline_outer(arr)` out into N per-struct-field
-        // projections. Args: `(arr : Array<Struct<...>>, field_name : STRING)`.
-        // Sibling `UNNEST(<arr>)` calls in a SELECT are consolidated by
-        // DuckDB into a single row-multiplication (empirically verified —
-        // See the corresponding emission tests. Corpus: inl-001, inl-002.
-        "inline_field" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`inline_field` requires exactly 2 arguments (arr, field_name)",
-                );
-            }
-            let arr_sql = render_expr(&f.args[0], schema)?;
-            let field_name = string_literal_arg(f, 1, "`inline_field` second argument")?;
-            let field_q = quote_ident(&field_name);
-            return Ok(format!("UNNEST({arr_sql}).{field_q}"));
-        }
-        "inline_outer_field" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`inline_outer_field` requires exactly 2 arguments (arr, field_name)",
-                );
-            }
-            let arr_sql = render_expr(&f.args[0], schema)?;
-            let field_name = string_literal_arg(f, 1, "`inline_outer_field` second argument")?;
-            // Build the struct-typed NULL sentinel from the resolved
-            // `Array<Struct<...>>` schema so a NULL / empty array yields
-            // exactly one all-NULL row (mirrors `explode_outer`'s
-            // `[NULL]` sentinel, specialised to structs).
-            let arr_ty = f.args[0].data_type(schema);
-            let struct_fields = match &arr_ty {
-                DataType::Array(inner, _) => match inner.as_ref() {
-                    DataType::Struct(st) => &st.fields,
-                    other => {
-                        bail_boundary_fn!(
-                            f.name.clone(),
-                            format!(
-                                "`inline_outer_field` requires `Array<Struct<...>>`, got `Array<{other:?}>`"
-                            ),
-                        );
-                    }
-                },
-                other => {
-                    bail_boundary_fn!(
-                        f.name.clone(),
-                        format!(
-                            "`inline_outer_field` requires `Array<Struct<...>>`, got `{other:?}`"
-                        ),
-                    );
-                }
-            };
-            let sentinel_fields = sql_join(struct_fields.iter(), ", ", |f0| {
-                let name_q = quote_ident(&f0.name);
-                let ty = render_data_type(&f0.data_type);
-                Ok(format!("{name_q} := CAST(NULL AS {ty})"))
-            })?;
-            let sentinel = format!("struct_pack({sentinel_fields})");
-            let field_q = quote_ident(&field_name);
-            return Ok(format!(
-                "UNNEST(CASE WHEN {arr_sql} IS NULL OR len({arr_sql}) = 0 THEN [{sentinel}] ELSE {arr_sql} END).{field_q}"
-            ));
-        }
-        // synthetic FunctionCall produced by the analyzer's Project
-        // pre-pass (`expand_json_tuple_projections`) when it fans
-        // `F.json_tuple(json, k1, ..., kN)` out into N per-key projections.
-        // Args: `(json_expr, key : STRING literal)`. Emit
-        // `json_extract_string(<json>, '$.<key>')` — same substrate as the
-        // `get_json_object` session macro (matches Spark's `JsonTuple`
-        // scalar-value semantics: quotes stripped, JSON null → NULL, missing
-        // key → NULL). Analyzer pre-pass rejects unsafe key chars, so the
-        // interpolated key is a safe single-quoted SQL literal. Corpus: json-002.
-        "json_tuple_field" => {
-            // These runtime guards are LOAD-BEARING, not duplication of the
-            // `expand_json_tuple_projections` choke point: that pre-pass
-            // covers only the calls IT synthesizes from `json_tuple`.
-            // Nothing stops a user from invoking `json_tuple_field(...)`
-            // directly (τ forwards unknown function names to emission by
-            // design, with no allowlist — SQL front-end and DataFrame
-            // converter alike), so a wrong-arity or unsafe-key call reaches
-            // this arm un-choke-pointed and must get a graceful boundary
-            // error, same as the sibling `inline_field` arms.
-            if f.args.len() != 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`json_tuple_field` requires exactly 2 arguments (json, key)",
-                );
-            }
-            let json_sql = render_expr(&f.args[0], schema)?;
-            let key = string_literal_arg(f, 1, "`json_tuple_field` second argument")?;
-            if key
-                .chars()
-                .any(|c| matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control())
-            {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    format!(
-                        "`json_tuple_field` key `{key}` contains an unsafe character; \
-                         it would path-walk or break the SQL literal"
-                    ),
-                );
-            }
-            let key_lit = sql_string_literal(&format!("$.{key}"));
-            return Ok(format!("json_extract_string({json_sql}, {key_lit})"));
         }
         // Spark → thdck_spark_funcs extension remaps.
         // These functions require the ext6 extension, loaded at session
@@ -6831,10 +6787,6 @@ mod tests {
         render_function_call(&fcall(name, args), &empty_schema()).expect("render")
     }
 
-    fn render_fn_on(schema: &Schema, name: &str, args: Vec<Expression>) -> String {
-        render_function_call(&fcall(name, args), schema).expect("render")
-    }
-
     /// Asserts `err` is [`EmissionError::Unsupported`] with the given `kind`
     /// and `name`, and that `reason` contains every fragment in
     /// `reason_frags`.
@@ -7585,54 +7537,8 @@ mod tests {
         );
     }
 
-    /// Build `explode(<args>)` or `explode_outer(<args>)`, analyze, and emit.
-    fn emit_explode_tvf(name: &str, args: Vec<Expression>) -> String {
-        let ast = CommonAst::new(CommonOp::TableFunction {
-            name: name.to_owned(),
-            args,
-            with_ordinality: false,
-        });
-        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze explode TVF");
-        dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch explode TVF")
-    }
-
-    /// tbl-007: `SELECT * FROM explode(array(1,2,3))` → SQL
-    /// contains `UNNEST` and emits the column as `col`.
-    #[test]
-    fn dispatch_explode_tvf_emits_unnest_as_col() {
-        let arr = Expression::FunctionCall(FunctionCall {
-            name: "array".to_owned(),
-            args: vec![int_lit(1), int_lit(2), int_lit(3)],
-            distinct: false,
-        });
-        let sql = emit_explode_tvf("explode", vec![arr]);
-        assert_eq!(sql, "SELECT UNNEST(list_value(1, 2, 3)) AS col");
-    }
-
-    /// explode_outer as TVF wraps with the CASE/NULL sentinel.
-    #[test]
-    fn dispatch_explode_outer_tvf_emits_case_wrapper() {
-        let arr = Expression::FunctionCall(FunctionCall {
-            name: "array".to_owned(),
-            args: vec![int_lit(1), int_lit(2)],
-            distinct: false,
-        });
-        let sql = emit_explode_tvf("explode_outer", vec![arr]);
-        assert!(
-            sql.contains("UNNEST(CASE WHEN"),
-            "explode_outer must emit the CASE wrapper; got: {sql}"
-        );
-        assert!(
-            sql.contains("AS col"),
-            "output column must be named 'col'; got: {sql}"
-        );
-    }
-
     #[test]
     fn render_literal_binary_emits_duckdb_blob_escape() {
-        // Spark `X'1F2A'` lowers to a Binary literal; DuckDB's blob literal is a
-        // `\xHH`-escaped string cast to BLOB (NOT `x'..'`, which DuckDB parses as
-        // the VARCHAR "x.."). Corpus: fn-020.
         let sql = render_literal(&Literal {
             value: LiteralValue::Binary(vec![0x1F, 0x2A]),
             data_type: DataType::Binary,
@@ -7641,12 +7547,6 @@ mod tests {
         assert_eq!(sql, r"CAST('\x1F\x2A' AS BLOB)");
     }
 
-    /// Root cause 026: the DATE literal used to be built as
-    /// `DATE '1970-01-01' + INTERVAL (n) DAY`, which DuckDB promotes to
-    /// TIMESTAMP (`DATE ± INTERVAL` → TIMESTAMP). Build it with a plain
-    /// INTEGER day offset instead — `DATE + INTEGER` stays DATE in DuckDB —
-    /// so a bare `DATE '...'` literal collects back as date, not datetime.
-    /// Corpus: test_interval_date_arithmetic's `d` column.
     #[test]
     fn render_literal_date_uses_integer_offset_not_interval() {
         let sql = render_literal(&Literal {
@@ -7655,11 +7555,7 @@ mod tests {
         })
         .expect("render");
         assert_eq!(sql, "(DATE '1970-01-01' + (20103))");
-        assert!(
-            !sql.contains("INTERVAL"),
-            "DATE literal must not use INTERVAL construction (promotes to \
-             TIMESTAMP in DuckDB); got: {sql}"
-        );
+        assert!(!sql.contains("INTERVAL"));
     }
 
     #[test]
@@ -7677,8 +7573,6 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Project over a bare TableScan inlines `FROM emp`, avoiding an
-        // unnecessary `__td_proj` wrapper.
         assert_eq!(sql, "SELECT id FROM emp");
     }
 
@@ -13362,71 +13256,12 @@ mod tests {
         }
     }
 
-    // `explode` / `explode_outer` / `posexplode_val` / `posexplode_pos`
-    // land in the SELECT list; DuckDB expands `UNNEST(list)` to one row
-    // per element when it appears in a SELECT projection. See
-    // `render_function_call`'s arms. Corpus witnesses: arr-015, arr-016,
-    // arr-017.
-
     fn tags_col() -> Expression {
         col_with_type("tags", DataType::Array(Box::new(DataType::String), true))
     }
 
     fn tags2_col() -> Expression {
         col_with_type("tags2", DataType::Array(Box::new(DataType::String), true))
-    }
-
-    #[test]
-    fn render_explode_emits_unnest() {
-        let sql = render_fn("explode", vec![tags_col()]);
-        assert_eq!(sql, "UNNEST(tags)");
-    }
-
-    #[test]
-    fn render_explode_arity_error() {
-        let f = fcall("explode", vec![tags_col(), tags_col()]);
-        let err =
-            render_function_call(&f, &empty_schema()).expect_err("explode with 2 args must error");
-        expect_unsupported(err, UnsupportedKind::Function, "explode", &[]);
-    }
-
-    #[test]
-    fn render_explode_outer_wraps_empty_and_null_arrays() {
-        let sql = render_fn("explode_outer", vec![tags_col()]);
-        // Explode_outer must emit a one-NULL-row fallback for both NULL and
-        // empty arrays so the outer semantics hold.
-        assert_eq!(
-            sql,
-            "UNNEST(CASE WHEN tags IS NULL OR len(tags) = 0 THEN [NULL] ELSE tags END)"
-        );
-    }
-
-    #[test]
-    fn render_posexplode_pos_emits_zero_indexed_subscripts() {
-        let sql = render_fn("posexplode_pos", vec![tags_col()]);
-        // DuckDB `generate_subscripts` is 1-indexed; subtract 1 to align
-        // with Spark's 0-indexed posexplode.
-        assert_eq!(sql, "(generate_subscripts(tags, 1) - 1)");
-    }
-
-    #[test]
-    fn render_posexplode_val_emits_unnest() {
-        let sql = render_fn("posexplode_val", vec![tags_col()]);
-        assert_eq!(sql, "UNNEST(tags)");
-    }
-
-    /// Synthetic `map_explode_key(m)` / `map_explode_val(m)`
-    /// (produced by the v2 converter when it splits
-    /// `F.explode(map_col).alias("k", "v")` into two projections) emit
-    /// co-UNNESTed `map_keys` / `map_values` so DuckDB row-aligns the
-    /// key/value fan-out. Corpus witness: `map-007`.
-    #[test]
-    fn render_map_explode_key_and_val_emit_unnested_map_accessors() {
-        let m = col_ref_expr("attrs");
-        let k_sql = render_fn("map_explode_key", vec![m.clone()]);
-        let v_sql = render_fn("map_explode_val", vec![m]);
-        assert_eq!(k_sql, "UNNEST(map_keys(attrs))");
-        assert_eq!(v_sql, "UNNEST(map_values(attrs))");
     }
 
     /// τ remaps `arrays_overlap(a, b)` → DuckDB's `list_has_any(a, b)`;
@@ -15792,151 +15627,6 @@ mod tests {
         );
     }
 
-    /// Schema with an `arr : Array<Struct<name STRING?, dept_id INT?, salary DOUBLE?>>`
-    /// column — enough surface to test both plain and sentinel-wrapped forms.
-    fn arr_of_struct_schema() -> Schema {
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::nullable("dept_id", DataType::Integer),
-            StructField::nullable("salary", DataType::Double),
-        ]));
-        Schema::minted(StructType::new(vec![
-            StructField::not_null("id", DataType::Long),
-            StructField::nullable("arr", DataType::Array(Box::new(element), true)),
-        ]))
-    }
-
-    fn inline_field_args(field: &str) -> Vec<Expression> {
-        let element = DataType::Struct(StructType::new(vec![
-            StructField::nullable("name", DataType::String),
-            StructField::nullable("dept_id", DataType::Integer),
-            StructField::nullable("salary", DataType::Double),
-        ]));
-        vec![
-            Expression::ColumnReference(ColumnReference {
-                name: "arr".to_owned(),
-                qualifier: None,
-                data_type: DataType::Array(Box::new(element), true),
-                nullable: true,
-                expr_id: None,
-            }),
-            str_lit(field),
-        ]
-    }
-
-    /// Plain `inline_field(arr, "name")` renders as `UNNEST(arr).name`.
-    #[test]
-    fn render_inline_field_emits_unnest_dot_field() {
-        let sql = render_fn_on(
-            &arr_of_struct_schema(),
-            "inline_field",
-            inline_field_args("name"),
-        );
-        assert_eq!(sql, "UNNEST(arr).name");
-    }
-
-    /// `inline_outer_field(arr, "dept_id")` renders with the struct-typed
-    /// NULL sentinel guard so a NULL / empty array yields one all-NULL row.
-    /// Snapshot pins the exact sentinel shape.
-    #[test]
-    fn render_inline_outer_field_emits_case_guard_with_typed_null() {
-        let sql = render_fn_on(
-            &arr_of_struct_schema(),
-            "inline_outer_field",
-            inline_field_args("dept_id"),
-        );
-        assert_eq!(
-            sql,
-            "UNNEST(CASE WHEN arr IS NULL OR len(arr) = 0 \
-             THEN [struct_pack(\
-             name := CAST(NULL AS VARCHAR), \
-             dept_id := CAST(NULL AS INTEGER), \
-             salary := CAST(NULL AS DOUBLE))] \
-             ELSE arr END).dept_id",
-        );
-    }
-
-    /// Wrong arity → `UnsupportedFunction` (internal-corruption signal — the
-    /// analyzer's contract is 2 args, so this should never fire in practice).
-    #[test]
-    fn render_inline_field_rejects_wrong_arity() {
-        let schema = arr_of_struct_schema();
-        let f = fcall(
-            "inline_field",
-            vec![Expression::ColumnReference(ColumnReference {
-                name: "arr".to_owned(),
-                qualifier: None,
-                // Arity-rejection twin: the guard never reads the type.
-                data_type: DataType::Unresolved,
-                nullable: true,
-                expr_id: None,
-            })],
-        );
-        let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
-        expect_unsupported(
-            err,
-            UnsupportedKind::Function,
-            "inline_field",
-            &["2 arguments"],
-        );
-    }
-
-    fn json_str_schema() -> Schema {
-        Schema::minted(StructType::new(vec![
-            StructField::not_null("id", DataType::Long),
-            StructField::nullable("json_str", DataType::String),
-        ]))
-    }
-
-    /// `json_tuple_field(json_str, "a")` renders as
-    /// `json_extract_string(json_str, '$.a')` — same substrate as the
-    /// `get_json_object` session macro (session.rs:344).
-    #[test]
-    fn render_json_tuple_field_emits_json_extract_string() {
-        let sql = render_fn_on(
-            &json_str_schema(),
-            "json_tuple_field",
-            vec![
-                Expression::ColumnReference(ColumnReference {
-                    name: "json_str".to_owned(),
-                    qualifier: None,
-                    data_type: DataType::String,
-                    nullable: true,
-                    expr_id: None,
-                }),
-                str_lit("a"),
-            ],
-        );
-        assert_eq!(sql, "json_extract_string(json_str, '$.a')");
-    }
-
-    /// Wrong arity gets a graceful boundary error, NOT a panic: the name is
-    /// user-invokable directly (τ forwards unknown function names with no
-    /// allowlist), so the `expand_json_tuple_projections` choke point covers
-    /// only the calls it synthesizes — the emission guard is load-bearing.
-    #[test]
-    fn render_json_tuple_field_rejects_wrong_arity() {
-        let schema = json_str_schema();
-        let f = fcall(
-            "json_tuple_field",
-            vec![Expression::ColumnReference(ColumnReference {
-                name: "json_str".to_owned(),
-                qualifier: None,
-                // Arity-rejection twin: the guard never reads the type.
-                data_type: DataType::String,
-                nullable: true,
-                expr_id: None,
-            })],
-        );
-        let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
-        expect_unsupported(
-            err,
-            UnsupportedKind::Function,
-            "json_tuple_field",
-            &["2 arguments"],
-        );
-    }
-
     /// `parse_number_format` recognizes digit templates.
     #[test]
     fn parse_number_format_digit_template() {
@@ -16039,9 +15729,6 @@ mod tests {
         assert!(sql.contains(", b FROM"), "got: {sql}");
     }
 
-    /// Build a `TypedOp::LateralView` with a TableScan("emp") aliased "e"
-    /// and an `ARRAY<STRING>` tags column. Returns the TypedAst for the
-    /// LateralView operator ready for dispatch_op / render tests.
     fn emp_tags_schema() -> StructType {
         StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -16050,8 +15737,6 @@ mod tests {
         ])
     }
 
-    /// A resolved scan of `table`, optionally under the `AliasedRelation`
-    /// wrapper that now owns aliases (collapsed back to `FROM t AS a`).
     fn typed_table_scan(table: &str, alias: Option<&str>, schema: StructType) -> TypedAst {
         let scan = TypedAst::new(
             TypedOp::TableScan {
@@ -16059,249 +15744,184 @@ mod tests {
             },
             Schema::minted(schema.clone()),
         );
-        match alias {
-            None => scan,
-            Some(a) => TypedAst::new(
+        alias.map_or(scan.clone(), |alias| {
+            TypedAst::new(
                 TypedOp::AliasedRelation {
                     input: Box::new(scan),
-                    alias: a.to_owned(),
+                    alias: alias.to_owned(),
                 },
                 Schema::minted(schema),
-            ),
-        }
-    }
-
-    fn tags_col_ref() -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: "tags".to_owned(),
-            qualifier: Some("e".to_owned()),
-            data_type: DataType::Array(Box::new(DataType::String), true),
-            nullable: true,
-            expr_id: None,
+            )
         })
     }
 
-    fn lateral_view_typed(columns: Vec<(String, Expression)>, input: TypedAst) -> TypedAst {
-        // Freshly generated LateralView output columns — brand-new logical
-        // columns that did not exist before this point: MINT.
-        let gen_fields: Vec<Attribute> = columns
-            .iter()
-            .map(|(alias, expr)| {
-                Attribute::minted(
-                    alias.clone(),
-                    expr.data_type(&input.resolved_schema),
-                    expr.nullable(&input.resolved_schema),
-                )
-            })
-            .collect();
-        let resolved_schema = Schema::merge(&input.resolved_schema, &Schema::new(gen_fields));
-        TypedAst::new(
-            TypedOp::LateralView {
-                input: Box::new(input),
-                table_alias: "t".to_owned(),
-                columns,
+    fn generator_ast(
+        input: CommonAst,
+        name: &str,
+        args: Vec<Expression>,
+        aliases: &[&str],
+        qualifier: Option<&str>,
+    ) -> CommonAst {
+        let mut generator = Generator::from_function(name, args).expect("generator name");
+        generator.aliases = aliases.iter().map(|alias| (*alias).to_owned()).collect();
+        CommonAst::new(CommonOp::Generate {
+            input: Box::new(input),
+            generator,
+            qualifier: qualifier.map(str::to_owned),
+        })
+    }
+
+    fn generator_sql(ast: &CommonAst, schema: StructType) -> String {
+        let base_types =
+            BaseTypes::build_from_plan(ast, |name| (name == "emp").then(|| schema.clone()));
+        generate(ast, &base_types).expect("generate")
+    }
+
+    #[test]
+    fn render_explode_variants_from_generator_ir() {
+        for (name, aliases, expected) in [
+            ("explode", &["tag"][..], "UNNEST(tags)"),
+            (
+                "explode_outer",
+                &["tag"][..],
+                "UNNEST(CASE WHEN tags IS NULL",
+            ),
+            (
+                "posexplode",
+                &["pos", "tag"][..],
+                "generate_subscripts(tags, 1) - 1",
+            ),
+        ] {
+            let ast = generator_ast(
+                aliased_scan("emp", "e"),
+                name,
+                vec![qcol("e", "tags")],
+                aliases,
+                Some("t"),
+            );
+            let sql = generator_sql(&ast, emp_tags_schema());
+            assert_eq!(sql.matches("LATERAL (SELECT").count(), 1, "{sql}");
+            assert!(sql.contains(expected), "{sql}");
+            assert!(!sql.contains("__td_proj"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn render_map_posexplode_outer_uses_one_zipped_lateral_select() {
+        let schema = StructType::new(vec![StructField::not_null(
+            "attrs",
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Long),
+                value_nullable: false,
             },
-            resolved_schema,
-        )
+        )]);
+        let ast = generator_ast(
+            aliased_scan("emp", "e"),
+            "posexplode_outer",
+            vec![qcol("e", "attrs")],
+            &["pos", "key", "value"],
+            Some("t"),
+        );
+        let sql = generator_sql(&ast, schema);
+        assert_eq!(sql.matches("LATERAL (SELECT").count(), 1, "{sql}");
+        for fragment in [
+            "generate_subscripts(map_keys(attrs), 1) - 1",
+            "UNNEST(CASE WHEN attrs IS NULL OR cardinality(attrs) = 0 THEN [NULL] ELSE map_keys(attrs) END)",
+            "map_values(attrs)",
+        ] {
+            assert!(sql.contains(fragment), "{sql}");
+        }
     }
 
     #[test]
-    fn render_lateral_view_plain_explode() {
-        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
-        let lv = lateral_view_typed(
-            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
-            input,
+    fn render_json_tuple_accepts_dynamic_field_expressions() {
+        let schema = StructType::new(vec![
+            StructField::nullable("json", DataType::String),
+            StructField::nullable("key", DataType::String),
+        ]);
+        let ast = generator_ast(
+            aliased_scan("emp", "e"),
+            "json_tuple",
+            vec![qcol("e", "json"), qcol("e", "key")],
+            &["value"],
+            Some("t"),
         );
-        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
-        // cx-007 shape: SELECT * FROM emp AS e, LATERAL (SELECT UNNEST(e.tags) AS tag) AS t
+        let sql = generator_sql(&ast, schema);
         assert!(
-            sql.contains("LATERAL (SELECT"),
-            "must contain LATERAL(SELECT), got: {sql}"
-        );
-        assert!(
-            sql.contains("UNNEST(e.tags)"),
-            "must contain UNNEST(e.tags), got: {sql}"
-        );
-        assert!(sql.contains("AS tag"), "must alias as tag, got: {sql}");
-        assert!(
-            sql.contains("AS t"),
-            "must alias lateral table as t, got: {sql}"
-        );
-        assert!(
-            !sql.contains("__td_proj"),
-            "must not contain __td_proj, got: {sql}"
-        );
-    }
-
-    #[test]
-    fn render_lateral_view_outer_explode() {
-        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
-        let lv = lateral_view_typed(
-            vec![(
-                "tag".to_owned(),
-                fexpr("explode_outer", vec![tags_col_ref()]),
-            )],
-            input,
-        );
-        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
-        // cx-008 shape: the CASE-wrapped UNNEST should appear inside the
-        // LATERAL(SELECT...) wrapper.
-        assert!(
-            sql.contains("LATERAL (SELECT"),
-            "must contain LATERAL(SELECT), got: {sql}"
-        );
-        assert!(
-            sql.contains("CASE WHEN"),
-            "OUTER must use CASE rewrite, got: {sql}"
-        );
-        assert!(
-            sql.contains("UNNEST(CASE WHEN e.tags"),
-            "must contain UNNEST(CASE WHEN e.tags...), got: {sql}"
+            sql.contains(
+                "json_extract_string(json, '/' || replace(replace(key, '~', '~0'), '/', '~1'))"
+            ),
+            "{sql}"
         );
     }
 
     #[test]
-    fn render_lateral_view_posexplode_single_inner_select() {
-        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
-        let lv = lateral_view_typed(
-            vec![
-                (
-                    "pos".to_owned(),
-                    fexpr("posexplode_pos", vec![tags_col_ref()]),
-                ),
-                (
-                    "tag".to_owned(),
-                    fexpr("posexplode_val", vec![tags_col_ref()]),
-                ),
-            ],
-            input,
+    fn project_over_generate_keeps_lateral_from_visible() {
+        let generated = generator_ast(
+            aliased_scan("emp", "e"),
+            "explode",
+            vec![qcol("e", "tags")],
+            &["tag"],
+            Some("t"),
         );
-        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
-        // cx-009 shape: both columns in ONE inner SELECT.
-        let lateral_count = sql.matches("LATERAL (SELECT").count();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(generated),
+            projections: vec![qcol("e", "id"), qcol("t", "tag")],
+        });
+        let sql = generator_sql(&ast, emp_tags_schema());
+        assert!(sql.contains("SELECT id, tag FROM"), "{sql}");
+        assert!(sql.contains("LATERAL (SELECT"), "{sql}");
+        assert!(!sql.contains("__td_proj"), "{sql}");
+    }
+
+    #[test]
+    fn generate_over_range_extends_default_projection() {
+        let range = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args: vec![int_lit(3)],
+            with_ordinality: false,
+        });
+        let ast = generator_ast(
+            range,
+            "explode",
+            vec![fexpr("array", vec![int_lit(1), int_lit(2)])],
+            &["c"],
+            Some("t"),
+        );
+        let base_types = BaseTypes::build_from_plan(&ast, |_| None);
+        let sql = generate(&ast, &base_types).expect("generate");
+        assert!(sql.starts_with("SELECT id, t.c FROM range("), "{sql}");
+        assert!(sql.contains("AS __td_range(id)"), "{sql}");
+    }
+
+    #[test]
+    fn bare_generator_table_emits_one_lateral_source() {
+        let ast =
+            crate::parser_v2::SparkSqlParserV2::parse("SELECT * FROM explode(array(1, 2, 3))")
+                .expect("parse");
+        let sql = generate(&ast, &BaseTypes::build_from_plan(&ast, |_| None)).expect("generate");
         assert_eq!(
-            lateral_count, 1,
-            "posexplode must produce exactly one LATERAL(SELECT), got {lateral_count} in: {sql}"
-        );
-        assert!(
-            sql.contains("generate_subscripts"),
-            "pos column must use generate_subscripts, got: {sql}"
-        );
-        assert!(sql.contains("AS pos"), "must alias pos, got: {sql}");
-        assert!(sql.contains("AS tag"), "must alias tag, got: {sql}");
-        assert!(
-            !sql.contains("__td_proj"),
-            "must not contain __td_proj, got: {sql}"
+            sql,
+            "SELECT __td_gen.col FROM (SELECT 1) AS __td_sub, LATERAL \
+             (SELECT UNNEST(list_value(1, 2, 3))) AS __td_gen(col)"
         );
     }
 
     #[test]
-    fn render_project_over_lateral_view_no_td_proj() {
-        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
-        let lv = lateral_view_typed(
-            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
-            input,
+    fn unqualified_generator_avoids_input_alias_collision() {
+        let ast = generator_ast(
+            aliased_scan("emp", "__td_gen"),
+            "explode",
+            vec![qcol("__td_gen", "tags")],
+            &["tag"],
+            None,
         );
-        // Project[e.id, t.tag] over LateralView
-        let id_ref = Expression::ColumnReference(ColumnReference {
-            name: "id".to_owned(),
-            qualifier: Some("e".to_owned()),
-            data_type: DataType::Long,
-            nullable: false,
-            expr_id: None,
-        });
-        let tag_ref = Expression::ColumnReference(ColumnReference {
-            name: "tag".to_owned(),
-            qualifier: Some("t".to_owned()),
-            data_type: DataType::String,
-            nullable: true,
-            expr_id: None,
-        });
-        let proj = TypedAst::new(
-            TypedOp::Project {
-                input: Box::new(lv),
-                projections: vec![id_ref, tag_ref],
-            },
-            Schema::minted(StructType::new(vec![
-                StructField::not_null("id", DataType::Long),
-                StructField::nullable("tag", DataType::String),
-            ])),
-        );
-        let sql = dispatch_op(&proj.op, &proj.resolved_schema).expect("render");
-        // The output must NOT wrap in __td_proj — the alias-transparent-from
-        // arm must inline the LATERAL FROM body.
-        assert!(
-            !sql.contains("__td_proj"),
-            "Project-over-LateralView must not contain __td_proj, got: {sql}"
-        );
-        assert!(sql.contains("e.id"), "must reference e.id, got: {sql}");
-        assert!(sql.contains("t.tag"), "must reference t.tag, got: {sql}");
-        assert!(
-            sql.contains("LATERAL (SELECT"),
-            "must contain LATERAL(SELECT), got: {sql}"
-        );
+        let sql = generator_sql(&ast, emp_tags_schema());
+        assert!(sql.contains("emp AS __td_gen"), "{sql}");
+        assert!(sql.contains("AS __td_gen_2(tag)"), "{sql}");
     }
 
-    #[test]
-    fn lateral_view_over_range_appends_generated_column() {
-        // Regression pin (implementation constraint): `range(3)`'s FROM-item
-        // leaf carries a default `id` bind (tbl-006); a merged LateralView
-        // must widen that default list to include its own generated column
-        // too, or a downstream bare-star consumer would never see it.
-        let range_input = TypedAst::new(
-            TypedOp::TableFunction {
-                name: "range".to_owned(),
-                args: vec![int_lit(3)],
-                with_ordinality: false,
-            },
-            Schema::minted(StructType::new(vec![StructField::not_null(
-                "id",
-                DataType::Long,
-            )])),
-        );
-        let lv = lateral_view_typed(
-            vec![(
-                "c".to_owned(),
-                fexpr(
-                    "explode",
-                    vec![fexpr("array", vec![int_lit(1), int_lit(2)])],
-                ),
-            )],
-            range_input,
-        );
-        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
-        assert!(
-            sql.starts_with("SELECT id, t.c FROM range("),
-            "default projection must widen to include the generated column; got: {sql}"
-        );
-        assert!(
-            sql.contains("AS __td_range(id)"),
-            "range's own id bind must survive; got: {sql}"
-        );
-        assert!(
-            sql.contains("LATERAL (SELECT"),
-            "must contain LATERAL(SELECT), got: {sql}"
-        );
-    }
-
-    #[test]
-    fn lateral_view_over_table_scan_still_renders_star() {
-        // F3 no-op guard: a plain table-scan child has no default
-        // projections (`None`), so extending must stay a no-op — the merged
-        // block keeps rendering `SELECT *` (protects the cx-007..009 shape).
-        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
-        let lv = lateral_view_typed(
-            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
-            input,
-        );
-        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
-        assert!(
-            sql.starts_with("SELECT * FROM"),
-            "LateralView over a plain scan must still render SELECT *; got: {sql}"
-        );
-    }
-
-    /// E2E analyze + emit of the tbl-005 shape: the SQL must contain
     /// `CROSS JOIN LATERAL` and NOT contain `__td_jl`.
     #[test]
     fn render_lateral_join_cross_emits_lateral_keyword_no_td_jl() {

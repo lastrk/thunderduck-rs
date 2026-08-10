@@ -214,6 +214,33 @@ def spark(spark_thunderduck):
 
 # Data path fixtures
 
+def _integration_data_dir(directory: str, env_var: str) -> Path:
+    """Resolve shared generated benchmark data without coupling worktrees to a path.
+
+    A worktree owns its source and mutable test state, while its main checkout
+    owns the generated TPC data.  An explicit environment override remains
+    available for CI and custom fixtures.
+    """
+    if configured := os.environ.get(env_var):
+        return Path(configured).expanduser()
+
+    local_dir = Path(__file__).parent / directory
+    if local_dir.exists():
+        return local_dir
+
+    try:
+        common_git = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return local_dir
+
+    return Path(common_git).parent / "tests" / "integration" / directory
+
 @pytest.fixture(scope="session")
 def workspace_dir():
     """Path to workspace root directory"""
@@ -222,8 +249,8 @@ def workspace_dir():
 
 @pytest.fixture(scope="session")
 def tpch_data_dir():
-    """Path to TPC-H data directory (co-located with integration tests)"""
-    data_dir = Path(__file__).parent / "tpch_sf001"
+    """Path to TPC-H data, shared from the main checkout when in a worktree."""
+    data_dir = _integration_data_dir("tpch_sf001", "THUNDERDUCK_TPCH_DATA_DIR")
     if not data_dir.exists():
         pytest.skip(f"TPC-H data not found at {data_dir}. Please ensure data files exist.")
     return data_dir
@@ -309,12 +336,12 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture(scope="session")
 def tpcds_data_dir():
     """
-    Path to TPC-DS test data (co-located with integration tests).
+    Path to TPC-DS test data, shared from the main checkout when in a worktree.
 
     Auto-generates TPC-DS data at scale factor 0.01 if the directory doesn't exist.
     This ensures tests can run without manual data setup.
     """
-    data_dir = Path(__file__).parent / "tpcds_sf001"
+    data_dir = _integration_data_dir("tpcds_sf001", "THUNDERDUCK_TPCDS_DATA_DIR")
     if not data_dir.exists():
         print(f"\nTPC-DS data not found at {data_dir}")
         print("Auto-generating TPC-DS data (SF=0.01)...")

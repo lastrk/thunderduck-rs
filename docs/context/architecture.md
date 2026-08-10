@@ -1,6 +1,6 @@
 # Architecture Reference
 
-> **Scope: τ (the only production path per ADR-022).** This document is the condensed reference for the current transpiler. The authoritative design is [`docs/thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
+> **Scope: τ (the only production path per ADR-022).** This document is the condensed reference for the current transpiler. The authoritative design is [`docs/thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
 
 ## SQL Generation Architecture Principles
 
@@ -137,6 +137,14 @@ Both paths converge on the shared `CommonAst` before emission:
 Both paths flow through τ's analyzer for full type awareness before emission.
 
 **Implication**: type-inference and emission fixes affect both raw SQL and DataFrame queries.
+
+## Spark Connect plan IDs (ADR-026 target; implementation pending)
+
+A Connect `plan_id` locates a logical-plan node; it is not attribute lineage.
+ADR-026 replaces the current join-vector approximation with per-node optional
+IDs and a top-down resolver. Candidates survive only while their `ExprId`
+references remain in every ancestor output; join sides come from tree position,
+never stored ID sets. See the ADR for exact depth, star, `Union`, and error rules.
 
 ## Spark Parity Requirements
 

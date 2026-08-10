@@ -226,7 +226,7 @@ def _integration_data_dir(directory: str, env_var: str) -> Path:
     available for CI and custom fixtures.
     """
     if configured := os.environ.get(env_var):
-        return Path(configured)
+        return Path(configured).expanduser()
 
     local_dir = Path(__file__).parent / directory
     if local_dir.exists():

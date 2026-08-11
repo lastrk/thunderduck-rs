@@ -151,8 +151,9 @@ identity, generator, or function-registry work.
   unsupported error.
 - Replace the three Arrow interval uses of `RawSqlExpression` with a typed
   interval expression, then delete `RawSqlExpression` if no producer remains.
-  Coordinate this with the interval-span decision in
-  [`tasks/adr-025-draft-interval-field-span.md`](adr-025-draft-interval-field-span.md).
+  ADR-025 ratifies family-specific start/end spans on `DataType` and
+  `IntervalKind`; preserve those spans through SQL lowering, inference, and
+  both Connect type-conversion directions.
 - Do not preserve an empty `extension_targets()` list. Phase 1 may delete it if
   it has no live consumer; otherwise Phase 4 must derive it from the live
   function registry and activate the relevant invariant. Never add another

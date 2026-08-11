@@ -39,7 +39,7 @@ use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
 use crate::transpiler_v2::EmissionError;
 use crate::transpiler_v2::Qualifier;
-use crate::types::DataType;
+use crate::types::{DataType, DayTimeField, YearMonthField};
 
 /// Immutable CTE scope: folded CTE qualifier → its already-lowered body.
 ///
@@ -3690,7 +3690,7 @@ fn resolve_named_windows_in_expr(
 /// [`lower_compound_interval`], which supports the `YEAR TO MONTH` and
 /// `DAY TO SECOND` pairs. Every other compound pair, any precision-annotated
 /// form, non-literal, or unrepresentable-field shape is a Thunderduck-boundary
-/// error (ADR-022), never a RawSql fallback.
+/// error (ADR-022), never a SQL-text fallback.
 fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     if iv.last_field.is_some() {
         return lower_compound_interval(iv);
@@ -3714,26 +3714,30 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
         reason: format!("interval {unit} value overflows"),
     };
 
-    // Map the field to its Spark unit name (used in the overflow error name)
-    // plus the IntervalExpression slot it fills: `Months(factor)` multiplies
-    // `n` into months (×12 for YEAR), `Days` carries `n` verbatim, and
-    // `Micros(per_unit)` scales `n` into microseconds.
     enum Slot {
-        Months(i32),
+        Months(i32, YearMonthField),
         Days,
-        Micros(i64),
+        Micros(i64, DayTimeField),
     }
     let (unit, slot) = match field {
-        DateTimeField::Year | DateTimeField::Years => ("year", Slot::Months(12)),
-        DateTimeField::Month | DateTimeField::Months => ("month", Slot::Months(1)),
+        DateTimeField::Year | DateTimeField::Years => {
+            ("year", Slot::Months(12, YearMonthField::Year))
+        }
+        DateTimeField::Month | DateTimeField::Months => {
+            ("month", Slot::Months(1, YearMonthField::Month))
+        }
         DateTimeField::Day | DateTimeField::Days => ("day", Slot::Days),
-        DateTimeField::Hour | DateTimeField::Hours => ("hour", Slot::Micros(MICROS_PER_HOUR)),
-        DateTimeField::Minute | DateTimeField::Minutes => {
-            ("minute", Slot::Micros(MICROS_PER_MINUTE))
+        DateTimeField::Hour | DateTimeField::Hours => {
+            ("hour", Slot::Micros(MICROS_PER_HOUR, DayTimeField::Hour))
         }
-        DateTimeField::Second | DateTimeField::Seconds => {
-            ("second", Slot::Micros(MICROS_PER_SECOND))
-        }
+        DateTimeField::Minute | DateTimeField::Minutes => (
+            "minute",
+            Slot::Micros(MICROS_PER_MINUTE, DayTimeField::Minute),
+        ),
+        DateTimeField::Second | DateTimeField::Seconds => (
+            "second",
+            Slot::Micros(MICROS_PER_SECOND, DayTimeField::Second),
+        ),
         other => {
             bail_boundary_proto!(
                 "sql::expr::interval::unsupported_field",
@@ -3742,47 +3746,34 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
         }
     };
     let ie = match slot {
-        // The ×1 MONTH multiply can't overflow, but keep the checked path
-        // for uniformity with YEAR. Spark types single-field YEAR/MONTH
-        // literals as `YearMonthIntervalType`, but `Date ± {YEAR,MONTH}
-        // interval` stays `DATE` either way (see `date_like_interval_result`
-        // — `IntervalKind::YearMonth` and `IntervalKind::Calendar` both hit
-        // its stay-`Date` arm), so re-kinding these to `YearMonth` is out of
-        // scope for the interval semantics.
-        Slot::Months(factor) => IntervalExpression {
+        Slot::Months(factor, field) => IntervalExpression {
             months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
             days: 0,
             microseconds: 0,
-            kind: IntervalKind::Calendar,
+            kind: IntervalKind::YearMonth {
+                start: field,
+                end: field,
+            },
         },
-        // Single-field DAY deliberately STAYS `Calendar`, not `DayTime`.
-        // Spark types `INTERVAL '1' DAY` as `DayTimeIntervalType(DAY, DAY)`
-        // and keeps `Date + INTERVAL '1' DAY` as `DATE` (live-probed against
-        // Spark 4.1.1 Connect, R1-6). τ's `DataType::DayTimeInterval` is
-        // field-less, so kind=DayTime would wrongly promote this to
-        // `TIMESTAMP` via `date_like_interval_result`'s new promoting arm,
-        // which is calibrated for spans that DO contain a sub-day field
-        // (`DAY TO SECOND` compounds, `make_dt_interval`). Kind=Calendar
-        // correctly routes day-only literals to the stay-`Date` arm.
         Slot::Days => IntervalExpression {
             months: 0,
             days: n,
             microseconds: 0,
-            kind: IntervalKind::Calendar,
+            kind: IntervalKind::DayTime {
+                start: DayTimeField::Day,
+                end: DayTimeField::Day,
+            },
         },
-        // Single-field HOUR/MINUTE/SECOND are `DayTimeIntervalType` spans
-        // that always contain a sub-day field, so Spark promotes
-        // `Date ± {HOUR,MINUTE,SECOND} interval` to `TIMESTAMP` (R1-6).
-        // Kind=DayTime routes these into `date_like_interval_result`'s
-        // promoting arm; the emitted SQL value is unaffected (`render_interval`
-        // renders months/days/microseconds verbatim, kind-agnostic).
-        Slot::Micros(per_unit) => IntervalExpression {
+        Slot::Micros(per_unit, field) => IntervalExpression {
             months: 0,
             days: 0,
             microseconds: i64::from(n)
                 .checked_mul(per_unit)
                 .ok_or_else(|| overflow(unit))?,
-            kind: IntervalKind::DayTime,
+            kind: IntervalKind::DayTime {
+                start: field,
+                end: field,
+            },
         },
     };
     Ok(Expression::Interval(ie))
@@ -3814,12 +3805,9 @@ fn extract_interval_string(expr: &Expr) -> Option<&str> {
     }
 }
 
-/// Lower a compound (`X TO Y`) interval literal. Supports ONLY the singular
-/// field pairs `YEAR TO MONTH` → [`IntervalKind::YearMonth`] and `DAY TO
-/// SECOND` → [`IntervalKind::DayTime`], the only two pairs that τ's field-less
-/// interval `DataType`s encode wire-exactly. Every
-/// other pair, or any field precision, is the existing
-/// `sql::expr::interval::compound` Thunderduck boundary (ADR-022).
+/// Lower a compound (`X TO Y`) interval literal. The supported full-family
+/// pairs are `YEAR TO MONTH` and `DAY TO SECOND`; other pairs and field
+/// precision remain at the existing Thunderduck boundary.
 fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
     if iv.leading_precision.is_some() || iv.fractional_seconds_precision.is_some() {
         bail_boundary_proto!(
@@ -3847,7 +3835,10 @@ fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
                 months,
                 days: 0,
                 microseconds: 0,
-                kind: IntervalKind::YearMonth,
+                kind: IntervalKind::YearMonth {
+                    start: YearMonthField::Year,
+                    end: YearMonthField::Month,
+                },
             }))
         }
         (DateTimeField::Day, DateTimeField::Second) => {
@@ -3856,7 +3847,10 @@ fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
                 months: 0,
                 days,
                 microseconds,
-                kind: IntervalKind::DayTime,
+                kind: IntervalKind::DayTime {
+                    start: DayTimeField::Day,
+                    end: DayTimeField::Second,
+                },
             }))
         }
         (l, r) => {
@@ -6771,11 +6765,13 @@ mod tests {
                 assert_eq!(ie.days, 90);
                 assert_eq!(ie.months, 0);
                 assert_eq!(ie.microseconds, 0);
-                // Scope guard: single-field DAY stays generic Calendar
-                // deliberately — `Date + INTERVAL '1' DAY` must stay `DATE`
-                // (R1-6), and τ's field-less `DayTimeInterval` type would
-                // wrongly promote it to `TIMESTAMP` if kinded `DayTime`.
-                assert_eq!(ie.kind, IntervalKind::Calendar);
+                assert_eq!(
+                    ie.kind,
+                    IntervalKind::DayTime {
+                        start: DayTimeField::Day,
+                        end: DayTimeField::Day,
+                    }
+                );
             }
             other => panic!("expected Interval, got {other:?}"),
         }
@@ -6793,14 +6789,17 @@ mod tests {
 
     #[test]
     fn interval_literal_hour_lowers_to_day_time_interval() {
-        // Single-field HOUR/MINUTE/SECOND are always sub-day spans, so they
-        // re-kind to `DayTime` (R1-6): `Date + INTERVAL '25' HOUR` promotes
-        // to `TIMESTAMP` in Spark, unlike day-only `INTERVAL '1' DAY`.
         let ie = first_interval("SELECT INTERVAL '25' HOUR AS ivl");
         assert_eq!(ie.months, 0);
         assert_eq!(ie.days, 0);
         assert_eq!(ie.microseconds, 25 * 3_600 * 1_000_000);
-        assert_eq!(ie.kind, IntervalKind::DayTime);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::DayTime {
+                start: DayTimeField::Hour,
+                end: DayTimeField::Hour,
+            }
+        );
     }
 
     #[test]
@@ -6809,7 +6808,13 @@ mod tests {
         assert_eq!(ie.months, 14);
         assert_eq!(ie.days, 0);
         assert_eq!(ie.microseconds, 0);
-        assert_eq!(ie.kind, IntervalKind::YearMonth);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::YearMonth {
+                start: YearMonthField::Year,
+                end: YearMonthField::Month,
+            }
+        );
     }
 
     #[test]
@@ -6818,7 +6823,13 @@ mod tests {
         assert_eq!(ie.days, 1);
         assert_eq!(ie.months, 0);
         assert_eq!(ie.microseconds, 9_000_000_000);
-        assert_eq!(ie.kind, IntervalKind::DayTime);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::DayTime {
+                start: DayTimeField::Day,
+                end: DayTimeField::Second,
+            }
+        );
     }
 
     #[test]
@@ -6826,7 +6837,13 @@ mod tests {
         let ie = first_interval("SELECT INTERVAL '1 02:30:00.123456' DAY TO SECOND AS dts");
         assert_eq!(ie.days, 1);
         assert_eq!(ie.microseconds, 9_000_123_456);
-        assert_eq!(ie.kind, IntervalKind::DayTime);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::DayTime {
+                start: DayTimeField::Day,
+                end: DayTimeField::Second,
+            }
+        );
     }
 
     #[test]
@@ -6840,7 +6857,13 @@ mod tests {
     fn interval_year_to_month_negative_sign() {
         let ie = first_interval("SELECT INTERVAL '-1-2' YEAR TO MONTH AS ym");
         assert_eq!(ie.months, -14);
-        assert_eq!(ie.kind, IntervalKind::YearMonth);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::YearMonth {
+                start: YearMonthField::Year,
+                end: YearMonthField::Month,
+            }
+        );
     }
 
     #[test]
@@ -6848,7 +6871,13 @@ mod tests {
         let ie = first_interval("SELECT INTERVAL '-1 02:30:00' DAY TO SECOND AS dts");
         assert_eq!(ie.days, -1);
         assert_eq!(ie.microseconds, -9_000_000_000);
-        assert_eq!(ie.kind, IntervalKind::DayTime);
+        assert_eq!(
+            ie.kind,
+            IntervalKind::DayTime {
+                start: DayTimeField::Day,
+                end: DayTimeField::Second,
+            }
+        );
     }
 
     #[test]
@@ -6892,13 +6921,29 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         let field = &typed.resolved_schema.fields[0];
         assert_eq!(field.name, "ym");
-        assert_eq!(field.data_type, DataType::YearMonthInterval);
+        assert_eq!(field.data_type, DataType::year_month_full());
         assert!(!field.nullable);
 
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("emit");
         assert!(
             sql.contains("INTERVAL '14 months 0 days 0 microseconds'"),
             "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn interval_hour_projection_preserves_exact_analyzed_span() {
+        use crate::transpiler_v2::analyzer::analyze;
+        use crate::transpiler_v2::base_types::BaseTypes;
+
+        let plan = parse("SELECT INTERVAL '3' HOUR AS h").expect("parse");
+        let typed = analyze(plan, &BaseTypes::empty()).expect("analyze");
+        assert_eq!(
+            typed.resolved_schema.fields[0].data_type,
+            DataType::DayTimeInterval {
+                start: DayTimeField::Hour,
+                end: DayTimeField::Hour,
+            }
         );
     }
 

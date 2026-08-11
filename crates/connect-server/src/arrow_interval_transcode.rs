@@ -85,11 +85,11 @@ impl IntervalPlan {
             .fields
             .iter()
             .map(|f| match &f.data_type {
-                TdckDt::DayTimeInterval => {
+                TdckDt::DayTimeInterval { .. } => {
                     all_noop = false;
                     IntervalTarget::DayTimeToDurationMicros
                 }
-                TdckDt::YearMonthInterval => {
+                TdckDt::YearMonthInterval { .. } => {
                     all_noop = false;
                     IntervalTarget::YearMonthPassthrough
                 }
@@ -249,7 +249,7 @@ mod tests {
     fn plan_is_not_noop_when_daytime_present() {
         let plan = IntervalPlan::build(&tdck_struct(vec![
             ("i", TdckDt::Long),
-            ("dt", TdckDt::DayTimeInterval),
+            ("dt", TdckDt::day_time_full()),
         ]));
         assert!(!plan.is_noop());
     }
@@ -280,7 +280,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(src)]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::day_time_full())]));
 
         let out = apply(&batch, &plan).expect("apply must succeed");
         assert_eq!(out.len(), 1);
@@ -306,7 +306,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(src)]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::day_time_full())]));
 
         let out = apply(&batch, &plan).expect("apply must succeed");
         let arr = out[0]
@@ -332,7 +332,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(src)]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::day_time_full())]));
 
         let out = apply(&batch, &plan).expect("apply must succeed");
         let arr = out[0]
@@ -358,7 +358,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(bogus) as ArrayRef]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::day_time_full())]));
 
         match apply(&batch, &plan) {
             Err(TranscodeError::UnexpectedArrowType { col: 0, tdck, .. }) => {
@@ -381,7 +381,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::clone(&src_arc)]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("ymi", TdckDt::YearMonthInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("ymi", TdckDt::year_month_full())]));
 
         let out = apply(&batch, &plan).expect("passthrough must succeed");
         assert_eq!(out.len(), 1);
@@ -406,7 +406,7 @@ mod tests {
             true,
         )]));
         let batch = RecordBatch::try_new(Arc::clone(&src_schema), vec![Arc::new(src)]).unwrap();
-        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::DayTimeInterval)]));
+        let plan = IntervalPlan::build(&tdck_struct(vec![("dt", TdckDt::day_time_full())]));
 
         let cols = apply(&batch, &plan).expect("apply must succeed");
         assert_eq!(cols.len(), 1);

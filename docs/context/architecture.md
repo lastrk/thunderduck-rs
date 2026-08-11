@@ -133,7 +133,7 @@ Expression (enum)
   Star                  # *
   InSubquery / ExistsSubquery / ScalarSubquery
   Lambda / LambdaVariable    # HOF lambdas (transform, filter, etc.)
-  RawSql                # raw SQL passthrough from spark.expr()
+  Interval              # typed calendar/year-month/day-time value
   ArrayLiteral / MapLiteral / StructLiteral
 ```
 

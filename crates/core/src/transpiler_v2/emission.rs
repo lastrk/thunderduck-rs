@@ -2966,7 +2966,6 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             }
         }
         Expression::LambdaVariable(lv) => Ok(quote_ident(&lv.name).into_owned()),
-        Expression::RawSql(r) => Ok(r.sql.clone()),
         Expression::ArrayLiteral(a) => render_array_literal(a, schema),
         Expression::MapLiteral(m) => render_map_literal(m, schema),
         Expression::StructLiteral(s) => render_struct_literal(s, schema),
@@ -6785,9 +6784,9 @@ pub(crate) fn render_data_type(dt: &DataType) -> String {
         DataType::Date => "DATE".to_owned(),
         DataType::Timestamp => "TIMESTAMP WITH TIME ZONE".to_owned(),
         DataType::TimestampNtz => "TIMESTAMP".to_owned(),
-        DataType::YearMonthInterval | DataType::DayTimeInterval | DataType::Interval => {
-            "INTERVAL".to_owned()
-        }
+        DataType::YearMonthInterval { .. }
+        | DataType::DayTimeInterval { .. }
+        | DataType::Interval => "INTERVAL".to_owned(),
         DataType::Null => "INTEGER".to_owned(), // best-effort; NULL cast target.
         DataType::Unresolved => "VARCHAR".to_owned(),
         DataType::Array(elem, _) => format!("{}[]", render_data_type(elem)),
@@ -6865,7 +6864,7 @@ mod tests {
     };
     use crate::transpiler_v2::schema::Attribute;
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
-    use crate::types::StructField;
+    use crate::types::{StructField, YearMonthField};
 
     fn empty_schema() -> Schema {
         Schema::empty()
@@ -11700,7 +11699,10 @@ mod tests {
             months: 14,
             days: 0,
             microseconds: 0,
-            kind: IntervalKind::YearMonth,
+            kind: IntervalKind::YearMonth {
+                start: YearMonthField::Year,
+                end: YearMonthField::Month,
+            },
         };
         let cal = IntervalExpression {
             months: 14,
@@ -14644,7 +14646,10 @@ mod tests {
             months: 1,
             days: 0,
             microseconds: 0,
-            kind: IntervalKind::YearMonth,
+            kind: IntervalKind::YearMonth {
+                start: YearMonthField::Month,
+                end: YearMonthField::Month,
+            },
         };
         let b = BinaryExpression {
             op: BinaryOp::Add,

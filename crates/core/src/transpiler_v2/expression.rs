@@ -12,7 +12,7 @@ use super::identifier::Qualifier;
 use super::name_fold::eq_fold;
 use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
-use crate::types::{DataType, StructField, StructType};
+use crate::types::{DataType, DayTimeField, StructField, StructType, YearMonthField};
 
 /// Extract a compile-time integer value from an integral [`Literal`] expression.
 ///
@@ -474,14 +474,6 @@ pub struct LambdaVariableExpression {
     pub name: String,
 }
 
-/// Raw SQL passthrough (from `spark.expr(...)`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct RawSqlExpression {
-    pub sql: String,
-    pub data_type: Option<DataType>,
-    pub nullable: Option<bool>,
-}
-
 /// Array literal `array(a, b, c)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrayLiteralExpression {
@@ -539,11 +531,17 @@ pub struct LikeExpression {
 /// schema surfaces the correct Spark type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntervalKind {
-    /// Spark `YearMonthIntervalType` — compound `YEAR TO MONTH` literals.
-    YearMonth,
-    /// Spark `DayTimeIntervalType` — compound `DAY TO SECOND` literals.
-    DayTime,
-    /// Spark `CalendarIntervalType` — single-field / generic interval literals.
+    /// Spark `YearMonthIntervalType` with its declared field span.
+    YearMonth {
+        start: YearMonthField,
+        end: YearMonthField,
+    },
+    /// Spark `DayTimeIntervalType` with its declared field span.
+    DayTime {
+        start: DayTimeField,
+        end: DayTimeField,
+    },
+    /// Spark `CalendarIntervalType`.
     Calendar,
 }
 
@@ -608,7 +606,6 @@ pub enum Expression {
     ScalarSubquery(ScalarSubquery),
     Lambda(LambdaExpression),
     LambdaVariable(LambdaVariableExpression),
-    RawSql(RawSqlExpression),
     ArrayLiteral(ArrayLiteralExpression),
     MapLiteral(MapLiteralExpression),
     StructLiteral(StructLiteralExpression),
@@ -636,7 +633,6 @@ macro_rules! expression_children {
             | Expression::UnresolvedRegex(_)
             | Expression::Star(_)
             | Expression::LambdaVariable(_)
-            | Expression::RawSql(_)
             | Expression::Interval(_)
             | Expression::ExistsSubquery(_)
             | Expression::ScalarSubquery(_) => Box::new(std::iter::empty()),
@@ -748,7 +744,6 @@ impl Expression {
             },
             Expression::Lambda(l) => l.body.data_type(schema),
             Expression::LambdaVariable(lv) => TypeInferenceEngine::column_type(&lv.name, schema),
-            Expression::RawSql(r) => r.data_type.clone().unwrap_or(DataType::Unresolved),
             Expression::ArrayLiteral(a) => {
                 let contains_null = a
                     .elements
@@ -780,8 +775,10 @@ impl Expression {
             | Expression::Like(_)
             | Expression::IsDistinctFrom(_) => DataType::Boolean,
             Expression::Interval(i) => match i.kind {
-                IntervalKind::YearMonth => DataType::YearMonthInterval,
-                IntervalKind::DayTime => DataType::DayTimeInterval,
+                IntervalKind::YearMonth { start, end } => {
+                    DataType::YearMonthInterval { start, end }
+                }
+                IntervalKind::DayTime { start, end } => DataType::DayTimeInterval { start, end },
                 IntervalKind::Calendar => DataType::Interval,
             },
             Expression::ExtractValue(ev) => Self::extract_value_data_type(ev, schema),
@@ -850,7 +847,6 @@ impl Expression {
             Expression::LambdaVariable(lv) => {
                 TypeInferenceEngine::column_nullable(&lv.name, schema)
             }
-            Expression::RawSql(r) => r.nullable.unwrap_or(true),
             Expression::ArrayLiteral(_)
             | Expression::MapLiteral(_)
             | Expression::StructLiteral(_) => false,
@@ -933,9 +929,8 @@ impl Expression {
     /// (analyzed lazily by its consumer function — its body closes over its
     /// own bound `LambdaVariable`, not the walker's outer scope),
     /// `LambdaVariable` (a leaf bound by its enclosing `Lambda`, never a
-    /// column reference some other walker should rewrite), `RawSql`, and
-    /// `Interval` (both already carry their own final type, never derived by
-    /// a walker).
+    /// column reference some other walker should rewrite), and `Interval`
+    /// (which already carries its final type).
     ///
     /// This is the shared CORE only. Some walkers add variants for reasons
     /// specific to that walk: [`Expression::is_resolve_opaque`] also includes
@@ -944,10 +939,7 @@ impl Expression {
     pub(crate) fn is_opaque_unit(&self) -> bool {
         matches!(
             self,
-            Expression::Lambda(_)
-                | Expression::LambdaVariable(_)
-                | Expression::RawSql(_)
-                | Expression::Interval(_)
+            Expression::Lambda(_) | Expression::LambdaVariable(_) | Expression::Interval(_)
         )
     }
 
@@ -984,7 +976,7 @@ impl Expression {
                 | (DataType::TimestampNtz, DataType::TimestampNtz)
                 | (DataType::Timestamp, DataType::TimestampNtz)
                 | (DataType::TimestampNtz, DataType::Timestamp) => {
-                    return DataType::DayTimeInterval;
+                    return DataType::day_time_full();
                 }
                 _ => {}
             }
@@ -1591,34 +1583,8 @@ impl Expression {
 // see `CastExpression::implicit`'s doc for the naming/semantic_eq
 // transparency contract that makes this safe.
 
-/// The Add/Sub date-preserving match extracted from `binary_data_type`:
-/// `Interval ± Date/Timestamp` preserves the date-like side, EXCEPT that
-/// `Date ± DayTimeInterval` *promotes* to `Timestamp` (Spark: `Date +
-/// YearMonthIntervalType` and `Date + CalendarIntervalType` stay `DATE`, but
-/// `Date + DayTimeIntervalType` — any field span containing a sub-day unit —
-/// widens to `TIMESTAMP` per Catalyst's `DateAddInterval`/type-coercion
-/// rules). This is the single home of that rule: preserving `Date` for
-/// `DATE ± INTERVAL '25' HOUR`-shaped expressions would silently truncate the
-/// time of day.
-///
-/// τ's `DataType::DayTimeInterval` is field-less (see `types::data_type`), so
-/// it cannot distinguish `DayTimeIntervalType(DAY)` (day-only span, Spark:
-/// stays `DATE`) from `DAY TO SECOND` (Spark: promotes). τ resolves this by
-/// construction: every producer of `Expression::Interval` with
-/// `IntervalKind::DayTime` in τ today is already a full/sub-day span —
-/// `DAY TO SECOND` compound SQL literals and `make_dt_interval(...)` — so
-/// `DayTimeInterval` ⟹ "has a sub-day field" holds for τ's actual inputs. A
-/// single-field `INTERVAL '1' DAY` literal deliberately lowers as
-/// `IntervalKind::Calendar` (not `DayTime`) precisely so it does NOT hit this
-/// promoting arm — see `lower_interval`'s `Slot::Days` comment. One class of
-/// producer the by-construction argument does NOT cover: `DayTimeInterval`
-/// COLUMNS arriving over the wire (Arrow `Duration(Microsecond)` and proto
-/// `DayTimeInterval` schema kinds), whose user-supplied field span is
-/// discarded by τ's field-less type. A day-only such column added to a
-/// `Date` now over-promotes to `Timestamp` (Spark keeps `DATE`) — an
-/// accepted trade-off: the common `datetime.timedelta` column is the full
-/// `DAY TO SECOND` span, which this arm now types correctly and the old
-/// always-`Date` rule silently truncated.
+/// `Interval ± Date/Timestamp` preserves the date-like side, except a
+/// day-time span ending in a sub-day field promotes `Date` to `Timestamp`.
 ///
 /// Shared by `binary_data_type`'s own inference and
 /// [`materialize_binary_coercions`]'s Date rule (which fires only on
@@ -1631,8 +1597,12 @@ fn date_like_interval_result(op: &BinaryOp, l: &DataType, r: &DataType) -> Optio
         return None;
     }
     match (l, r) {
-        (DataType::Date, DataType::DayTimeInterval)
-        | (DataType::DayTimeInterval, DataType::Date) => Some(DataType::Timestamp),
+        (DataType::Date, DataType::DayTimeInterval { end, .. })
+        | (DataType::DayTimeInterval { end, .. }, DataType::Date)
+            if *end != DayTimeField::Day =>
+        {
+            Some(DataType::Timestamp)
+        }
         (DataType::Date, dt) | (dt, DataType::Date) if dt.is_interval() => Some(DataType::Date),
         (DataType::Timestamp, dt) | (dt, DataType::Timestamp) if dt.is_interval() => {
             Some(DataType::Timestamp)
@@ -3163,12 +3133,26 @@ mod tests {
             })
         };
         assert_eq!(
-            with_kind(IntervalKind::YearMonth).data_type(&schema),
-            DataType::YearMonthInterval
+            with_kind(IntervalKind::YearMonth {
+                start: YearMonthField::Month,
+                end: YearMonthField::Month,
+            })
+            .data_type(&schema),
+            DataType::YearMonthInterval {
+                start: YearMonthField::Month,
+                end: YearMonthField::Month,
+            }
         );
         assert_eq!(
-            with_kind(IntervalKind::DayTime).data_type(&schema),
-            DataType::DayTimeInterval
+            with_kind(IntervalKind::DayTime {
+                start: DayTimeField::Hour,
+                end: DayTimeField::Minute,
+            })
+            .data_type(&schema),
+            DataType::DayTimeInterval {
+                start: DayTimeField::Hour,
+                end: DayTimeField::Minute,
+            }
         );
         assert_eq!(
             with_kind(IntervalKind::Calendar).data_type(&schema),
@@ -3180,8 +3164,14 @@ mod tests {
     fn interval_literal_is_non_nullable_for_all_kinds() {
         let schema = ResolvedSchema::empty();
         for kind in [
-            IntervalKind::YearMonth,
-            IntervalKind::DayTime,
+            IntervalKind::YearMonth {
+                start: YearMonthField::Year,
+                end: YearMonthField::Month,
+            },
+            IntervalKind::DayTime {
+                start: DayTimeField::Day,
+                end: DayTimeField::Second,
+            },
             IntervalKind::Calendar,
         ] {
             let expr = Expression::Interval(IntervalExpression {
@@ -3208,7 +3198,10 @@ mod tests {
             months: 0,
             days: 0,
             microseconds: 25 * 3_600 * 1_000_000,
-            kind: IntervalKind::DayTime,
+            kind: IntervalKind::DayTime {
+                start: DayTimeField::Hour,
+                end: DayTimeField::Hour,
+            },
         })
     }
 
@@ -3217,7 +3210,10 @@ mod tests {
             months: 2,
             days: 0,
             microseconds: 0,
-            kind: IntervalKind::YearMonth,
+            kind: IntervalKind::YearMonth {
+                start: YearMonthField::Month,
+                end: YearMonthField::Month,
+            },
         })
     }
 
@@ -3402,6 +3398,34 @@ mod tests {
             day_time_interval(),
         );
         assert_eq!(expr.data_type(&schema), DataType::Timestamp);
+    }
+
+    #[test]
+    fn date_plus_day_only_interval_column_infers_date() {
+        let schema = ResolvedSchema::minted(StructType::new(vec![
+            StructField::nullable("d", DataType::Date),
+            StructField::nullable(
+                "iv",
+                DataType::DayTimeInterval {
+                    start: DayTimeField::Day,
+                    end: DayTimeField::Day,
+                },
+            ),
+        ]));
+        let expr = bin(
+            BinaryOp::Add,
+            UnresolvedColumn::bare("d"),
+            UnresolvedColumn::bare("iv"),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Date);
+        assert!(matches!(
+            materialize_binary_coercions(expr, &schema),
+            Expression::Cast(CastExpression {
+                to_type: DataType::Date,
+                implicit: true,
+                ..
+            })
+        ));
     }
 
     #[test]

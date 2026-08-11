@@ -4,5 +4,5 @@ pub mod pyspark_parity;
 pub mod spark_ddl;
 mod struct_type;
 
-pub use data_type::DataType;
+pub use data_type::{DataType, DayTimeField, YearMonthField};
 pub use struct_type::{StructField, StructType};

@@ -36,10 +36,10 @@ use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
     decimal_value_precision_scale, AliasExpression, ArrayLiteralExpression, BinaryExpression,
     BinaryOp, CaseWhenExpression, CastExpression, Expression, ExtractValueExpression, FunctionCall,
-    InListExpression, LambdaExpression, LambdaVariableExpression, Literal, LiteralValue,
-    MapLiteralExpression, NullOrdering, RawSqlExpression, SortDirection, SortOrder, StarExpression,
-    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
-    UpdateFieldsExpression, WindowFunction,
+    InListExpression, IntervalExpression, IntervalKind, LambdaExpression, LambdaVariableExpression,
+    Literal, LiteralValue, MapLiteralExpression, NullOrdering, SortDirection, SortOrder,
+    StarExpression, StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
+    UnresolvedRegexExpression, UpdateFieldsExpression, WindowFunction,
 };
 use thunderduck_core::transpiler_v2::generator::Generator;
 use thunderduck_core::transpiler_v2::identifier::SqlIdentifierError;
@@ -47,7 +47,7 @@ use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::{
     parse_multipart_identifier, parse_sql_multipart_identifier, EmissionError, Qualifier,
 };
-use thunderduck_core::types::{DataType, StructField, StructType};
+use thunderduck_core::types::{DataType, DayTimeField, StructField, StructType, YearMonthField};
 
 use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
 use crate::proto::spark::connect as proto;
@@ -1888,8 +1888,8 @@ pub(crate) fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, Emission
             precision: *p,
             scale: *s as u8,
         },
-        ArrowDT::Duration(TimeUnit::Microsecond) => DataType::DayTimeInterval,
-        ArrowDT::Interval(IntervalUnit::YearMonth) => DataType::YearMonthInterval,
+        ArrowDT::Duration(TimeUnit::Microsecond) => DataType::day_time_full(),
+        ArrowDT::Interval(IntervalUnit::YearMonth) => DataType::year_month_full(),
         ArrowDT::Interval(IntervalUnit::MonthDayNano) => DataType::Interval,
         ArrowDT::List(f) | ArrowDT::LargeList(f) => DataType::Array(
             Box::new(arrow_data_type_to_core(f.data_type())?),
@@ -2081,42 +2081,38 @@ pub(crate) fn arrow_val_to_literal(
                 fields: out,
             }))
         }
-        // τ has no interval LiteralValue, so preserve the Arrow interval with
-        // typed RawSql using DuckDB's interval constructors.
         ArrowDT::Duration(TimeUnit::Microsecond) => {
             let a = downcast::<DurationMicrosecondArray>(array)?;
-            let micros: i64 = a.value(row);
-            let sql = format!("to_microseconds(CAST({micros} AS BIGINT))");
-            Ok(Expression::RawSql(RawSqlExpression {
-                sql,
-                data_type: Some(DataType::DayTimeInterval),
-                nullable: Some(false),
+            Ok(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 0,
+                microseconds: a.value(row),
+                kind: IntervalKind::DayTime {
+                    start: DayTimeField::Day,
+                    end: DayTimeField::Second,
+                },
             }))
         }
         ArrowDT::Interval(IntervalUnit::YearMonth) => {
             let a = downcast::<IntervalYearMonthArray>(array)?;
-            let total_months: i32 = a.value(row);
-            let sql = format!("to_months(CAST({total_months} AS INTEGER))");
-            Ok(Expression::RawSql(RawSqlExpression {
-                sql,
-                data_type: Some(DataType::YearMonthInterval),
-                nullable: Some(false),
+            Ok(Expression::Interval(IntervalExpression {
+                months: a.value(row),
+                days: 0,
+                microseconds: 0,
+                kind: IntervalKind::YearMonth {
+                    start: YearMonthField::Year,
+                    end: YearMonthField::Month,
+                },
             }))
         }
         ArrowDT::Interval(IntervalUnit::MonthDayNano) => {
             let a = downcast::<IntervalMonthDayNanoArray>(array)?;
             let v = a.value(row);
-            let micros = v.nanoseconds / 1_000;
-            let sql = format!(
-                "(to_months(CAST({m} AS INTEGER)) + to_days(CAST({d} AS INTEGER)) + to_microseconds(CAST({us} AS BIGINT)))",
-                m = v.months,
-                d = v.days,
-                us = micros,
-            );
-            Ok(Expression::RawSql(RawSqlExpression {
-                sql,
-                data_type: Some(DataType::Interval),
-                nullable: Some(false),
+            Ok(Expression::Interval(IntervalExpression {
+                months: v.months,
+                days: v.days,
+                microseconds: v.nanoseconds / 1_000,
+                kind: IntervalKind::Calendar,
             }))
         }
         other => bail_boundary_proto!(
@@ -2945,6 +2941,30 @@ mod tests {
     }
 
     #[test]
+    fn convert_local_relation_preserves_declared_interval_span() {
+        let lr = rel(proto::relation::RelType::LocalRelation(
+            proto::LocalRelation {
+                data: None,
+                schema: Some(
+                    r#"{"type":"struct","fields":[{"name":"iv","type":"interval day","nullable":false,"metadata":{}}]}"#
+                        .into(),
+                ),
+            },
+        ));
+        let out = convert_ok(&lr);
+        let CommonOp::LocalRelation { schema, .. } = out.op else {
+            panic!("expected LocalRelation");
+        };
+        assert_eq!(
+            schema.fields[0].data_type,
+            DataType::DayTimeInterval {
+                start: DayTimeField::Day,
+                end: DayTimeField::Day,
+            }
+        );
+    }
+
+    #[test]
     fn parse_type_str_to_struct_parses_struct_wrapper_ddl() {
         let st = super::parse_type_str_to_struct("struct<id:bigint,name:string>");
         assert_eq!(st.fields.len(), 2);
@@ -3056,6 +3076,54 @@ mod tests {
             }
             other => panic!("expected Decimal literal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn arrow_interval_values_lower_to_typed_interval_expressions() {
+        use arrow::datatypes::IntervalMonthDayNano;
+
+        let day_time = DurationMicrosecondArray::from(vec![Some(3_600_000_000_i64)]);
+        let expr = arrow_val_to_literal(&day_time, 0).expect("day-time interval");
+        assert_eq!(
+            expr,
+            Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 0,
+                microseconds: 3_600_000_000,
+                kind: IntervalKind::DayTime {
+                    start: DayTimeField::Day,
+                    end: DayTimeField::Second,
+                },
+            })
+        );
+
+        let year_month = IntervalYearMonthArray::from(vec![Some(14_i32)]);
+        let expr = arrow_val_to_literal(&year_month, 0).expect("year-month interval");
+        assert_eq!(
+            expr,
+            Expression::Interval(IntervalExpression {
+                months: 14,
+                days: 0,
+                microseconds: 0,
+                kind: IntervalKind::YearMonth {
+                    start: YearMonthField::Year,
+                    end: YearMonthField::Month,
+                },
+            })
+        );
+
+        let calendar =
+            IntervalMonthDayNanoArray::from(vec![Some(IntervalMonthDayNano::new(2, 3, 4_000))]);
+        let expr = arrow_val_to_literal(&calendar, 0).expect("calendar interval");
+        assert_eq!(
+            expr,
+            Expression::Interval(IntervalExpression {
+                months: 2,
+                days: 3,
+                microseconds: 4,
+                kind: IntervalKind::Calendar,
+            })
+        );
     }
 
     #[test]

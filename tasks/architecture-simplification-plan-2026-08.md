@@ -700,6 +700,32 @@ relation-plan-ID ADR. Do not treat the remaining typed-interval or
 invariant candidates as safe deletion: each changes a represented contract and
 must be planned and witnessed independently.
 
+### Phase 1 interval-field checkpoint — 2026-08-11
+
+Phase 1 resumed on top of the completed Phase 2 stack. ADR-025 first landed as
+commit `0a74679`, then its representation replaced the interval workaround:
+
+- `DayTimeInterval` and `YearMonthInterval` now retain family-specific start
+  and end fields through SQL/DDL parsing, inference, Connect conversion, and
+  AnalyzePlan responses.
+- Date arithmetic reads the stored day-time end field; compatible spans widen
+  to their union.
+- Arrow interval values lower to `IntervalExpression`, eliminating the final
+  `RawSqlExpression` producers and the variant itself.
+- `intv-009`, `lit-012`, and `lit-013` pin downstream date promotion, exact
+  literal schemas, and mixed-span widening against Spark 4.1.1.
+
+The earlier safe-deletion checkpoint removed 149 production lines. This slice
+adds 148 production lines, so Phase 1 remains net −1 production line while
+replacing a lossy type representation with an exact one. The final exact SCIP
+snapshot reports zero `RawSql` references.
+
+Verification: format and Clippy passed; 164 connect-server and 1,328 core unit
+tests passed (five configured core ignores); the DataFrame corpus has 422
+passes plus the same seven documented reds; the SQL corpus has 426 passes and
+two documented skips. The 829-case baseline gate reports zero regressions and
+all 14 witness flips remain green.
+
 ## Phase 2 decision checkpoint — 2026-08-09
 
 The approved safe-deletion checkpoint is commit `bff14bd`. A fresh baseline at

@@ -125,6 +125,32 @@ impl TypeInferenceEngine {
             (Boolean, y) if y.is_numeric() => y.clone(),
             (x, Boolean) if x.is_numeric() => x.clone(),
             (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+            (
+                DayTimeInterval {
+                    start: left_start,
+                    end: left_end,
+                },
+                DayTimeInterval {
+                    start: right_start,
+                    end: right_end,
+                },
+            ) => DayTimeInterval {
+                start: (*left_start).min(*right_start),
+                end: (*left_end).max(*right_end),
+            },
+            (
+                YearMonthInterval {
+                    start: left_start,
+                    end: left_end,
+                },
+                YearMonthInterval {
+                    start: right_start,
+                    end: right_end,
+                },
+            ) => YearMonthInterval {
+                start: (*left_start).min(*right_start),
+                end: (*left_end).max(*right_end),
+            },
             (x, y) if x.is_interval() && y.is_interval() => Interval,
             _ => String,
         }
@@ -893,10 +919,10 @@ impl TypeInferenceEngine {
 
             // Spark's `make_dt_interval(days[, hours[, mins[, secs]]])`
             // returns a `DayTimeIntervalType`.
-            "make_dt_interval" | "try_make_dt_interval" => DayTimeInterval,
+            "make_dt_interval" | "try_make_dt_interval" => DataType::day_time_full(),
             // `make_ym_interval(years[, months])` returns
             // `YearMonthIntervalType`.
-            "make_ym_interval" | "try_make_ym_interval" => YearMonthInterval,
+            "make_ym_interval" | "try_make_ym_interval" => DataType::year_month_full(),
             // `make_interval(years, months, weeks, days[, hours, mins, secs])`
             // returns `CalendarIntervalType` in Spark 4.1.
             "make_interval" | "try_make_interval" => Interval,
@@ -1229,6 +1255,7 @@ pub(crate) const HASH_FAMILY_NAMES: &[&str] = &["hash", "murmur3", "xxhash64"];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DayTimeField, YearMonthField};
 
     fn dec(p: u8, s: u8) -> DataType {
         DataType::Decimal {
@@ -1255,6 +1282,35 @@ mod tests {
     /// One-line wrapper for [`TypeInferenceEngine::aggregate_return_type`].
     fn agg_rt(name: &str, arg: &DataType) -> DataType {
         TypeInferenceEngine::aggregate_return_type(name, arg)
+    }
+
+    #[test]
+    fn interval_unification_widens_each_family_to_the_union_span() {
+        let day_minute = DataType::DayTimeInterval {
+            start: DayTimeField::Day,
+            end: DayTimeField::Minute,
+        };
+        let hour_second = DataType::DayTimeInterval {
+            start: DayTimeField::Hour,
+            end: DayTimeField::Second,
+        };
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&day_minute, &hour_second),
+            DataType::day_time_full()
+        );
+
+        let year = DataType::YearMonthInterval {
+            start: YearMonthField::Year,
+            end: YearMonthField::Year,
+        };
+        let month = DataType::YearMonthInterval {
+            start: YearMonthField::Month,
+            end: YearMonthField::Month,
+        };
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&year, &month),
+            DataType::year_month_full()
+        );
     }
 
     #[test]
@@ -2293,18 +2349,18 @@ mod tests {
     fn make_dt_interval_returns_day_time_interval() {
         // Spark's `make_dt_interval(1, 2, 30, 0)` yields
         // `DayTimeIntervalType`.
-        assert_eq!(frt("make_dt_interval", &[]), DataType::DayTimeInterval);
-        assert_eq!(frt("try_make_dt_interval", &[]), DataType::DayTimeInterval);
+        assert_eq!(frt("make_dt_interval", &[]), DataType::day_time_full());
+        assert_eq!(frt("try_make_dt_interval", &[]), DataType::day_time_full());
         // Case-insensitive dispatch.
-        assert_eq!(frt("MAKE_DT_INTERVAL", &[]), DataType::DayTimeInterval);
+        assert_eq!(frt("MAKE_DT_INTERVAL", &[]), DataType::day_time_full());
     }
 
     #[test]
     fn make_ym_interval_returns_year_month_interval() {
-        assert_eq!(frt("make_ym_interval", &[]), DataType::YearMonthInterval);
+        assert_eq!(frt("make_ym_interval", &[]), DataType::year_month_full());
         assert_eq!(
             frt("try_make_ym_interval", &[]),
-            DataType::YearMonthInterval
+            DataType::year_month_full()
         );
     }
 

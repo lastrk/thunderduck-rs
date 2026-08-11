@@ -152,7 +152,7 @@ fn rewrite_data_type(
         | TdckDt::TimestampNtz
         | TdckDt::Null => Ok(arrow.clone()),
 
-        TdckDt::DayTimeInterval => {
+        TdckDt::DayTimeInterval { .. } => {
             if is_arrow_duration_micros(arrow) || is_arrow_interval_month_day_nano(arrow) {
                 Ok(arrow.clone())
             } else {
@@ -174,7 +174,7 @@ fn rewrite_data_type(
                 })
             }
         }
-        TdckDt::YearMonthInterval => {
+        TdckDt::YearMonthInterval { .. } => {
             if is_arrow_interval_month_day_nano(arrow) {
                 Ok(arrow.clone())
             } else {
@@ -713,7 +713,7 @@ mod tests {
             ArrowDt::Duration(TimeUnit::Microsecond),
             true,
         )]);
-        let tdck = tdck_struct(vec![("later", TdckDt::DayTimeInterval, true)]);
+        let tdck = tdck_struct(vec![("later", TdckDt::day_time_full(), true)]);
         let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
             .expect("DayTime post-transcode must stamp cleanly");
         assert_eq!(
@@ -752,7 +752,7 @@ mod tests {
             ArrowDt::Interval(IntervalUnit::MonthDayNano),
             true,
         )]);
-        let tdck = tdck_struct(vec![("ymi", TdckDt::YearMonthInterval, true)]);
+        let tdck = tdck_struct(vec![("ymi", TdckDt::year_month_full(), true)]);
         let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
             .expect("YearMonth stamp must succeed on MonthDayNano");
         assert_eq!(
@@ -772,7 +772,7 @@ mod tests {
             ArrowDt::Interval(IntervalUnit::MonthDayNano),
             true,
         )]);
-        let tdck = tdck_struct(vec![("dt", TdckDt::DayTimeInterval, true)]);
+        let tdck = tdck_struct(vec![("dt", TdckDt::day_time_full(), true)]);
         let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
             .expect("DayTime pre-transcode fallback must stamp cleanly");
         assert_eq!(
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn stamp_interval_rejects_wrong_arrow_shape() {
         let arrow_schema = Schema::new(vec![Field::new("dt", ArrowDt::Int64, true)]);
-        let tdck = tdck_struct(vec![("dt", TdckDt::DayTimeInterval, true)]);
+        let tdck = tdck_struct(vec![("dt", TdckDt::day_time_full(), true)]);
         let err = rewrite_top_schema(&arrow_schema, &tdck)
             .expect_err("Int64 paired with DayTimeInterval must be a shape mismatch");
         assert_eq!(err.tdck, "DayTimeInterval");

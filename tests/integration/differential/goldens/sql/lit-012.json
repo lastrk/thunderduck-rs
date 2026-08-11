@@ -1,0 +1,28 @@
+{
+ "id": "lit-012",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "h",
+    "type": "interval hour",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "d",
+    "type": "interval day",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "m",
+    "type": "interval month",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

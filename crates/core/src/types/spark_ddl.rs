@@ -10,7 +10,7 @@
 //! Value-level code only: this module must not import `transpiler_v2` or
 //! `runtime` (INV10-adjacent layering — `types/` sits below τ).
 
-use super::{DataType, StructField, StructType};
+use super::{DataType, DayTimeField, StructField, StructType, YearMonthField};
 
 /// Parse a Spark type string leniently: unknown input returns
 /// [`DataType::Unresolved`].
@@ -80,6 +80,9 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
     }
 
     let token = t.to_ascii_lowercase();
+    if let Some(interval) = parse_ansi_interval(&token) {
+        return Some(interval);
+    }
     let dt = match token.as_str() {
         "boolean" | "bool" => DataType::Boolean,
         "tinyint" | "byte" | "int8" => DataType::Byte,
@@ -93,8 +96,8 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
         "date" => DataType::Date,
         "timestamp" | "timestamp_ltz" => DataType::Timestamp,
         "timestamp_ntz" => DataType::TimestampNtz,
-        "interval year to month" | "yearmonthinterval" => DataType::YearMonthInterval,
-        "interval day to second" | "daytimeinterval" => DataType::DayTimeInterval,
+        "yearmonthinterval" => DataType::year_month_full(),
+        "daytimeinterval" => DataType::day_time_full(),
         "interval" => DataType::Interval,
         "null" | "void" => DataType::Null,
         _ => {
@@ -106,6 +109,35 @@ fn parse_type(s: &str, lenient: bool) -> Option<DataType> {
         }
     };
     Some(dt)
+}
+
+fn parse_ansi_interval(token: &str) -> Option<DataType> {
+    let fields = token.strip_prefix("interval ")?;
+    let mut fields = fields.split(" to ");
+    let start = fields.next()?;
+    let end = fields.next().unwrap_or(start);
+    if fields.next().is_some() {
+        return None;
+    }
+
+    let year_month = |field| match field {
+        "year" => Some(YearMonthField::Year),
+        "month" => Some(YearMonthField::Month),
+        _ => None,
+    };
+    if let (Some(start), Some(end)) = (year_month(start), year_month(end)) {
+        return (start <= end).then_some(DataType::YearMonthInterval { start, end });
+    }
+
+    let day_time = |field| match field {
+        "day" => Some(DayTimeField::Day),
+        "hour" => Some(DayTimeField::Hour),
+        "minute" => Some(DayTimeField::Minute),
+        "second" => Some(DayTimeField::Second),
+        _ => None,
+    };
+    let (start, end) = (day_time(start)?, day_time(end)?);
+    (start <= end).then_some(DataType::DayTimeInterval { start, end })
 }
 
 /// Parse the remainder after a leading `decimal` prefix. Well-formed `(p,s)` /
@@ -291,10 +323,10 @@ mod tests {
             ("timestamp", DataType::Timestamp),
             ("TIMESTAMP_LTZ", DataType::Timestamp),
             ("timestamp_ntz", DataType::TimestampNtz),
-            ("interval year to month", DataType::YearMonthInterval),
-            ("yearmonthinterval", DataType::YearMonthInterval),
-            ("INTERVAL DAY TO SECOND", DataType::DayTimeInterval),
-            ("daytimeinterval", DataType::DayTimeInterval),
+            ("interval year to month", DataType::year_month_full()),
+            ("yearmonthinterval", DataType::year_month_full()),
+            ("INTERVAL DAY TO SECOND", DataType::day_time_full()),
+            ("daytimeinterval", DataType::day_time_full()),
             ("interval", DataType::Interval),
             ("void", DataType::Null),
             ("null", DataType::Null),
@@ -309,6 +341,39 @@ mod tests {
     fn unknown_token_strict_none_lenient_unresolved() {
         assert_eq!(strict("garbage"), None);
         assert_eq!(lenient("garbage"), DataType::Unresolved);
+    }
+
+    #[test]
+    fn ansi_interval_spans_parse_exactly() {
+        let cases = [
+            (
+                "interval month",
+                DataType::YearMonthInterval {
+                    start: YearMonthField::Month,
+                    end: YearMonthField::Month,
+                },
+            ),
+            (
+                "INTERVAL HOUR TO SECOND",
+                DataType::DayTimeInterval {
+                    start: DayTimeField::Hour,
+                    end: DayTimeField::Second,
+                },
+            ),
+            (
+                "interval day",
+                DataType::DayTimeInterval {
+                    start: DayTimeField::Day,
+                    end: DayTimeField::Day,
+                },
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strict(input), Some(expected.clone()));
+            assert_eq!(lenient(input), expected);
+        }
+        assert_eq!(strict("interval month to year"), None);
+        assert_eq!(lenient("interval day to month"), DataType::Unresolved);
     }
 
     #[test]

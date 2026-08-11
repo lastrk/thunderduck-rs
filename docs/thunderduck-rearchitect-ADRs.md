@@ -4,7 +4,7 @@
 **Status of set:** Proposed — for ratification before / alongside reimplementation.
 **Reference Spark version:** 4.1.1.
 
-This document records the architectural decisions that emerged from design discussion. Each ADR is self-contained for individual review and carries explicit `Depends on` / `Depended on by` links. The ADRs are ordered as a logical narrative: ADR-000 establishes the product premise that selects the whole approach; ADR-001–002 state what τ is and what it delegates; ADR-003–004 define the intermediate representation and how both front-ends populate it; ADR-005–006 define the analyzer that resolves and types it; ADR-007–010 define how it is transformed and emitted; ADR-011–013 cover commands, the catalog, and external/lakehouse reads; ADR-014–016 are the testing architecture the rest makes possible; ADR-017–019 add the per-format write paths (Delta append, UC-managed Iceberg) and the end-to-end I/O contract; ADR-020 pins the emission target (strict-only, extension mandatory); ADR-021 pins the substrate boundary; ADR-022 pins the runtime position; ADR-024 defines resolved attribute identity; and ADR-026 defines Spark Connect plan-ID resolution. Superseded decisions live under `docs/adrs/retired/`.
+This document records the architectural decisions that emerged from design discussion. Each ADR is self-contained for individual review and carries explicit `Depends on` / `Depended on by` links. The ADRs are ordered as a logical narrative: ADR-000 establishes the product premise that selects the whole approach; ADR-001–002 state what τ is and what it delegates; ADR-003–004 define the intermediate representation and how both front-ends populate it; ADR-005–006 define the analyzer that resolves and types it; ADR-007–010 define how it is transformed and emitted; ADR-011–013 cover commands, the catalog, and external/lakehouse reads; ADR-014–016 are the testing architecture the rest makes possible; ADR-017–019 add the per-format write paths (Delta append, UC-managed Iceberg) and the end-to-end I/O contract; ADR-020 pins the emission target (strict-only, extension mandatory); ADR-021 pins the substrate boundary; ADR-022 pins the runtime position; ADR-024 defines resolved attribute identity; ADR-025 defines ANSI interval field spans; and ADR-026 defines Spark Connect plan-ID resolution. Superseded decisions live under `docs/adrs/retired/`.
 
 The **Cross-Validation** section at the end provides the dependency matrix, the tension points where decisions pull against each other, the load-bearing assumptions whose failure would cascade, and the cross-cutting invariants any refinement must preserve.
 
@@ -160,7 +160,7 @@ A Connect node carrying `plan_id` is not cosmetic: ADR-026 makes that boundary o
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-002 (defines the boundary), ADR-003 (the IR it annotates), ADR-004 (must serve both front-ends), ADR-012 (catalog seed)
-**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018, ADR-024
+**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018, ADR-024, ADR-025
 
 **Context.** Every dispatch decision in τ keys on resolved Spark types (ADR-009). The common AST (ADR-003) arrives unresolved (`UnresolvedAttribute`, `UnresolvedRelation`) from both front-ends; types and nullability live in the catalog and in Spark's analyzer rules, not in the AST. DuckDB's native inference gives DuckDB types, which diverge from Spark. Per ADR-000, embedding real Catalyst (which would supply correct types) is rejected, so thunderduck must reimplement this slice.
 
@@ -589,7 +589,7 @@ That positioning has shifted. ADR-010 already classifies the extension functions
 
 **Status:** Proposed
 **Depends on:** ADR-002 (delegation boundary), ADR-003 (common AST), ADR-004 (front-end convergence), ADR-005 (owned inference), ADR-014 (two decision spaces), ADR-015 (differential oracle)
-**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion); ADR-024 (stored attribute identity); ADR-026 (Spark Connect plan-ID resolution)
+**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion); ADR-024 (stored attribute identity); ADR-025 (interval field-span representation); ADR-026 (Spark Connect plan-ID resolution)
 
 **Context.** τ must own its substrate — the protobuf-to-CommonAST converter, the `Expression` payload in CommonAST, and the `TypeInferenceEngine`. If τ consumed an upstream plan type produced by a converter it does not own, τ inherits every quirk of that converter: synthesized-SQL shortcut shapes for structured operations (VALUES, table functions, file scans, Arrow-IPC LocalRelation), stringly-typed qualifier encodings (`__plan_id_{N}__`), silent-NULL fallbacks in Arrow value marshalling. If τ delegated type/nullability calls to an upstream inference engine, symmetric-omission gaps in that engine (a function present in `aggregate_return_type` but missing from `aggregate_is_nullable`) transit silently — τ arms can be individually correct yet the corpus stays red because the input's schema or nullability was wrong before the arm ran. Substrate ownership is the design lever that makes τ's correctness a τ-local concern.
 
@@ -627,7 +627,7 @@ category: named strict rejections of malformed SQL that Spark's permissive
 grammar accepts. The amendment narrows category 1 and adds a register; the
 two original categories are otherwise unchanged.*
 **Depends on:** ADR-000 (no-JVM premise), ADR-002 (delegation boundary), ADR-021 (substrate ownership)
-**Depended on by:** every implementation slice; ADR-024 and ADR-026 (reference-resolution Spark-emulated errors)
+**Depended on by:** every implementation slice; ADR-024 and ADR-026 (reference-resolution Spark-emulated errors); ADR-025 (lossless interval types)
 
 **Context.** τ is the transpiler. When τ does not implement a Spark input, τ says so — it produces a typed error to the caller, not a partial or synthetic SQL string, and not a route to some other execution path. The correctness contract is Spark parity, a named limitation, or a **named and registered** divergence; what is forbidden is the *unnamed* third choice — silently different. This ADR pins that contract.
 
@@ -777,6 +777,36 @@ USING/NATURAL hidden donors are relation-level metadata outputs, separate from t
 
 ---
 
+## ADR-025 — ANSI interval field spans live on `DataType`
+
+**Status:** Proposed
+**Depends on:** ADR-005 (type inference), ADR-015 (Spark differential oracle), ADR-016 (Spark 4.1.1 pin), ADR-021 (τ owns its substrate), ADR-022 (honest errors)
+**Depended on by:** interval SQL lowering, `Date ± interval` inference, AnalyzePlan schemas, Connect type conversion, and Arrow LocalRelation values
+
+**Context.** Spark's `DayTimeIntervalType` and `YearMonthIntervalType` are parameterized by inclusive start and end fields. Spark Connect carries those fields, but τ currently discards them because its interval `DataType` variants are field-less. That loss forces single-field `DAY` literals to masquerade as calendar intervals, makes every day-time interval column appear to contain a sub-day field, and reports full-span types for narrower literals. These are silent type changes, not honest unsupported boundaries.
+
+**Decision.** The declared span is durable value-type structure:
+
+```rust
+enum DayTimeField { Day, Hour, Minute, Second }
+enum YearMonthField { Year, Month }
+
+DayTimeInterval { start: DayTimeField, end: DayTimeField }
+YearMonthInterval { start: YearMonthField, end: YearMonthField }
+```
+
+The separate field enums prevent cross-family states. Both derive Spark's most-significant-to-least-significant ordering. Missing Connect fields use Spark's full-span defaults (`DAY TO SECOND` and `YEAR TO MONTH`); present fields round-trip exactly. Literal `IntervalKind` carries the same family-specific span, so `Expression::data_type` is a pure mapping. Generic `CalendarInterval` remains unparameterized.
+
+Every span-dependent decision consumes this stored fact. `Date ± DayTimeInterval` promotes to `Timestamp` exactly when the end field is below `DAY`; a day-only span stays `Date`. Type unification widens compatible interval spans to their union. AnalyzePlan and Connect responses emit the exact span. Arrow encodings that omit the logical span use the appropriate full-span default; the physical wire transcoder remains in connect-server per INV10.
+
+Arrow interval values lower to the typed `IntervalExpression { months, days, microseconds, kind }`. They never enter τ as SQL text. Once those are the last producers, `RawSqlExpression` is deleted.
+
+**Alternatives rejected.** Literal-only metadata cannot represent interval columns. Value inspection cannot distinguish a day-only type from a `DAY TO SECOND` value whose sub-day component is zero. A shared field enum permits illegal cross-family states. An out-of-band side table duplicates type structure and can drift at wire boundaries.
+
+**Consequences.** Interval `Eq`/`Hash` now distinguishes spans; every equality and keying site must be audited. Existing construction sites without more precise information use full-span constructors. The compensating `DAY → Calendar` lowering and the long "sub-day by construction" rationale disappear. Differential witnesses pin day-only column arithmetic, exact literal schemas, mixed-span widening, and unchanged Arrow behavior.
+
+---
+
 ## ADR-026 — τ mirrors Spark Connect's `plan_id` tree lookup
 
 **Status:** Proposed
@@ -814,7 +844,7 @@ The ADRs are not peers; they form four strata.
 
 **Spine (the irreducible commitments, given the premise):** ADR-001 (transliterator), ADR-002 (emit-level delegation), ADR-005 (own the divergent slice), ADR-020 (strict-only; extension mandatory). These define what τ *is* and what it *owns*.
 
-**Substrate & front-ends (the IR and how it is populated and analyzed):** ADR-003 (common AST), ADR-004 (both front-ends lower to it; relation-vs-command by parse-root), ADR-006 (analyzer pass structure), ADR-021 (τ owns its protobuf converter, Expression, TypeInferenceEngine), ADR-024 (stored attribute identity), and ADR-026 (Spark Connect plan-ID lookup). These define the representation and the substrate boundary.
+**Substrate & front-ends (the IR and how it is populated and analyzed):** ADR-003 (common AST), ADR-004 (both front-ends lower to it; relation-vs-command by parse-root), ADR-006 (analyzer pass structure), ADR-021 (τ owns its protobuf converter, Expression, TypeInferenceEngine), ADR-024 (stored attribute identity), ADR-025 (interval field spans), and ADR-026 (Spark Connect plan-ID lookup). These define the representation and the substrate boundary.
 
 **Consequences (the spine applied to surfaces):** ADR-007 (A/B/C, B retained) from 001+002+005+006+008; ADR-008 (correlated direct) from 001; ADR-009 (declarative table, hand-written match arms) from 003+005+007; ADR-010 (extension fns, C++ project) from 005; ADR-011 (commands) from 001+004; ADR-012 (catalog overlay) from 011+005; ADR-013 (external/lakehouse reads, delegated) from 000+002+012; ADR-017 (Delta append writes) and ADR-018 (UC-managed Iceberg CTAS/INSERT/DELETE/MERGE writes) — the per-format write specializations — both from 005+011+013+016; ADR-019 (the native-read / Iceberg-write lakehouse I/O contract) composing 013+018.
 
@@ -833,7 +863,7 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 002 delegation | 000, DuckDB-correct (LB2) | 003, 005, 007, 013, 026 |
 | 003 common AST | 000, 002 | 004, 005, 009, 026 |
 | 004 front-ends → AST | 000, 003 | 005, 011, 015, 026 |
-| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018, 024 |
+| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018, 024, 025 |
 | 006 analyzer passes | 000, 005 | 007, 024, 026 |
 | 007 A/B/C | 001, 002, 005, 006, 008 | 009 |
 | 008 correlated direct | 001 | 007 |
@@ -849,9 +879,10 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 018 Iceberg writes (UC managed) | 005, 011, 013, 016 | 015, 019 |
 | 019 lakehouse I/O contract | 013, 018 | — |
 | 020 strict-only extension | 000, 001, 010 | 009, 015 (simplified) |
-| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10; 024, 026 |
-| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule; 024, 026 |
+| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10; 024, 025, 026 |
+| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule; 024, 025, 026 |
 | 024 stored attribute identity | 005, 006, 021, 022 | resolved-reference binding; future N10 work; 026 |
+| 025 interval field spans | 005, 015, 016, 021, 022 | interval lowering/inference; AnalyzePlan and Arrow interval boundaries |
 | 026 Spark Connect plan-ID lookup | 001, 002, 003, 004, 006, 015, 016, 021, 022, 024 | DataFrame reference resolution; join-only plan-ID deletion |
 
 **New external dependency:** the [`thunderduck-duckdb-extension`](https://github.com/lastrk/thunderduck-duckdb-extension) C++ project is an external build artifact that ADR-010 depends on. It is not an ADR but it participates in the dependency graph: the dispatch table's `Extension(...)` targets must match its exported functions (INV6), its behavior must be differentially validated (edge 010 → 014), and it is the third member of the version-coordination set (edge 010 → 015, alongside Spark 4.1.1 and the dispatch table).
@@ -942,7 +973,7 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 4. **ADR-007 → 013** (consequences) in dependency order per CV.2 — this group now includes external/lakehouse reads (ADR-013), which depends only on the delegation premise (000/002) and the overlay (012).
 5. **ADR-016** (version pin — it scopes the coverage claims, so fix it first) then **ADR-014 → 015** (the enabled testing architecture).
 6. **ADR-020** (strict-only extension), **ADR-021** (τ owns substrate), and **ADR-022** (τ is the only path). ADR-020 consolidates the emission target; ADR-021 pins the substrate boundary (τ owns its protobuf converter, Expression, TypeInferenceEngine); ADR-022 pins the runtime position (τ is the only path; two error categories; no fallback). Together with ADR-000's premise, these three shape every implementation slice.
-7. **ADR-024** (stored attribute identity), then **ADR-026** (Spark Connect plan-ID lookup). ADR-026 presupposes ADR-024's `ExprId` filtering model. Superseded records under `docs/adrs/retired/` are outside the active ratification order.
+7. **ADR-024** (stored attribute identity), **ADR-025** (interval field spans), then **ADR-026** (Spark Connect plan-ID lookup). ADR-026 presupposes ADR-024's `ExprId` filtering model; ADR-025 is independent of both identity models. Superseded records under `docs/adrs/retired/` are outside the active ratification order.
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
 

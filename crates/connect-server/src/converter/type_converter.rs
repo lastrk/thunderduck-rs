@@ -1,4 +1,4 @@
-use thunderduck_core::types::{DataType, StructField, StructType};
+use thunderduck_core::types::{DataType, DayTimeField, StructField, StructType, YearMonthField};
 
 use crate::proto::spark::connect as proto;
 
@@ -25,8 +25,8 @@ pub fn proto_to_data_type(dt: &proto::DataType) -> DataType {
         Some(Kind::Date(_)) => DataType::Date,
         Some(Kind::Timestamp(_)) => DataType::Timestamp,
         Some(Kind::TimestampNtz(_)) => DataType::TimestampNtz,
-        Some(Kind::YearMonthInterval(_)) => DataType::YearMonthInterval,
-        Some(Kind::DayTimeInterval(_)) => DataType::DayTimeInterval,
+        Some(Kind::YearMonthInterval(interval)) => year_month_interval_from_proto(interval),
+        Some(Kind::DayTimeInterval(interval)) => day_time_interval_from_proto(interval),
         // mirrors data_type_to_proto: Interval <-> CalendarInterval
         Some(Kind::CalendarInterval(_)) => DataType::Interval,
         Some(Kind::Decimal(d)) => {
@@ -87,11 +87,19 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
         DataType::Date => Kind::Date(proto::data_type::Date::default()),
         DataType::Timestamp => Kind::Timestamp(proto::data_type::Timestamp::default()),
         DataType::TimestampNtz => Kind::TimestampNtz(proto::data_type::TimestampNtz::default()),
-        DataType::YearMonthInterval => {
-            Kind::YearMonthInterval(proto::data_type::YearMonthInterval::default())
+        DataType::YearMonthInterval { start, end } => {
+            Kind::YearMonthInterval(proto::data_type::YearMonthInterval {
+                start_field: Some(start.to_proto()),
+                end_field: Some(end.to_proto()),
+                type_variation_reference: 0,
+            })
         }
-        DataType::DayTimeInterval => {
-            Kind::DayTimeInterval(proto::data_type::DayTimeInterval::default())
+        DataType::DayTimeInterval { start, end } => {
+            Kind::DayTimeInterval(proto::data_type::DayTimeInterval {
+                start_field: Some(start.to_proto()),
+                end_field: Some(end.to_proto()),
+                type_variation_reference: 0,
+            })
         }
         DataType::Interval => Kind::CalendarInterval(proto::data_type::CalendarInterval::default()),
         DataType::Decimal { precision, scale } => Kind::Decimal(proto::data_type::Decimal {
@@ -124,6 +132,36 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
     };
 
     proto::DataType { kind: Some(kind) }
+}
+
+fn day_time_interval_from_proto(interval: &proto::data_type::DayTimeInterval) -> DataType {
+    let start = interval
+        .start_field
+        .map(DayTimeField::from_proto)
+        .unwrap_or(Some(DayTimeField::Day));
+    let end = interval
+        .end_field
+        .map(DayTimeField::from_proto)
+        .unwrap_or(Some(DayTimeField::Second));
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end => DataType::DayTimeInterval { start, end },
+        _ => DataType::Unresolved,
+    }
+}
+
+fn year_month_interval_from_proto(interval: &proto::data_type::YearMonthInterval) -> DataType {
+    let start = interval
+        .start_field
+        .map(YearMonthField::from_proto)
+        .unwrap_or(Some(YearMonthField::Year));
+    let end = interval
+        .end_field
+        .map(YearMonthField::from_proto)
+        .unwrap_or(Some(YearMonthField::Month));
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end => DataType::YearMonthInterval { start, end },
+        _ => DataType::Unresolved,
+    }
 }
 
 fn struct_field_to_proto(f: &StructField) -> proto::data_type::StructField {
@@ -195,14 +233,68 @@ mod tests {
                 proto::data_type::YearMonthInterval::default(),
             )),
         };
-        assert_eq!(proto_to_data_type(&year_month), DataType::YearMonthInterval);
+        assert_eq!(proto_to_data_type(&year_month), DataType::year_month_full());
 
         let day_time = proto::DataType {
             kind: Some(Kind::DayTimeInterval(
                 proto::data_type::DayTimeInterval::default(),
             )),
         };
-        assert_eq!(proto_to_data_type(&day_time), DataType::DayTimeInterval);
+        assert_eq!(proto_to_data_type(&day_time), DataType::day_time_full());
+    }
+
+    #[test]
+    fn interval_spans_round_trip_exactly() {
+        use proto::data_type::Kind;
+
+        let day_time = DataType::DayTimeInterval {
+            start: DayTimeField::Hour,
+            end: DayTimeField::Minute,
+        };
+        let day_time_proto = data_type_to_proto(&day_time);
+        let Some(Kind::DayTimeInterval(encoded)) = &day_time_proto.kind else {
+            panic!("expected day-time proto type");
+        };
+        assert_eq!(encoded.start_field, Some(1));
+        assert_eq!(encoded.end_field, Some(2));
+        assert_eq!(proto_to_data_type(&day_time_proto), day_time);
+
+        let year_month = DataType::YearMonthInterval {
+            start: YearMonthField::Month,
+            end: YearMonthField::Month,
+        };
+        let year_month_proto = data_type_to_proto(&year_month);
+        let Some(Kind::YearMonthInterval(encoded)) = &year_month_proto.kind else {
+            panic!("expected year-month proto type");
+        };
+        assert_eq!(encoded.start_field, Some(1));
+        assert_eq!(encoded.end_field, Some(1));
+        assert_eq!(proto_to_data_type(&year_month_proto), year_month);
+    }
+
+    #[test]
+    fn invalid_interval_span_decodes_as_unresolved() {
+        use proto::data_type::Kind;
+
+        let reversed = proto::DataType {
+            kind: Some(Kind::DayTimeInterval(proto::data_type::DayTimeInterval {
+                start_field: Some(3),
+                end_field: Some(0),
+                type_variation_reference: 0,
+            })),
+        };
+        assert_eq!(proto_to_data_type(&reversed), DataType::Unresolved);
+
+        let unknown = proto::DataType {
+            kind: Some(Kind::YearMonthInterval(
+                proto::data_type::YearMonthInterval {
+                    start_field: Some(2),
+                    end_field: Some(2),
+                    type_variation_reference: 0,
+                },
+            )),
+        };
+        assert_eq!(proto_to_data_type(&unknown), DataType::Unresolved);
     }
 
     #[test]

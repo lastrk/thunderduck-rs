@@ -640,6 +640,8 @@ case("lit-010", "typed_literal", "INTERVAL arithmetic in WHERE", "SELECT * FROM 
 # 4.1.1 Connect). `hire_date` is DATE-typed on the `emp` fixture (see
 # lit-003).
 case("lit-011", "typed_literal", "DATE +/- sub-day INTERVAL promotes to TIMESTAMP, day/month INTERVAL stays DATE (R1-6)", "SELECT hire_date + INTERVAL '25' HOUR AS promoted_add, hire_date - INTERVAL '25' HOUR AS promoted_sub, hire_date + INTERVAL '1' DAY AS stays_date_day, hire_date + INTERVAL '2' MONTH AS stays_date_month FROM emp")
+case("lit-012", "typed_literal", "ANSI interval literals preserve their exact field spans", "SELECT INTERVAL '3' HOUR AS h, INTERVAL '5' DAY AS d, INTERVAL '2' MONTH AS m", flags=("schema_only",))
+case("lit-013", "typed_literal", "same-family interval widening uses the union field span", "SELECT INTERVAL '1' DAY AS iv UNION ALL SELECT INTERVAL '2' HOUR AS iv", flags=("schema_only",))
 
 # Each function applied across the supported numeric types (short/int/bigint/
 # float/double/decimal) to pin Spark's per-type RESULT TYPE and coercion rules —

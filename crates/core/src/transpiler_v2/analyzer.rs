@@ -5613,9 +5613,8 @@ fn derive_implicit_grouping(
 ///   references `outer_col`. The body's `LambdaVariable` refs are
 ///   lambda-local leaves (no children, not a `ColumnReference`) and add
 ///   nothing.
-/// * **Opaque leaves contribute nothing** — `RawSql` (unparsed SQL string),
-///   `UnresolvedRegex` (expanded away by the Project pre-pass before
-///   inference), `Literal`, `Interval`, `Star`.
+/// * **Opaque leaves contribute nothing** — `UnresolvedRegex` (expanded by the
+///   Project pre-pass), `Literal`, `Interval`, and `Star`.
 fn collect_referenced_columns(expr: &Expression, acc: &mut HashSet<String>) {
     match expr {
         Expression::ColumnReference(c) => {
@@ -5882,8 +5881,9 @@ fn spark_type_sql(dt: &DataType) -> String {
         DataType::Date => "DATE".to_owned(),
         DataType::Timestamp => "TIMESTAMP".to_owned(),
         DataType::TimestampNtz => "TIMESTAMP_NTZ".to_owned(),
-        DataType::YearMonthInterval => "INTERVAL YEAR TO MONTH".to_owned(),
-        DataType::DayTimeInterval => "INTERVAL DAY TO SECOND".to_owned(),
+        DataType::YearMonthInterval { .. } | DataType::DayTimeInterval { .. } => {
+            dt.to_string().to_ascii_uppercase()
+        }
         DataType::Interval => "INTERVAL".to_owned(),
         DataType::Null => "VOID".to_owned(),
         DataType::Unresolved => "STRING".to_owned(),

@@ -95,6 +95,12 @@ Never attempt to move a `Connection` across thread boundaries or hold it across 
 
 ## Streaming and Arrow interval transcoding
 
+Spark's declared interval field span is semantic type structure. τ preserves it
+on `DataType::DayTimeInterval { start, end }` and
+`DataType::YearMonthInterval { start, end }` (ADR-025); it is never inferred
+from the stored months/days/microseconds value. Physical Arrow encoding remains
+an independent connect-server concern.
+
 `execute_streaming_query` (`crates/connect-server/src/service.rs`) is a true per-batch stream driven by `futures::stream::unfold`. For every ExecutePlan request it:
 
 1. Yields one `ExecutePlanResponse.schema` frame built from τ's `resolved_schema` (via `build_schema_response`). This bypasses PySpark's `from_arrow_schema` fallback, which lacks `is_interval` arms and would raise `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION` on any interval column.
@@ -127,7 +133,7 @@ Expression (enum)
   Star                  # *
   InSubquery / ExistsSubquery / ScalarSubquery
   Lambda / LambdaVariable    # HOF lambdas (transform, filter, etc.)
-  RawSql                # raw SQL passthrough from spark.expr()
+  Interval              # typed calendar/year-month/day-time value
   ArrayLiteral / MapLiteral / StructLiteral
 ```
 

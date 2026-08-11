@@ -754,6 +754,24 @@ case(
 # DayTimeIntervalType (HOURS) promotes DATE to TIMESTAMP while a day-only
 # interval (intv-004's shape) stays DATE. Verified against Spark 4.1.1.
 case("intv-008", "interval", "date + sub-day INTERVAL promotes to TIMESTAMP (R1-6)", lambda I: I["emp"].select((F.col("hire_date") + F.expr("INTERVAL 25 HOURS")).alias("promoted"), (F.col("hire_date") - F.expr("INTERVAL 25 HOURS")).alias("promoted_sub")))
+case(
+    "intv-009",
+    "interval",
+    "interval spans survive projection and drive downstream DATE promotion",
+    lambda I: I["emp"]
+    .select(
+        "hire_date",
+        F.expr("INTERVAL '1' DAY").alias("day_iv"),
+        F.expr("INTERVAL '1' HOUR").alias("hour_iv"),
+    )
+    .select(
+        (F.col("hire_date") + F.col("day_iv")).alias("day_result"),
+        (F.col("hire_date") + F.col("hour_iv")).alias("hour_result"),
+        "day_iv",
+        "hour_iv",
+    ),
+    flags=("schema_only",),
+)
 
 case("arr2-001", "array_new", "array_append / array_prepend", lambda I: I["emp"].select(F.array_append("tags", "new").alias("ap"), F.array_prepend("tags", "first").alias("pp")))
 case("arr2-002", "array_new", "array_insert (1-based position)", lambda I: I["emp"].select(F.array_insert("tags", 1, "head").alias("ai")))

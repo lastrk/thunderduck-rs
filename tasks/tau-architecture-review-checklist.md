@@ -89,11 +89,10 @@ All touch `emission.rs`. **Serialise these**; order matters.
       Rewrite only the 8 hand-rolled copy-outs. **Do not** extend the literal ban to
       `ColumnReference` — `:4039/4381/4482/4578/4703` must stay literals (type/nullability come
       from the nested field, not the column). −40/+15
-- [ ] **C3 · (b)2 `ColumnReference::expr_id: Option<ExprId>` → `ExprId`** — CONFIRMED, structural
-      bet — requires C2's constructor first, plus its own review pass. Needs restructuring
-      `resolve_column`'s tier ladder (three arms use `(Unresolved, false, None)` as a
-      fall-through sentinel) into an explicit `enum Resolution` — an `.expect()` is not an option
-      under the no-unwrap rule. Hinge is `emission.rs:1170`. −15/+8
+- [x] **C3 · (b)2 `ColumnReference::expr_id: Option<ExprId>` → `ExprId`** — COMPLETE.
+      Phase 2 had already removed the old resolver sentinel, so C2's constructors made the
+      narrowing mechanical. Recovery, semantic equality, projection identity, and duplicate-name
+      emission now consume the mandatory id directly.
 - [x] **C4 · (a)6 extract `merge_join_scopes`** — CONFIRMED — `for_join_condition` re-implements
       `RelScope::of`'s Join arm; only divergence is `keep_right`. Independent of C1–C3, can run in
       parallel. **Keep the `using_columns` gate at the call site.** Use `RightSide::{Keep, Drop}`,

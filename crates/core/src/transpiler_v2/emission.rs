@@ -1204,8 +1204,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     if name_count < 2 {
         return None;
     }
-    let id = c.expr_id?;
-    let (k, _) = schema.field_by_id(id, &c.name)?;
+    let (k, _) = schema.field_by_id(c.expr_id, &c.name)?;
     Some(k)
 }
 
@@ -1219,13 +1218,9 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
 /// the set: a partial rewrite would be unsound (the wrap path re-derives the
 /// whole set from scratch instead).
 ///
-/// All other references pass through untouched: `expr_id: None` (deferred
-/// pre-analysis resolution, or one of the analyzer gaps enumerated on
-/// [`super::expression::ColumnReference::expr_id`]'s doc), `expr_id: Some`
-/// but naming no field in this schema (D2: a correlated outer reference —
-/// its id lives in the enclosing plan's schema, never this one's), a real
-/// (already-rewritten) qualifier already binds, or a unique name that
-/// resolution already left bare.
+/// All other references pass through untouched: the id names no field in this
+/// schema (for example, a correlated outer reference), an existing qualifier
+/// already binds, or the name is unique.
 fn requalify_visible<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
     block: &SelectBlock,
@@ -1286,9 +1281,10 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
     fn walk(expr: &mut Expression, schema: &Schema, uniquified: &[String]) {
         match expr {
             Expression::ColumnReference(c) => {
-                let position = c
-                    .expr_id
-                    .and_then(|id| schema.fields.iter().position(|field| field.expr_id == id));
+                let position = schema
+                    .fields
+                    .iter()
+                    .position(|field| field.expr_id == c.expr_id);
                 if let Some(position) = position {
                     if c.qualifier.is_some() || bare_dup_slot(c, schema).is_some() {
                         c.qualifier = None;
@@ -6543,7 +6539,7 @@ mod tests {
         LambdaVariableExpression, LikeExpression, Literal, LiteralValue, MapLiteralExpression,
         StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
     };
-    use crate::transpiler_v2::schema::Attribute;
+    use crate::transpiler_v2::schema::{Attribute, ExprId};
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
     use crate::types::{StructField, YearMonthField};
 
@@ -6660,7 +6656,7 @@ mod tests {
             qualifier: None,
             data_type: dt,
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         })
     }
 
@@ -7202,7 +7198,7 @@ mod tests {
                         qualifier: Some(Qualifier::single("outer_e")),
                         data_type: DataType::Double,
                         nullable: true,
-                        expr_id: None,
+                        expr_id: ExprId::fresh(),
                     })),
                     right: Box::new(int_lit(1)),
                 }),
@@ -9861,12 +9857,8 @@ mod tests {
 
     #[test]
     fn reproject_qualifiers_ordinal_arm_binds_bare_dup_by_id() {
-        // Direct unit pin for the `reproject_qualifiers` bare-dup else-arm
-        // (N10-lite): a bare duplicate-name ref rewrites to `uniquified[k]`
-        // where `k` is found by the reference's `expr_id` — fixtures stamp
-        // REAL ids read off the fixture schema (not `expr_id: None`). A bare
-        // UNIQUE-name ref and a bare ref with `expr_id: None` (deferred
-        // resolution) are both left untouched regardless.
+        // A bare duplicate-name reference binds its uniquified slot by id;
+        // unique-name references remain unchanged.
         let schema = Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("dept_id", DataType::Integer),
@@ -9887,21 +9879,21 @@ mod tests {
             qualifier: None,
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(dept_id_second),
+            expr_id: dept_id_second,
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
             qualifier: None,
             data_type: DataType::Long,
             nullable: false,
-            expr_id: Some(id_col_id),
+            expr_id: id_col_id,
         });
-        let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
+        let unique_name = Expression::ColumnReference(ColumnReference {
             name: "name".to_owned(),
             qualifier: None,
             data_type: DataType::String,
             nullable: true,
-            expr_id: Some(name_col_id),
+            expr_id: name_col_id,
         });
         let input = TypedAst::new(
             TypedOp::TableScan {
@@ -9925,8 +9917,8 @@ mod tests {
             }
             other => panic!("expected ColumnReference, got {other:?}"),
         }
-        let rewritten_deferred = reproject_qualifiers(&deferred_no_ordinal, &input, &uniquified);
-        match rewritten_deferred {
+        let rewritten_unique_name = reproject_qualifiers(&unique_name, &input, &uniquified);
+        match rewritten_unique_name {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.qualifier, None);
                 assert_eq!(c.name, "name", "a bare unique-name ref is untouched");
@@ -9968,7 +9960,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(shared_id),
+            expr_id: shared_id,
         });
         let input = TypedAst::new(
             TypedOp::TableScan {
@@ -10025,7 +10017,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(foreign_id),
+            expr_id: foreign_id,
         });
         let input = TypedAst::new(
             TypedOp::TableScan {
@@ -11412,7 +11404,7 @@ mod tests {
             qualifier: Some(Qualifier::single("emp")),
             data_type: DataType::Long,
             nullable: false,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         };
         let sql = render_column_reference(&c).expect("render");
         assert_eq!(sql, "emp.id");
@@ -12272,7 +12264,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql =
             super::render_sample_by(&typed_input, &col_ref, &[], None).expect("empty fractions ok");
@@ -12530,7 +12522,7 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::Timestamp,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
             ],
@@ -12713,7 +12705,7 @@ mod tests {
                 qualifier: None,
                 data_type: DataType::String,
                 nullable: true,
-                expr_id: None,
+                expr_id: ExprId::fresh(),
             })),
             updates: vec![("x".to_owned(), None)],
         });
@@ -12732,7 +12724,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_5".to_owned()],
@@ -12765,7 +12757,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_7".to_owned()],
@@ -12805,7 +12797,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned(), "i".to_owned()],
@@ -12858,7 +12850,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned()],
@@ -12896,7 +12888,7 @@ mod tests {
                         qualifier: None,
                         data_type: DataType::Array(Box::new(DataType::Long), true),
                         nullable: true,
-                        expr_id: None,
+                        expr_id: ExprId::fresh(),
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["i".to_owned()],
@@ -12953,7 +12945,7 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::Array(Box::new(DataType::String), true),
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
             ],
         );
@@ -13021,7 +13013,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_1".to_owned(), "y_2".to_owned()],
@@ -13069,7 +13061,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -13107,7 +13099,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -13140,7 +13132,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -13298,7 +13290,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn("size", vec![map_col]);
         assert_eq!(sql, "CAST(cardinality(attrs) AS BIGINT)");
@@ -13324,7 +13316,7 @@ mod tests {
                 true,
             ),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn("flatten", vec![outer]);
         assert!(
@@ -13385,7 +13377,7 @@ mod tests {
                         qualifier: None,
                         data_type: DataType::Array(Box::new(DataType::Long), true),
                         nullable: true,
-                        expr_id: None,
+                        expr_id: ExprId::fresh(),
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["k".to_owned()],
@@ -13809,7 +13801,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
@@ -13827,7 +13819,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn(
             "element_at",
@@ -13887,7 +13879,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn(
             "element_at",
@@ -13919,7 +13911,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn(
             "try_element_at",
@@ -13953,7 +13945,7 @@ mod tests {
                 value_nullable: true,
             },
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
         assert_eq!(sql, "element_at(attrs, 'missing')[1]");
@@ -14053,7 +14045,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::Array(Box::new(DataType::String), true),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
@@ -14168,7 +14160,7 @@ mod tests {
                     scale: 2,
                 },
                 nullable: true,
-                expr_id: None,
+                expr_id: ExprId::fresh(),
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
@@ -14179,7 +14171,7 @@ mod tests {
                     scale: 3,
                 },
                 nullable: true,
-                expr_id: None,
+                expr_id: ExprId::fresh(),
             })),
         });
         let sql = render_expr(&expr, &schema).expect("render decimal div");
@@ -15078,7 +15070,7 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::String,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING, price DOUBLE".to_owned()),
@@ -15122,7 +15114,7 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::String,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING".to_owned()),
@@ -15152,7 +15144,7 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::String,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("a INT, b STRING".to_owned()),
@@ -15185,14 +15177,14 @@ mod tests {
                     qualifier: None,
                     data_type: DataType::String,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
                     qualifier: None,
                     data_type: DataType::String,
                     nullable: true,
-                    expr_id: None,
+                    expr_id: ExprId::fresh(),
                 }),
             ],
         );

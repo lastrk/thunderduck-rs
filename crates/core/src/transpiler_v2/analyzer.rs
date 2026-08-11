@@ -12,8 +12,8 @@
 //!
 //! `analyze(ast, base_types)` runs three logical passes over a [`CommonAst`],
 //! producing a [`TypedAst`] whose every node carries a fully-resolved schema
-//! and whose every [`Expression::ColumnReference`] carries populated
-//! `data_type` and `nullable` fields:
+//! and whose every [`Expression::ColumnReference`] carries an `ExprId`, data
+//! type, and nullability:
 //!
 //! 1. **resolve** — bottom-up: convert `UnresolvedColumn` → `ColumnReference`
 //!    against the current operator's input schema, seed `TableScan` from
@@ -4111,7 +4111,7 @@ fn expose_missing_references(
     input_schema: &ResolvedSchema,
 ) -> Option<Expression> {
     if let Expression::ColumnReference(reference) = expr {
-        let id = reference.expr_id?;
+        let id = reference.expr_id;
         if let Some((_, field)) = schema.field_by_id(id, &reference.name) {
             return Some(Expression::ColumnReference(ColumnReference::from_attr(
                 field,
@@ -4315,10 +4315,7 @@ fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
 fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     match (a, b) {
         (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
-            match (ca.expr_id, cb.expr_id) {
-                (Some(ia), Some(ib)) => ia == ib,
-                _ => true,
-            }
+            ca.expr_id == cb.expr_id
         }
         _ => a
             .children()
@@ -4887,17 +4884,15 @@ fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
     let data_type = e.data_type(input);
     let nullable = e.nullable(input);
     if let Expression::ColumnReference(cr) = e {
-        if let Some(id) = cr.expr_id {
-            if let Some((_, src)) = input.field_by_id(id, &cr.name) {
-                let mut attr = src.clone();
-                attr.name = expression_output_name(e);
-                attr.data_type = data_type.clone();
-                attr.nullable = nullable;
-                if let Some(q) = &cr.qualifier {
-                    attr.source_quals.insert(q.clone());
-                }
-                return attr;
+        if let Some((_, src)) = input.field_by_id(cr.expr_id, &cr.name) {
+            let mut attr = src.clone();
+            attr.name = expression_output_name(e);
+            attr.data_type = data_type;
+            attr.nullable = nullable;
+            if let Some(q) = &cr.qualifier {
+                attr.source_quals.insert(q.clone());
             }
+            return attr;
         }
     }
     Attribute::minted(expression_output_name(e), data_type, nullable)
@@ -6629,7 +6624,7 @@ mod tests {
             let Expression::ColumnReference(reference) = projection else {
                 panic!("expected ColumnReference");
             };
-            assert_eq!(reference.expr_id, Some(field.expr_id));
+            assert_eq!(reference.expr_id, field.expr_id);
         }
     }
 
@@ -7329,9 +7324,9 @@ mod tests {
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
+        assert_eq!(l.expr_id, merged_join_expr_id_at(&typed, 0));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 5)));
+        assert_eq!(r.expr_id, merged_join_expr_id_at(&typed, 5));
     }
 
     #[test]
@@ -7345,9 +7340,9 @@ mod tests {
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 2)));
+        assert_eq!(l.expr_id, merged_join_expr_id_at(&typed, 2));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 4)));
+        assert_eq!(r.expr_id, merged_join_expr_id_at(&typed, 4));
     }
 
     #[test]
@@ -7367,9 +7362,9 @@ mod tests {
         let typed = analyze(joined, &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
+        assert_eq!(l.expr_id, merged_join_expr_id_at(&typed, 0));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 4)));
+        assert_eq!(r.expr_id, merged_join_expr_id_at(&typed, 4));
     }
 
     #[test]
@@ -7406,7 +7401,7 @@ mod tests {
             );
         };
         assert_eq!(proj_ref.qualifier, None);
-        assert_eq!(proj_ref.expr_id, Some(merged_join_expr_id_at(join, 2)));
+        assert_eq!(proj_ref.expr_id, merged_join_expr_id_at(join, 2));
     }
 
     #[test]
@@ -7890,7 +7885,7 @@ mod tests {
             TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "salary");
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[3].expr_id);
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -7910,7 +7905,7 @@ mod tests {
             TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "dept_name");
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[5].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[5].expr_id);
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -7945,7 +7940,7 @@ mod tests {
             TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier, None);
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[4].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[4].expr_id);
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -8433,7 +8428,7 @@ mod tests {
             } => match b.left.as_ref() {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier, None);
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[1].expr_id);
                     assert_eq!(c.name, "name");
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -8508,13 +8503,11 @@ mod tests {
                     assert_eq!(c.qualifier, None);
                     assert_eq!(
                         c.expr_id,
-                        Some(
-                            input
-                                .resolved_schema
-                                .field_by_name("dept_id")
-                                .expect("dept_id survives drop")
-                                .expr_id
-                        )
+                        input
+                            .resolved_schema
+                            .field_by_name("dept_id")
+                            .expect("dept_id survives drop")
+                            .expr_id
                     );
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -8552,13 +8545,11 @@ mod tests {
                     assert_eq!(c.qualifier, None);
                     assert_eq!(
                         c.expr_id,
-                        Some(
-                            input
-                                .resolved_schema
-                                .field_by_name("dept_id")
-                                .expect("dept_id untouched by withColumns")
-                                .expr_id
-                        )
+                        input
+                            .resolved_schema
+                            .field_by_name("dept_id")
+                            .expect("dept_id untouched by withColumns")
+                            .expr_id
                     );
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -8628,13 +8619,11 @@ mod tests {
                     assert_eq!(c.qualifier, None);
                     assert_eq!(
                         c.expr_id,
-                        Some(
-                            input
-                                .resolved_schema
-                                .field_by_name("id")
-                                .expect("id preserved by unpivot")
-                                .expr_id
-                        )
+                        input
+                            .resolved_schema
+                            .field_by_name("id")
+                            .expect("id preserved by unpivot")
+                            .expr_id
                     );
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -8707,13 +8696,11 @@ mod tests {
                     assert_eq!(c.qualifier, None);
                     assert_eq!(
                         c.expr_id,
-                        Some(
-                            input
-                                .resolved_schema
-                                .field_by_name("dept_id")
-                                .expect("dept_id is the grouping column")
-                                .expr_id
-                        )
+                        input
+                            .resolved_schema
+                            .field_by_name("dept_id")
+                            .expect("dept_id is the grouping column")
+                            .expr_id
                     );
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -8880,7 +8867,7 @@ mod tests {
                                     assert!(c.qualifier.is_none(), "chain root is unqualified");
                                     assert_eq!(
                                         c.expr_id,
-                                        Some(outer_address_id),
+                                        outer_address_id,
                                         "chain root must carry the OUTER address attribute's own id"
                                     );
                                 }
@@ -11562,7 +11549,6 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "address");
                 c.expr_id
-                    .expect("raw address column reference is id-carrying")
             }
             other => panic!("expected ColumnReference('address'), got {other:?}"),
         };
@@ -11577,8 +11563,7 @@ mod tests {
         match ev.child.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(
-                    c.expr_id,
-                    Some(address_id),
+                    c.expr_id, address_id,
                     "chain root must carry the SAME id as the raw address column reference"
                 );
             }
@@ -11787,7 +11772,7 @@ mod tests {
                         field_ty.clone(),
                     )])),
                     nullable: true,
-                    expr_id: Some(root_id),
+                    expr_id: root_id,
                 })),
                 extraction: Box::new(Expression::Literal(Literal {
                     value: LiteralValue::String("x".to_owned()),
@@ -12215,14 +12200,14 @@ mod tests {
         match &expanded[0] {
             Expression::ColumnReference(column) => {
                 assert_eq!(column.name, "customer_id");
-                assert_eq!(column.expr_id, Some(schema.fields[0].expr_id));
+                assert_eq!(column.expr_id, schema.fields[0].expr_id);
             }
             _ => panic!("expected ColumnReference"),
         }
         match &expanded[1] {
             Expression::ColumnReference(column) => {
                 assert_eq!(column.name, "order_id");
-                assert_eq!(column.expr_id, Some(schema.fields[2].expr_id));
+                assert_eq!(column.expr_id, schema.fields[2].expr_id);
             }
             _ => panic!("expected ColumnReference"),
         }
@@ -12302,8 +12287,7 @@ mod tests {
         let Expression::ColumnReference(column) = &expanded[0] else {
             panic!("expected ColumnReference");
         };
-        assert_eq!(column.expr_id, Some(schema.fields[1].expr_id));
-
+        assert_eq!(column.expr_id, schema.fields[1].expr_id);
         let dotted_capture = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: ".*_id".to_owned(),
             qualifier: Some(Qualifier::single("catalog.right")),
@@ -12408,10 +12392,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![
-                Some(schema.fields[0].expr_id),
-                Some(schema.fields[1].expr_id)
-            ]
+            vec![schema.fields[0].expr_id, schema.fields[1].expr_id]
         );
     }
 
@@ -14200,7 +14181,7 @@ mod tests {
                         c.qualifier, None,
                         "plan_id=2 must resolve bare (Phase 3b: no synthetic qualifier)"
                     );
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[4].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[4].expr_id);
                 }
                 other => panic!("expected ColumnReference, got: {other:?}"),
             }
@@ -14244,7 +14225,7 @@ mod tests {
                         c.qualifier, None,
                         "plan_id=1 must resolve bare (Phase 3b: no synthetic qualifier)"
                     );
-                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
+                    assert_eq!(c.expr_id, input.resolved_schema.fields[3].expr_id);
                 }
                 other => panic!("expected ColumnReference, got: {other:?}"),
             }
@@ -14323,9 +14304,9 @@ mod tests {
         let typed = analyze(joined, &bt).expect("distinct-pid dept_id condition should resolve");
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
+        assert_eq!(l.expr_id, merged_join_expr_id_at(&typed, 0));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 6)));
+        assert_eq!(r.expr_id, merged_join_expr_id_at(&typed, 6));
     }
 
     #[test]
@@ -15255,7 +15236,7 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "sum(salary)");
                 assert!(c.qualifier.is_none());
-                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
+                assert_eq!(c.expr_id, input.resolved_schema.fields[1].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15360,7 +15341,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert!(c.qualifier.is_none());
-                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
+                assert_eq!(c.expr_id, input.resolved_schema.fields[0].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15430,7 +15411,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "id");
-                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
+                assert_eq!(c.expr_id, input.resolved_schema.fields[0].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15565,14 +15546,14 @@ mod tests {
         match &projections[0] {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "name");
-                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[0].expr_id));
+                assert_eq!(c.expr_id, sort_ast.resolved_schema.fields[0].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
         match &projections[1] {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "sum(salary)");
-                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[1].expr_id));
+                assert_eq!(c.expr_id, sort_ast.resolved_schema.fields[1].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15592,7 +15573,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "dept_id");
-                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[2].expr_id));
+                assert_eq!(c.expr_id, sort_ast.resolved_schema.fields[2].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15660,8 +15641,7 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert!(c.qualifier.is_none());
                 assert_eq!(
-                    c.expr_id,
-                    Some(input.resolved_schema.fields[0].expr_id),
+                    c.expr_id, input.resolved_schema.fields[0].expr_id,
                     "the folded grouping expression is aggregates[0] by construction"
                 );
             }
@@ -15712,7 +15692,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "salary");
-                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[2].expr_id));
+                assert_eq!(c.expr_id, sort_ast.resolved_schema.fields[2].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -16066,7 +16046,7 @@ mod tests {
             qualifier: Some(Qualifier::single("e")),
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         });
         assert_eq!(ensure_named(bare_qualified.clone()), bare_qualified);
 
@@ -16128,14 +16108,14 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "dept_id");
-                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
+                assert_eq!(c.expr_id, input.resolved_schema.fields[0].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
         match order[1].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "avg(salary)");
-                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
+                assert_eq!(c.expr_id, input.resolved_schema.fields[1].expr_id);
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -16914,7 +16894,7 @@ mod tests {
             qualifier: Some(Qualifier::single("e")),
             data_type: field.data_type.clone(),
             nullable: field.nullable,
-            expr_id: Some(field.expr_id),
+            expr_id: field.expr_id,
         });
         let attr = output_attribute(&cr, &scanned.resolved_schema);
         let expected: BTreeSet<Qualifier> = [Qualifier::single("emp"), Qualifier::single("e")]
@@ -17091,18 +17071,15 @@ mod tests {
             },
             ResolvedSchema::new(vec![Attribute::minted("dept_id", DataType::Integer, false)]),
         );
+        let projection = Expression::ColumnReference(ColumnReference::from_attr(
+            &input.resolved_schema.fields[0],
+        ));
         let child_attr = Attribute::minted("id", DataType::Integer, false);
         let child_id = child_attr.expr_id;
         let mut child = TypedAst::new(
             TypedOp::Project {
                 input: Box::new(input),
-                projections: vec![Expression::ColumnReference(ColumnReference {
-                    name: "dept_id".to_owned(),
-                    qualifier: None,
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    expr_id: None,
-                })],
+                projections: vec![projection],
             },
             ResolvedSchema::new(vec![child_attr]),
         );
@@ -17178,14 +17155,14 @@ mod tests {
             qualifier: Some(Qualifier::single("t1")),
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(id_a),
+            expr_id: id_a,
         });
         let b = Expression::ColumnReference(ColumnReference {
             name: "x".to_owned(),
             qualifier: Some(Qualifier::single("t2")),
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(id_b),
+            expr_id: id_b,
         });
         assert!(
             !semantic_eq(&a, &b),
@@ -17221,14 +17198,14 @@ mod tests {
                 qualifier: None,
                 data_type: e_field.data_type.clone(),
                 nullable: e_field.nullable,
-                expr_id: Some(e_field.expr_id),
+                expr_id: e_field.expr_id,
             }),
             Expression::ColumnReference(ColumnReference {
                 name: d_field.name.clone(),
                 qualifier: None,
                 data_type: d_field.data_type.clone(),
                 nullable: d_field.nullable,
-                expr_id: Some(d_field.expr_id),
+                expr_id: d_field.expr_id,
             }),
         ];
         let grouping = aggregates.clone();
@@ -17249,8 +17226,7 @@ mod tests {
         match bound {
             Expression::ColumnReference(c) => {
                 assert_eq!(
-                    c.expr_id,
-                    Some(d_field.expr_id),
+                    c.expr_id, d_field.expr_id,
                     "must bind aggregates[1] (the d-side entry), not aggregates[0] \
                      which merely shares the name"
                 );
@@ -17348,8 +17324,7 @@ mod tests {
             match so.expr.as_ref() {
                 Expression::ColumnReference(c) => {
                     assert_eq!(
-                        c.expr_id,
-                        Some(promoted_id),
+                        c.expr_id, promoted_id,
                         "order-by key {i} must bind the SAME promoted entry by id"
                     );
                 }
@@ -17427,8 +17402,7 @@ mod tests {
                     Some("e".to_owned())
                 );
                 assert_eq!(
-                    c.expr_id,
-                    Some(outer_salary_id),
+                    c.expr_id, outer_salary_id,
                     "tier-(g) must stamp the matched OUTER attribute's expr_id"
                 );
             }
@@ -17444,13 +17418,12 @@ mod tests {
             qualifier: Some(Qualifier::single("t")),
             data_type: DataType::Integer,
             nullable: true,
-            expr_id: Some(id),
+            expr_id: id,
         });
         match canonicalize_for_semantic_eq(&c) {
             Expression::ColumnReference(cc) => {
                 assert_eq!(
-                    cc.expr_id,
-                    Some(id),
+                    cc.expr_id, id,
                     "canonicalize_for_semantic_eq must preserve expr_id"
                 );
                 assert_eq!(cc.name, "x", "name must still be case-folded");

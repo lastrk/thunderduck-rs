@@ -1,4 +1,5 @@
 use super::expression::Expression;
+use super::function_registry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeneratorKind {
@@ -33,30 +34,11 @@ impl Generator {
     }
 
     fn classify(name: &str) -> Option<(GeneratorKind, bool)> {
-        let (kind, outer) = match name {
-            "explode" => (GeneratorKind::Explode, false),
-            "explode_outer" => (GeneratorKind::Explode, true),
-            "posexplode" => (GeneratorKind::PosExplode, false),
-            "posexplode_outer" => (GeneratorKind::PosExplode, true),
-            "inline" => (GeneratorKind::Inline, false),
-            "inline_outer" => (GeneratorKind::Inline, true),
-            "json_tuple" => (GeneratorKind::JsonTuple, false),
-            "stack" => (GeneratorKind::Stack, false),
-            _ => return None,
-        };
-        Some((kind, outer))
+        function_registry::generator_spec(name).map(|spec| (spec.kind, spec.outer))
     }
 
     pub fn name(&self) -> &'static str {
-        match (self.kind, self.outer) {
-            (GeneratorKind::Explode, false) => "explode",
-            (GeneratorKind::Explode, true) => "explode_outer",
-            (GeneratorKind::PosExplode, false) => "posexplode",
-            (GeneratorKind::PosExplode, true) => "posexplode_outer",
-            (GeneratorKind::Inline, false) => "inline",
-            (GeneratorKind::Inline, true) => "inline_outer",
-            (GeneratorKind::JsonTuple, _) => "json_tuple",
-            (GeneratorKind::Stack, _) => "stack",
-        }
+        function_registry::generator_name(self.kind, self.outer)
+            .expect("every Generator kind/outer pair is registry-backed")
     }
 }

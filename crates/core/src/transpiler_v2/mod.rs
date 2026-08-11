@@ -22,6 +22,8 @@ pub mod emission;
 pub mod error;
 pub mod expression;
 pub mod function_catalog;
+mod function_literals;
+pub(crate) mod function_registry;
 pub mod generator;
 pub mod identifier;
 pub mod invariants;

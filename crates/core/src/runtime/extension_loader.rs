@@ -93,6 +93,7 @@ fn load_optional_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpiler_v2::function_registry::ExtensionFunction;
 
     fn conn() -> duckdb::Connection {
         let config = duckdb::Config::default()
@@ -104,6 +105,23 @@ mod tests {
     #[test]
     fn no_path_is_a_noop() {
         assert!(load_optional_extension(&conn(), None).is_ok());
+    }
+
+    #[test]
+    fn every_emitted_extension_target_exists() {
+        let conn = conn();
+        load(&conn).expect("load thdck_spark_funcs");
+
+        for target in ExtensionFunction::ALL {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM duckdb_functions() WHERE function_name = ?",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("inspect loaded extension functions");
+            assert!(count > 0, "missing extension target `{}`", target.as_str());
+        }
     }
 
     /// Pins the shipped `spark_avg` aggregate's native DECIMAL result type,

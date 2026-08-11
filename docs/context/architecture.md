@@ -26,7 +26,8 @@ crates/core/                        # Pure translation engine (no gRPC)
     expression.rs                   # τ Expression enum
     type_inference.rs               # Spark-parity type inference
     statement.rs                    # SqlStatement / DdlStatement (CREATE/DROP/INSERT) + render_ddl
-    function_catalog.rs             # Static roster of τ-supported Spark functions
+    function_catalog.rs             # Catalog view derived from the live registry
+    function_registry.rs            # Scalar/Aggregate/Generator/Special/Lowered routes
     invariants.rs                   # INV1-10 mechanical enforcement
   parser_v2/                        # SparkSQL parser (sqlparser-rs + SparkDialect) → CommonAst
   types/                            # DataType, StructField, StructType

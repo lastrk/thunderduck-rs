@@ -1,6 +1,6 @@
 # τ architecture simplification and code-reduction plan
 
-**Status:** In progress — Phase 3 complete; Phase 4 not started
+**Status:** In progress — Phase 4 complete
 
 **Recorded:** 2026-08-07
 
@@ -373,74 +373,43 @@ from replacing the synthetic representation.
 
 ## Phase 4 — create one live function-spec registry
 
-### Current duplication
+### Completed result (2026-08-11)
 
-Function knowledge is independently encoded in `SUPPORTED_FUNCTIONS`, scalar
-return-type logic, aggregate specs, expression nullability, the large emission
-match, extension-symbol validation, and runtime macros. These sources already
-drift: the audit found functions handled by inference and emission but absent
-from the catalog, including `approx_count_distinct`, `bit_get`, `btrim`,
-`json_object_keys`, `max_by`, `min_by`, `substring_index`, `try_avg`,
-`try_sum`, and `any_value`.
-
-Literal/schema parsers also currently point the wrong direction:
-`parse_number_format_for_type_inference`,
-`from_json_ddl_to_struct_for_type_inference`, and
-`from_csv_ddl_to_struct` make type reasoning depend on emission-owned helpers.
-
-### Target invariant
-
-One τ-owned registry is read in production by catalog exposure, arity and kind
-classification, ordinary return-type/nullability inference, ordinary emission,
-and extension-target validation. Complex Spark semantics remain hand-written,
-but the registry names their exhaustive special handler. No declarative row is
-allowed to exist solely for tests.
-
-A likely closed representation is:
+The bounded prototype documented in
+[`phase-4-live-function-registry-analysis-2026-08.md`](phase-4-live-function-registry-analysis-2026-08.md)
+passed its deletion gate, and the follow-on cleanup migrated the full callable
+surface. The final representation deliberately preserves five routes:
 
 ```text
-FunctionSpec {
-    canonical_name, aliases, kind, arity,
-    type_rule, null_rule, emit_rule
-}
-
-EmitRule = Native | Rename(name) | Extension(name) | Special(SpecialFunction)
+FunctionImplementation =
+    Scalar(ordinary interpreted rules)
+  | Aggregate(ordinary interpreted rules)
+  | Generator(structured generator)
+  | Special(closed handwritten handler)
+  | Lowered(frontend-owned syntax/IR)
 ```
 
-These are enums/data interpreted by every live client, not function pointers or
-a new dynamic dispatch layer.
-
-### Work
-
-1. Extract pure DDL/format parsing into a neutral τ module consumed by both
-   analysis and emission.
-2. Build a vertical prototype with representative cases:
-   - one native scalar;
-   - one renamed DuckDB scalar;
-   - one extension scalar;
-   - one aggregate;
-   - one irreducible special function.
-3. Require the catalog, inference, nullability, emission, and extension checks
-   to consume those prototype rows in production.
-4. Compare added interpreter code with deleted match/list code. Reject the
-   design if a second hand-written path remains authoritative.
-5. Migrate simple families incrementally. Keep complex cases in exhaustive
-   `SpecialFunction` handlers until repetition demonstrates a smaller rule.
-6. Generate the extension-target set from `EmitRule::Extension` and make its
-   invariant live.
-7. Delete shadowed runtime macros only after Phase 1's direct-SQL validation.
-8. Add exact-set consistency tests so a cataloged function cannot lack a live
-   route and a public live route cannot disappear from the catalog unnoticed.
-
-### Go/no-go gate
-
-- A new ordinary function is added in one spec row plus semantic code only when
-  its rule is genuinely special.
-- Every registry field has at least one production reader.
-- The prototype deletes more production code than its interpreter adds.
-- No behavior-bearing list remains duplicated for migrated functions.
-- ADR-009 and INV3/INV10 remain satisfied; this is a τ-owned registry, not a
-  reintroduction of the deleted v1 `FunctionRegistry`.
+- One sorted registry owns all 352 supported Spark and Connect spellings: 159
+  scalar, 60 aggregate, eight generator, 123 special, and two lowered.
+- Catalog exposure is derived directly from the registry. The 204-name legacy
+  roster and its union/disjointness machinery are deleted.
+- Ordinary type, nullability, and emission families are interpreted from row
+  data. Unknown calls stop at the registry boundary instead of reaching a
+  permissive native fallback.
+- `SpecialFunction` remains the correct home for Spark-specific bodies. Type,
+  nullability, and emission exhaustively match its closed discriminants.
+- Generator calls lower to structured generator IR; `cast` and `when` remain
+  frontend-owned lowering routes.
+- Extension/session targets remain closed enums with live existence checks;
+  neutral literal/schema parsing stays outside emission.
+- Against the prototype commit, the same five pre-test production modules lose
+  another 31 physical lines. Combined with the prototype's recorded reduction,
+  Phase 4 is net -91 production lines from its starting point.
+- `cargo fmt --all --check`, strict workspace Clippy, and all workspace tests
+  pass (Connect 164/164; core 1330/1330, with declared ignores only).
+- The complete DataFrame corpus is 422 green with the same seven known deferred
+  cases; the SQL corpus is 426 green with two intentional skips. The checked-in
+  829-case prior-green oracle reports zero regressions.
 
 ## Phase 5 — simplify runtime and service intent
 

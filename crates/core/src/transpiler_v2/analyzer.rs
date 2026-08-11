@@ -51,13 +51,12 @@ use super::expression::{
     FunctionCall, Literal, LiteralValue, SortOrder, StarExpression, SubqueryPlan, UnaryExpression,
     UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
 };
+use super::function_registry;
 use super::generator::{Generator, GeneratorKind};
 use super::identifier::Qualifier;
 use super::name_fold::{eq_fold, fold_key};
 use super::schema::{Attribute, ExprId, ResolvedSchema};
-use super::type_inference::{
-    is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
-};
+use super::type_inference::{is_nondeterministic_fn_name, TypeInferenceEngine};
 use crate::types::{DataType, StructField, StructType};
 
 // Re-export SetOpKind so downstream callers can use `analyzer::SetOpKind`.
@@ -3925,7 +3924,7 @@ fn analyze_sort_key(
     match step1 {
         Ok(resolved) => {
             let restates_aggregate = matches!(ti.op, TypedOp::Aggregate { .. })
-                && contains_matching_call(&resolved, is_aggregate_classifier_name);
+                && contains_matching_call(&resolved, function_registry::is_aggregate);
             if !restates_aggregate {
                 return Ok(resolved);
             }
@@ -4180,7 +4179,7 @@ fn promote_subtree(
     }
     match kind {
         MissingColumnChild::Aggregate { grouping } => {
-            let is_new_aggregate = matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
+            let is_new_aggregate = matches!(&expr, Expression::FunctionCall(f) if function_registry::is_aggregate(&f.name));
             let matches_grouping = ca_expr
                 .as_ref()
                 .is_some_and(|ca| grouping.iter().any(|g| semantic_eq_against(ca, g)));

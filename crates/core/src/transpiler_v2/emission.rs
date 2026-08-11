@@ -23,12 +23,19 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::function_literals::{
+    parse_from_csv_schema, parse_from_json_schema, parse_number_format,
+};
+use super::function_registry::{
+    self, AggregateEmission, AggregateSpecial, ExtensionFunction, ScalarEmission, ScalarSpec,
+    SpecialFunction,
+};
 use super::generator::{Generator, GeneratorKind};
 pub(crate) use super::identifier::quote_ident;
 use super::identifier::Qualifier;
 use super::name_fold::{eq_fold, fold_key};
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
-use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
+use super::type_inference::TypeInferenceEngine;
 use crate::types::pyspark_parity::uniquify;
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
@@ -3219,9 +3226,7 @@ fn render_group_exprs(
 }
 
 fn is_aggregate_name(name: &str) -> bool {
-    // Classifier roster lives in the `AGG_SPECS` table (`type_inference.rs`);
-    // the lookup is case-insensitive without allocating a lowercased `String`.
-    is_aggregate_classifier_name(name)
+    function_registry::is_aggregate(name)
 }
 
 /// Wrap a rendered format-string expression (typically a string literal, but
@@ -3766,12 +3771,12 @@ fn render_ceil_floor(
 /// keep-arity, shared by the two trim sites. The sites' trim GUARDS are
 /// deliberately divergent — do NOT unify them without a corpus witness:
 ///
-/// * [`render_function_call`] (reached by `nth_value`/`lag`/`lead`, whose
-///   aggregate-classifier bit is false) trims ONLY when every extra trailing
+/// * [`render_function_call`] (reached by scalar/window-only
+///   `nth_value`/`lag`/`lead`) trims ONLY when every extra trailing
 ///   arg is a boolean literal — it never drops a real value. Anchor: corpus
 ///   win-006.
 /// * [`render_aggregate`] (reached by `first`/`last`/`first_value`/
-///   `last_value`, which the classifier routes there) trims UNCONDITIONALLY
+///   `last_value`, which the registry marks aggregate) trims UNCONDITIONALLY
 ///   whenever extra args are present (corpus uses ignorenulls=True, which
 ///   matches DuckDB's default).
 fn trailing_ignore_nulls_keep_arity(name_lower: &str) -> Option<usize> {
@@ -3791,16 +3796,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
     Ok(sql)
 }
 
-/// Emission-owned divergence roster: Date-typed Spark functions whose
-/// DuckDB-rendered substrate form natively returns TIMESTAMP (DATE±INTERVAL
-/// promotion / date_trunc). Single home of the corrective cast.
-/// Mechanically gated by `date_typed_functions_return_date_in_duckdb`.
-///
-/// Future-author rule: a NEW Date-returning function is added to
-/// [`TypeInferenceEngine`]'s `DATE_RETURNING_FNS` ALWAYS (the type
-/// authority), and to this roster ONLY when its emitted DuckDB form
-/// diverges from DATE — the audit test fails until the two agree with
-/// reality, so a wrong guess cannot land silently.
+/// Corrects Date-typed calls whose DuckDB substrate returns Timestamp.
+/// `date_typed_functions_return_date_in_duckdb` guards this divergence list.
 fn needs_date_return_cast(f: &FunctionCall) -> bool {
     match f.name.as_str() {
         "add_months" | "date_add" | "date_sub" => true,
@@ -3809,30 +3806,33 @@ fn needs_date_return_cast(f: &FunctionCall) -> bool {
     }
 }
 
+fn render_registered_scalar(
+    f: &FunctionCall,
+    spec: &ScalarSpec,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let target = match spec.emission {
+        ScalarEmission::Extension(target) => target.as_str(),
+        ScalarEmission::Native => f.name.as_str(),
+        ScalarEmission::Rename(target) => target.as_str(),
+        ScalarEmission::Session(target) => target.as_str(),
+    };
+    let args = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
+    Ok(format!("{target}({args})"))
+}
+
 fn render_function_call_dispatch(
     f: &FunctionCall,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // N5: `f.name` is already canonical lowercase — `name_lower` borrows it
-    // rather than cloning (post-N5, no re-derivation is needed; the ~1900-
-    // line match below reads it, never mutates or moves it).
     let name_lower: &str = f.name.as_str();
-    // Aggregate-name overlap check — if the analyzer classified a FunctionCall
-    // as aggregate, `render_expr` routes to `render_aggregate` before this
-    // function; anything reaching here is scalar by construction. Defense in
-    // depth: any name in the classifier roster should never be seen here.
-    // Window-only functions with a trailing `ignoreNulls` argument that PySpark
-    // serializes verbatim — DuckDB's `nth_value(col, n)` / `lag`/`lead`/
-    // `first_value`/`last_value` do not accept the boolean flag. Drop the
-    // trailing bool; keep-arity is single-homed in
-    // [`trailing_ignore_nulls_keep_arity`]. Anchor: corpus win-006.
+    // DuckDB omits Spark's trailing window `ignoreNulls` argument.
     if matches!(
         name_lower,
         "nth_value" | "first_value" | "last_value" | "lag" | "lead"
     ) {
         if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(name_lower) {
-            // Only apply the trim if the extra trailing arg is a boolean literal
-            // (Spark's ignoreNulls flag). Never silently drop a real value.
+            // Never discard a non-flag argument.
             if f.args.len() > arity_keep {
                 let extras = &f.args[arity_keep..];
                 let all_bool_literals = extras.iter().all(|e| bool_literal(e).is_some());
@@ -3845,35 +3845,55 @@ fn render_function_call_dispatch(
             }
         }
     }
+    if let Some(spec) = function_registry::scalar_spec(name_lower) {
+        return render_registered_scalar(f, spec, schema);
+    }
+    let Some(special) = function_registry::special_function(name_lower) else {
+        let reason = if function_registry::lowered_function(name_lower).is_some() {
+            "function must be lowered by the frontend"
+        } else {
+            "function not present in the live function registry"
+        };
+        bail_boundary_fn!(f.name.clone(), reason);
+    };
     let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
-    // Handful of Spark-name → DuckDB-name remappings where the direct
-    // pass-through wouldn't work. Everything else passes through unchanged.
-    let duck_name: &str = match name_lower {
-        // DuckDB parses `not` as a keyword; Spark sends unary NOT as a
-        // function. Emit as a keyword expression.
-        "not" => {
+    let duck_name: &str = match special {
+        SpecialFunction::SubstringIndex => {
+            let [value, delimiter, count] =
+                exact_args(f, schema, "`substring_index` requires exactly 3 arguments")?;
+            return Ok(format!(
+                "CASE WHEN ({count}) >= 0 \
+                 THEN array_to_string(list_slice(string_split({value}, {delimiter}), 1, ({count})), {delimiter}) \
+                 ELSE array_to_string(list_slice(string_split({value}, {delimiter}), ({count}), -1), {delimiter}) \
+                 END"
+            ));
+        }
+        // DuckDB parses `not` as a keyword.
+        SpecialFunction::Not => {
             let [a] = exact_args(f, schema, "`not` requires exactly one argument")?;
             return Ok(format!("(NOT {a})"));
         }
-        // Spark's `array()` literal — DuckDB uses `[a, b, c]` or
-        // `list_value(a, b, c)`. Emit the list_value form since it accepts
-        // zero-or-more args uniformly.
-        "array" => "list_value",
-        // Spark's `map()` literal — takes flat key/value pairs; DuckDB uses
-        // `map { k: v, ... }` or `map_from_entries`. For a variable pair
-        // count, emit via `map(list_value(k1,k2,...), list_value(v1,v2,...))`
-        // — but that requires splitting args, so this uses the more
-        // permissive `map_from_entries` shape if args come pre-paired.
-        // Spark's `create_map(k1, v1, k2, v2, ...)` (wire name `map`) builds
-        // a MAP from interleaved key/value scalars. DuckDB's `map` expects
-        // two lists (keys and values), so split the args and emit
-        // `map(list_value(k1, k2, ...), list_value(v1, v2, ...))`.
-        // Zero-arg produces an empty MAP; type is `Map<VARCHAR, VARCHAR>`
-        // by default — pin it with an explicit cast to avoid DuckDB's
-        // "template parameter type 'K' could not be resolved" error.
-        // Corpus: `map-006` (map_concat over create_map(...)) exercises
-        // this path.
-        "map" | "create_map" => {
+        SpecialFunction::EqNullSafe => {
+            let [a, b] = exact_args(f, schema, "`eqNullSafe` requires exactly 2 arguments")?;
+            return Ok(format!("({a} IS NOT DISTINCT FROM {b})"));
+        }
+        SpecialFunction::BitwiseAnd => {
+            let [a, b] = exact_args(f, schema, "`bitwiseAND` requires exactly 2 arguments")?;
+            return Ok(format!("({a} & {b})"));
+        }
+        SpecialFunction::BitwiseOr => {
+            let [a, b] = exact_args(f, schema, "`bitwiseOR` requires exactly 2 arguments")?;
+            return Ok(format!("({a} | {b})"));
+        }
+        SpecialFunction::BitwiseXor => {
+            let [a, b] = exact_args(f, schema, "`bitwiseXOR` requires exactly 2 arguments")?;
+            return Ok(format!("xor({a}, {b})"));
+        }
+        // `list_value` accepts the empty Spark array constructor.
+        SpecialFunction::Array => "list_value",
+        // Spark interleaves map keys and values; DuckDB expects two lists.
+        // Empty lists need explicit types so DuckDB can bind the constructor.
+        SpecialFunction::Map | SpecialFunction::CreateMap => {
             if f.args.is_empty() {
                 return Ok("map([]::VARCHAR[], []::VARCHAR[])".to_owned());
             }
@@ -3886,20 +3906,9 @@ fn render_function_call_dispatch(
             })?;
             return Ok(format!("map(list_value({keys}), list_value({vals}))"));
         }
-        // Spark's `struct(a, b, ...)` — Catalyst `CreateStruct`. Field
-        // names derive per-argument from `derive_struct_field_name` (Alias
-        // > ColumnReference > UnresolvedColumn > String literal > `colN`
-        // fallback). Emit DuckDB `struct_pack(name := expr, ...)` — the
-        // only DuckDB idiom that produces a named-field STRUCT. The
-        // `col{i+1}` fallback is Spark's documented behavior, not a
-        // silent NULL. Zero-arg `struct()` is valid: emits
-        // `struct_pack()`.
-        // Aliased arguments (`col.alias("x")`) contribute their alias to
-        // the field name but must NOT render as `expr AS x` inside the
-        // function-argument list — DuckDB rejects SELECT-list `AS` syntax
-        // inside function calls. Strip the outer Alias when rendering the
-        // value expression.
-        "struct" => {
+        // Derive Spark field names, but strip aliases from struct values because
+        // DuckDB rejects `AS` inside `struct_pack` arguments.
+        SpecialFunction::Struct => {
             let parts = sql_join(f.args.iter().enumerate(), ", ", |(i, arg)| {
                 let name = super::struct_names::derive_struct_field_name(arg, i);
                 let val = render_expr(arg.unaliased(), schema)?;
@@ -3908,72 +3917,26 @@ fn render_function_call_dispatch(
             })?;
             return Ok(format!("struct_pack({parts})"));
         }
-        // Spark's `locate(needle, haystack[, start])` → DuckDB's
-        // `strpos(haystack, needle)` (no start-position support).
-        "locate" => {
+        // DuckDB reverses locate's first two arguments.
+        SpecialFunction::Locate => {
             let [needle, haystack] = min_args(f, schema, "`locate` requires at least 2 arguments")?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
-        // Spark's `btrim(str[, trimStr])` trims characters in `trimStr`
-        // (default: whitespace) from both ends of `str`. DuckDB's `trim`
-        // has the identical signature and semantics — same name, same arg
-        // order; just rename.
-        "btrim" => "trim",
-        // Spark's `substring_index(str, delim, count)` returns the substring
-        // of `str` before the `count`-th occurrence of `delim`: `count > 0`
-        // counts from the left (keep the first `count` delimited pieces),
-        // `count < 0` counts from the right (keep the last `|count|`
-        // pieces), `count == 0` yields an empty string. DuckDB has no
-        // direct equivalent; emulate via `string_split` + `list_slice` +
-        // `array_to_string`. `list_slice` clamps out-of-range bounds (a
-        // count larger than the number of occurrences returns the whole
-        // list, matching Spark) and propagates NULL through a NULL `str`
-        // unchanged, so no separate NULL guard is needed. Empirically
-        // verified against live Spark 4.1.1 for count > 0 / < 0 / == 0, a
-        // count exceeding the occurrence count, and `delim` absent from
-        // `str`. Corpus: `test_substring_index`.
-        "substring_index" => {
-            let [s, delim, count] =
-                exact_args(f, schema, "`substring_index` requires exactly 3 arguments")?;
-            return Ok(format!(
-                "CASE WHEN ({count}) >= 0 \
-                 THEN array_to_string(list_slice(string_split({s}, {delim}), 1, ({count})), {delim}) \
-                 ELSE array_to_string(list_slice(string_split({s}, {delim}), ({count}), -1), {delim}) \
-                 END"
-            ));
-        }
-        // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
-        // 0..6 (Sunday=0). Add 1 to align with Spark.
-        "dayofweek" => {
+        // Spark numbers Sunday as 1; DuckDB uses 0.
+        SpecialFunction::Dayofweek => {
             let [a] = exact_args(f, schema, "`dayofweek` requires exactly 1 argument")?;
             return Ok(format!("(dayofweek({a}) + 1)"));
         }
-        // Spark's `date_format(date, fmt)` → DuckDB `strftime(date, fmt)`.
-        // Note: Spark uses Java SimpleDateFormat tokens (yyyy/MM/dd) while
-        // DuckDB uses strftime tokens (%Y/%m/%d). We do a best-effort
-        // token translation for the most common patterns; complex format
-        // strings will diverge and require per-case follow-ups.
-        "date_format" if f.args.len() == 2 => {
+        // Translate Spark's date pattern before calling `strftime`.
+        SpecialFunction::DateFormat if f.args.len() == 2 => {
             let [d, fmt] = rendered_args(f, schema)?;
-            // Translate Spark tokens to strftime tokens at emission time
-            // — supports yyyy/MM/dd/HH/mm/ss and common variants.
             let duck_fmt = spark_fmt_to_duckdb(&fmt);
             return Ok(format!("strftime({d}, {duck_fmt})"));
         }
-        // Spark's `to_char(x, fmt)` has two forms: datetime (mirrors
-        // `date_format`, translated via `strftime` + the shared Spark→DuckDB
-        // token helper) and numeric-picture (`9`/`0`/`.`/`,`/`$`/`S`/`MI`/
-        // `PR`/`L`…, e.g. `to_char(78.12, '99.99')` → `'78.12'`). DuckDB has
-        // neither natively; only the datetime form is implemented — the
-        // numeric-picture form is a genuine ADR-022 Thunderduck-boundary gap
-        // (Spark succeeds; τ honestly does not implement the picture model).
-        // Corpus: `test_to_char` (test_string_collection_differential, DATE
-        // form only — the numeric form cannot be a green corpus case).
-        "to_char" if f.args.len() == 2 => match f.args[0].data_type(schema) {
-            // `Null` rides the datetime arm: Spark returns NULL for
-            // `to_char(NULL, fmt)` in BOTH the datetime and numeric-picture
-            // forms, and `strftime(NULL, …)` is NULL — routing it to the
-            // boundary error would DIVERGE (implementation constraint).
+        // Datetime `to_char` shares date-pattern translation; numeric-picture
+        // formatting remains an explicit Thunderduck boundary.
+        SpecialFunction::ToChar if f.args.len() == 2 => match f.args[0].data_type(schema) {
+            // Either `to_char` form returns NULL for a NULL input.
             DataType::Date | DataType::Timestamp | DataType::TimestampNtz | DataType::Null => {
                 let [d, fmt] = rendered_args(f, schema)?;
                 let duck_fmt = spark_fmt_to_duckdb(&fmt);
@@ -3988,50 +3951,15 @@ fn render_function_call_dispatch(
                 );
             }
         },
-        // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
-        // Spark's arg order is (date, fmt); DuckDB's is (fmt, date). DuckDB's
-        // `date_trunc` natively returns TIMESTAMP; the `render_function_call`
-        // wrapper (via `needs_date_return_cast`) supplies the CAST back to
-        // Spark's DATE return type — no cast here.
-        "trunc" if f.args.len() == 2 => {
+        // DuckDB reverses trunc's arguments; the outer wrapper restores Date.
+        SpecialFunction::Trunc if f.args.len() == 2 => {
             let [d, fmt] = rendered_args(f, schema)?;
             return Ok(format!("date_trunc({fmt}, {d})"));
         }
-        // Spark → thdck_spark_funcs extension remaps.
-        // These functions require the ext6 extension, loaded at session
-        // start by `DuckDbSession`.
-        "hash" | "murmur3" => "spark_hash",
-        "xxhash64" => "spark_xxhash64",
-        "try_divide" => "spark_try_divide",
-        // Spark's `crc32(binary)` — no `spark_crc32` in `thdck_spark_funcs`
-        // ext6, so τ ships a bit-exact CRC-32-IEEE session macro
-        // (`java.util.zip.CRC32` emulation) registered by
-        // `DuckDbSession::spawn`. Long-term the C++ extension may absorb this;
-        // the dispatch arm stays either way. Corpus: `hash-001`.
-        "crc32" => "spark_crc32",
-        "spark_hash" => "spark_hash",
-        "spark_xxhash64" => "spark_xxhash64",
-        "spark_try_divide" => "spark_try_divide",
-        "spark_try_sum" => "spark_try_sum",
-        "spark_try_avg" => "spark_try_avg",
-        "spark_decimal_div" => "spark_decimal_div",
-        // Spark's `schema_of_json(json_str)` — DuckDB has no native
-        // equivalent that returns Spark-DDL. The `thdck_spark_funcs`
-        // extension provides `spark_schema_of_json`. Corpus: `json-006`.
-        "schema_of_json" => "spark_schema_of_json",
-        // Spark's `to_json(col[, options])` runs `JacksonGenerator` with
-        // `SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true` by default, which
-        // omits object entries whose value is JSON `null` at every nesting
-        // level (array elements that are null are preserved as `null`, and
-        // empty-object containers stay as `{}`). DuckDB's native `to_json`
-        // has no such option, so wrap the call with DuckDB's recursive
-        // `json_strip_nulls` (JSON extension, already loaded at session
-        // start per ADR-020) to match Spark exactly. When the caller
-        // passes an explicit `MapLiteral{'ignoreNullFields': 'false'}`
-        // options map, emit the bare `to_json` instead. Any other options
-        // key or non-`MapLiteral` second argument is a Thunderduck-boundary
-        // error (ADR-022). Corpus: `json-005`.
-        "to_json" => match f.args.len() {
+        SpecialFunction::TryDivide => ExtensionFunction::TryDivide.as_str(),
+        // Spark removes object-valued NULL fields by default. Only the explicit
+        // `ignoreNullFields` option is supported.
+        SpecialFunction::ToJson => match f.args.len() {
             1 => {
                 let a = render_expr(&f.args[0], schema)?;
                 return Ok(format!("json_strip_nulls(to_json({a}))"));
@@ -4055,40 +3983,19 @@ fn render_function_call_dispatch(
                 bail_boundary_fn!(f.name.clone(), "`to_json` requires 1 or 2 arguments");
             }
         },
-        // Spark's `json_object_keys(jsonStr)` returns the top-level object's
-        // keys as `Array<String>`, and NULL for a NULL, invalid-JSON, or
-        // non-object input. DuckDB's native `json_keys` diverges on both
-        // edge cases — it RAISES on malformed JSON and returns `[]` (not
-        // NULL) on a non-object — so a direct rename is not Spark-parity.
-        // Guard both with `json_valid`/`json_type` and only call
-        // `json_keys` on a confirmed OBJECT. (ADR-022 Spark-parity value
-        // fix — not a boundary.) Corpus: `test_json_object_keys`,
-        // `fn-024`/`fn-025`/`fn-026` witnesses (not-json / array / object).
-        "json_object_keys" => {
+        // DuckDB raises on invalid JSON and returns [] for non-objects; Spark
+        // returns NULL for both.
+        SpecialFunction::JsonObjectKeys => {
             let [j] = exact_args(f, schema, "`json_object_keys` requires exactly 1 argument")?;
             return Ok(format!(
                 "CASE WHEN json_valid({j}) AND json_type({j}) = 'OBJECT' \
                  THEN json_keys({j}) ELSE NULL END"
             ));
         }
-        // Spark's `to_csv(struct)` — DuckDB has no `to_csv` scalar.
-        // When the argument is a `struct(...)` (Spark's `F.struct` /
-        // Catalyst `CreateStruct`), unpack the fields and emit
-        // `concat_ws(',', CAST(f1 AS VARCHAR), ...)`. If the argument is
-        // anything else (an already-typed struct column, etc.), we cannot
-        // enumerate the fields at emission time — return a honest
-        // Thunderduck-boundary error. Corpus: `json-008`.
-        // KNOWN DEVIATION (τ-boundary, Spark-parity gap):
-        // Spark's `to_csv` follows RFC-4180 escaping — fields containing `,` or `"`
-        // are quoted, and embedded `"` becomes `""`. This mapping to
-        // `concat_ws(',', CAST(f AS VARCHAR), ...)` does NOT escape. Corpus witness
-        // json-008 uses (id, name, age) with no embedded delimiters, so the current
-        // mapping is Spark-identical for that shape but silently diverges on
-        // payloads containing `,` or `"`. Tracked as follow-up pass
-        // "Spark-parity CSV escaping" — options:
-        //   (a) inline `CASE WHEN val LIKE '%,%' OR val LIKE '%"%' THEN <escape wrapper>`,
-        //   (b) new `spark_to_csv` extension function in `thdck_spark_funcs`.
-        "to_csv" => {
+        // DuckDB lacks `to_csv`; literal structs can be enumerated, while other
+        // struct expressions remain a boundary. This approximation does not yet
+        // implement Spark's RFC-4180 escaping.
+        SpecialFunction::ToCsv => {
             if f.args.len() != 1 {
                 bail_boundary_fn!(f.name.clone(), "`to_csv` requires exactly 1 argument");
             }
@@ -4096,9 +4003,7 @@ fn render_function_call_dispatch(
                 Expression::FunctionCall(inner)
                     if inner.name == "struct" || inner.name == "named_struct" =>
                 {
-                    // For `struct(a, b, c)` every arg is a field value.
-                    // For `named_struct(k1, v1, k2, v2, ...)` only the
-                    // odd-indexed args (v1, v2, ...) are field values.
+                    // Named structs interleave names and values.
                     if inner.name == "named_struct" {
                         inner
                             .args
@@ -4125,46 +4030,26 @@ fn render_function_call_dispatch(
             })?;
             return Ok(format!("concat_ws(',', {parts})"));
         }
-        // Spark's `regexp_replace(str, pat, repl)` replaces ALL matches.
-        // DuckDB's `regexp_replace(str, pat, repl)` replaces only the FIRST;
-        // the 4th arg 'g' flag makes it global.
-        "regexp_replace" => {
+        // DuckDB needs `g` to replace every match.
+        SpecialFunction::RegexpReplace => {
             if !(3..=4).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`regexp_replace` requires 3 or 4 arguments");
             }
             let [s, p, r] = rendered_args(f, schema)?;
             return Ok(format!("regexp_replace({s}, {p}, {r}, 'g')"));
         }
-        // Spark null-handling remaps (DuckDB uses coalesce).
-        "nvl" => "coalesce",
-        "nvl2" => {
-            // Spark's `nvl2(a, b, c)` = if a is not null then b else c.
+        SpecialFunction::Nvl2 => {
             let [a, b, c] = exact_args(f, schema, "`nvl2` requires exactly 3 arguments")?;
             return Ok(format!("CASE WHEN {a} IS NOT NULL THEN {b} ELSE {c} END"));
         }
-        "ifnull" => "coalesce",
-        // Spark's `concat_ws(sep, ...args)` — when any arg is an array/list,
-        // Spark flattens the array elements into the sep-join; DuckDB's
-        // `concat_ws` treats the array as a single VARCHAR (rendered like
-        // `[a, b, c]`). If exactly one array arg follows the separator,
-        // emit `list_string_agg(arr, sep)`; else pass through.
-        // Corpus witness: `str-011` (`concat_ws(",", tags)` where tags is
-        // ARRAY<VARCHAR>).
-        "concat_ws" if f.args.len() >= 2 => {
+        // Spark flattens array arguments; DuckDB stringifies them.
+        SpecialFunction::ConcatWs if f.args.len() >= 2 => {
             let sep = render_expr(&f.args[0], schema)?;
-            // Detect the corpus shape: sep + one array arg.
             if f.args.len() == 2 && matches!(f.args[1].data_type(schema), DataType::Array(_, _)) {
                 let arr = render_expr(&f.args[1], schema)?;
-                // DuckDB's `array_to_string(NULL, ',')` returns NULL, but
-                // Spark's `concat_ws(',', NULL_array)` returns "". Wrap in
-                // COALESCE to match Spark semantics. Corpus witness: `str-011`
-                // (`concat_ws(",", NULL_tags)` — the split(...) of the result
-                // must be `[""]`, not NULL).
+                // Spark turns a NULL array into the empty string.
                 return Ok(format!("COALESCE(array_to_string({arr}, {sep}), '')"));
             }
-            // General case: emit `concat_ws(sep, args...)`. Any array args
-            // beyond that would surface as `[...]` string; the corpus
-            // primary witness is the one-array case above.
             let parts = sql_join(f.args[1..].iter(), ", ", |arg| {
                 let dt = arg.data_type(schema);
                 let arg_sql = render_expr(arg, schema)?;
@@ -4180,14 +4065,6 @@ fn render_function_call_dispatch(
         // — the 1-arg form needs `CAST(... AS BIGINT)` for Spark parity, and
         // the 2-arg form needs `strptime` for the format string. Not a simple
         // name remap.
-        // Spark's `startswith`/`endswith`/`contains` — DuckDB spells them
-        // `starts_with`/`ends_with`/`contains` (contains is fine, others
-        // need underscore).
-        "startswith" => "starts_with",
-        "endswith" => "ends_with",
-        // Spark's `substr` — DuckDB canonical form is `substring` (both
-        // spellings accepted actually, but standardize).
-        "substr" => "substring",
         // Spark ceil/floor return Long; DuckDB returns Double. Cast to
         // BIGINT so schema matches type_inference.
         // Spark's semantics on non-finite Double: `ceil(NaN) = 0`,
@@ -4196,11 +4073,13 @@ fn render_function_call_dispatch(
         // NULL. DuckDB's `CAST(nan AS BIGINT)` raises "Conversion Error",
         // so guard the cast: NULL → NULL, NaN → 0, else CAST. Corpus:
         // `math-003`.
-        "ceil" | "ceiling" => return render_ceil_floor(f, schema, "ceil"),
-        "floor" => return render_ceil_floor(f, schema, "floor"),
+        SpecialFunction::Ceil | SpecialFunction::Ceiling => {
+            return render_ceil_floor(f, schema, "ceil");
+        }
+        SpecialFunction::Floor => return render_ceil_floor(f, schema, "floor"),
         // Spark `signum` returns Double; DuckDB `sign` returns the arg's
         // type. Cast to DOUBLE at emission.
-        "sign" | "signum" => {
+        SpecialFunction::Sign | SpecialFunction::Signum => {
             let [a] = min_args(f, schema, "`signum` requires at least 1 argument")?;
             return Ok(format!("CAST(sign({a}) AS DOUBLE)"));
         }
@@ -4208,7 +4087,7 @@ fn render_function_call_dispatch(
         // has no native `positive` scalar, so emit the argument unchanged
         // (parenthesized). Corpus: `test_positive`
         // (test_math_bitwise_date_differential).
-        "positive" => {
+        SpecialFunction::Positive => {
             let [a] = exact_args(f, schema, "`positive` requires exactly 1 argument")?;
             return Ok(format!("({a})"));
         }
@@ -4220,7 +4099,7 @@ fn render_function_call_dispatch(
         // arm since `type_inference.rs` already treats it identically and
         // the emission is harmless either way; no corpus witness for
         // `negate`, unit test only. Corpus: `num-008`.
-        "negative" | "negate" => {
+        SpecialFunction::Negative => {
             let [a] = exact_args(f, schema, "`negative` requires exactly 1 argument")?;
             return Ok(format!("(-({a}))"));
         }
@@ -4238,7 +4117,7 @@ fn render_function_call_dispatch(
         // A non-integral arg0 is rejected by Spark at analysis, so the
         // un-guarded compute form is unchanged there. Corpus: `fn-027`
         // (OOB raise), `fn-028` (in-bounds / null-value regression).
-        "bit_get" | "getbit" => {
+        SpecialFunction::BitGet | SpecialFunction::Getbit => {
             let [x, pos] = exact_args(f, schema, "`bit_get` requires exactly 2 arguments")?;
             let compute = format!("CAST((({x} >> {pos}) & 1) AS TINYINT)");
             return match integral_bit_width(&f.args[0].data_type(schema)) {
@@ -4258,7 +4137,7 @@ fn render_function_call_dispatch(
         // accepts `INTERVAL (expr) UNIT` arithmetic. Compose the interval by
         // summing each present component (missing components default to 0,
         // Spark's documented behavior). Corpus anchor: `intv-003`.
-        "make_dt_interval" => {
+        SpecialFunction::MakeDtInterval => {
             return render_make_interval(
                 f,
                 schema,
@@ -4270,7 +4149,7 @@ fn render_function_call_dispatch(
         // Spark's `make_interval(years, months, weeks, days[, hours[, mins[, secs]]])`
         // builds a CalendarInterval. DuckDB has no `make_interval` scalar;
         // compose from individual `INTERVAL <n> UNIT` summands. Corpus: `intv-001`.
-        "make_interval" | "try_make_interval" => {
+        SpecialFunction::MakeInterval | SpecialFunction::TryMakeInterval => {
             return render_make_interval(
                 f,
                 schema,
@@ -4281,7 +4160,7 @@ fn render_function_call_dispatch(
         }
         // Spark's `make_ym_interval([years[, months]])` builds a year-month
         // INTERVAL. Same principle as `make_dt_interval`.
-        "make_ym_interval" => {
+        SpecialFunction::MakeYmInterval => {
             return render_make_interval(
                 f,
                 schema,
@@ -4305,7 +4184,7 @@ fn render_function_call_dispatch(
         //    empty / unknown unit → boundary reject with `[TDCK-BOUNDARY]`.
         // `"end"` is a DuckDB reserved keyword — quoted via `quote_ident`,
         // proven-safe idiom (same pattern as `named_struct` at ~L3667).
-        "window" => {
+        SpecialFunction::Window => {
             if f.args.len() != 2 {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -4363,7 +4242,7 @@ fn render_function_call_dispatch(
         //  4. `timezone('UTC', tstz)` extracts the wall-clock again in
         //     UTC — this is the Spark return value, a naive TIMESTAMP.
         // Corpus anchor: `dt-017`.
-        "to_utc_timestamp" if f.args.len() == 2 => {
+        SpecialFunction::ToUtcTimestamp if f.args.len() == 2 => {
             let [ts, tz] = rendered_args(f, schema)?;
             return Ok(format!(
                 "timezone('UTC', timezone({tz}, timezone('UTC', CAST({ts} AS TIMESTAMPTZ))))"
@@ -4371,7 +4250,7 @@ fn render_function_call_dispatch(
         }
         // Spark's `from_utc_timestamp(ts, tz)` is the inverse — interpret
         // `ts` as UTC and convert to local wall-clock time in `tz`.
-        "from_utc_timestamp" if f.args.len() == 2 => {
+        SpecialFunction::FromUtcTimestamp if f.args.len() == 2 => {
             let [ts, tz] = rendered_args(f, schema)?;
             return Ok(format!(
                 "timezone({tz}, timezone('UTC', timezone('UTC', CAST({ts} AS TIMESTAMPTZ))))"
@@ -4385,7 +4264,7 @@ fn render_function_call_dispatch(
         //   empty list → false
         //   else       → OR of `pred(x)` across elements (NULL if all-NULL preds).
         // Anchors: corpus hof-004.
-        "exists" if f.args.len() == 2 => {
+        SpecialFunction::Exists if f.args.len() == 2 => {
             let [arr, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL WHEN len({arr}) = 0 THEN false ELSE list_bool_or(list_transform({arr}, {lambda})) END"
@@ -4395,7 +4274,7 @@ fn render_function_call_dispatch(
         // `list_all`; use `list_bool_and(list_transform(...))` with the
         // Spark-parity empty/NULL guard: NULL list → NULL, empty list → true.
         // Anchors: corpus hof-005.
-        "forall" if f.args.len() == 2 => {
+        SpecialFunction::Forall if f.args.len() == 2 => {
             let [arr, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL WHEN len({arr}) = 0 THEN true ELSE list_bool_and(list_transform({arr}, {lambda})) END"
@@ -4406,18 +4285,18 @@ fn render_function_call_dispatch(
         // index), Spark's index is 0-based but DuckDB's is 1-based; rewrite
         // the lambda body so references to the index variable become
         // `(index - 1)`. Anchors: corpus hof-007.
-        "transform" if hof_lambda_has_index(&f.args, 1) => {
+        SpecialFunction::Transform if hof_lambda_has_index(&f.args, 1) => {
             let arr = render_expr(&f.args[0], schema)?;
             let lambda = render_expr_with_lambda_adjust(&f.args[1], schema, true)?;
             return Ok(format!("list_transform({arr}, {lambda})"));
         }
-        "filter" if hof_lambda_has_index(&f.args, 1) => {
+        SpecialFunction::Filter if hof_lambda_has_index(&f.args, 1) => {
             let arr = render_expr(&f.args[0], schema)?;
             let lambda = render_expr_with_lambda_adjust(&f.args[1], schema, true)?;
             return Ok(format!("list_filter({arr}, {lambda})"));
         }
-        "transform" => "list_transform",
-        "filter" => "list_filter",
+        SpecialFunction::Transform => "list_transform",
+        SpecialFunction::Filter => "list_filter",
         // Spark's `zip_with(a, b, (x, y) -> f)` — DuckDB has no direct
         // equivalent (`list_zip` in DuckDB is `arrays_zip`-style struct
         // packing, not a HOF). Emulate by index iteration:
@@ -4427,7 +4306,7 @@ fn render_function_call_dispatch(
         // emission implements Spark's 0-based GetArrayItem (index+1 into DuckDB's
         // 1-based `list_extract`, guarded). The iteration therefore ranges over
         // 0-based indices `0..least(len(a), len(b))`. Corpus: `hof-006`.
-        "zip_with" if f.args.len() == 3 => {
+        SpecialFunction::ZipWith if f.args.len() == 3 => {
             let [a_sql, b_sql] = rendered_args(f, schema)?;
             let Expression::Lambda(lam) = &f.args[2] else {
                 bail_boundary_fn!(
@@ -4468,22 +4347,21 @@ fn render_function_call_dispatch(
         // `map_filter`. Emulate via `map_from_entries(list_filter(
         // map_entries(m), kv -> pred[k → kv.key, v → kv.value]))`.
         // Corpus: `hof-008`.
-        "map_filter" if f.args.len() == 2 => {
+        SpecialFunction::MapFilter if f.args.len() == 2 => {
             return render_map_hof(f, schema, MapHofKind::Filter);
         }
         // Spark's `transform_values(m, (k, v) -> f)` — DuckDB has no direct
         // equivalent. Emulate via `map_from_entries(list_transform(
         // map_entries(m), kv -> struct_pack(key := kv.key,
         // value := f[k → kv.key, v → kv.value])))`. Corpus: `hof-009`.
-        "transform_values" if f.args.len() == 2 => {
+        SpecialFunction::TransformValues if f.args.len() == 2 => {
             return render_map_hof(f, schema, MapHofKind::TransformValues);
         }
         // Spark's `transform_keys(m, (k, v) -> f)` — mirror of
         // `transform_values`, updating the key instead. Corpus: `hof-010`.
-        "transform_keys" if f.args.len() == 2 => {
+        SpecialFunction::TransformKeys if f.args.len() == 2 => {
             return render_map_hof(f, schema, MapHofKind::TransformKeys);
         }
-        "map_zip_with" => "map_zip_with",
         // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
         // with an initial value. DuckDB's `list_reduce(list, lambda)` has
         // no init parameter — it uses the first element as init. Prepend
@@ -4492,17 +4370,17 @@ fn render_function_call_dispatch(
         // DuckDB's `list_prepend(init, NULL)` returns `[init]`, which then
         // folds to `init` — masking the NULL. Guard with a CASE that
         // preserves Spark's NULL-in / NULL-out semantics. Corpus: `hof-003`.
-        "aggregate" | "reduce" if f.args.len() >= 3 => {
+        SpecialFunction::Aggregate | SpecialFunction::Reduce if f.args.len() >= 3 => {
             let [arr, init, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL \
                  ELSE list_reduce(list_prepend({init}, {arr}), {lambda}) END"
             ));
         }
-        "aggregate" | "reduce" => "list_reduce",
+        SpecialFunction::Aggregate | SpecialFunction::Reduce => "list_reduce",
         // Spark's `sort_array(arr[, asc])` — DuckDB's `list_sort(arr[,
         // 'ASC'|'DESC'])` takes a string order token, not a boolean.
-        "sort_array" if f.args.len() == 2 => {
+        SpecialFunction::SortArray if f.args.len() == 2 => {
             let arr = render_expr(&f.args[0], schema)?;
             // Second arg: Spark boolean literal (True=ASC, False=DESC).
             // Try to extract literal; otherwise use CASE.
@@ -4524,23 +4402,21 @@ fn render_function_call_dispatch(
         //   - 3-arg (null replacement): replace NULLs with the replacement
         //     string via `list_transform + coalesce`, then join.
         // Corpus: `arr-010`.
-        "array_join" if f.args.len() == 2 => {
+        SpecialFunction::ArrayJoin if f.args.len() == 2 => {
             let [arr, sep] = rendered_args(f, schema)?;
             // Skip NULL elements to match Spark's default behavior.
             return Ok(format!(
                 "array_to_string(list_filter({arr}, x -> x IS NOT NULL), {sep})"
             ));
         }
-        "array_join" if f.args.len() == 3 => {
+        SpecialFunction::ArrayJoin if f.args.len() == 3 => {
             let [arr, sep, null_repl] = rendered_args(f, schema)?;
             return Ok(format!(
                 "array_to_string(list_transform({arr}, x -> coalesce(CAST(x AS VARCHAR), {null_repl})), {sep})"
             ));
         }
         // Spark array/list remaps — DuckDB uses `list_*` prefix.
-        "sort_array" => "list_sort",
-        "slice" => "list_slice",
-        "array_contains" => "list_contains",
+        SpecialFunction::SortArray => "list_sort",
         // Spark's `array_distinct(a)` — distinct elements of `a`,
         // preserving the order elements FIRST appear (Spark's
         // `ArrayDistinct` is a linked-hash-set scan, not a sort). DuckDB's
@@ -4555,7 +4431,7 @@ fn render_function_call_dispatch(
         // first-occurrence position (verified live against Spark 4.1.1).
         // Corpus: `arr-005` (`schema_only` — a future pass can lift that
         // flag now that value order is fixed).
-        "array_distinct" if f.args.len() == 1 => {
+        SpecialFunction::ArrayDistinct if f.args.len() == 1 => {
             let [a] = rendered_args(f, schema)?;
             return Ok(order_preserving_distinct(&a));
         }
@@ -4564,7 +4440,7 @@ fn render_function_call_dispatch(
         // through to the verbatim tail below); on an ARRAY it reverses
         // element order, which DuckDB's `reverse` does not accept
         // (`reverse(VARCHAR)` only) — dispatch to `list_reverse`.
-        "reverse"
+        SpecialFunction::Reverse
             if f.args.len() == 1
                 && matches!(f.args[0].data_type(schema), DataType::Array(_, _)) =>
         {
@@ -4584,7 +4460,7 @@ fn render_function_call_dispatch(
         // guard is required here (unlike plain `array_distinct` above,
         // where `list_filter` already propagates NULL on its own). Corpus:
         // `arr-011`.
-        "array_union" if f.args.len() == 2 => {
+        SpecialFunction::ArrayUnion if f.args.len() == 2 => {
             let [a, b] = rendered_args(f, schema)?;
             let concat = format!("list_concat({a}, {b})");
             return Ok(format!(
@@ -4607,7 +4483,7 @@ fn render_function_call_dispatch(
         // should survive; `list_position(b, x) IS NULL` is null-safe
         // (verified live against Spark 4.1.1: `array_except(array(1, NULL,
         // 2), array(3, 4))` keeps the NULL). Corpus: `arr2-005`.
-        "array_except" if f.args.len() == 2 => {
+        SpecialFunction::ArrayExcept if f.args.len() == 2 => {
             let [a, b] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND {}) END",
@@ -4625,7 +4501,7 @@ fn render_function_call_dispatch(
         // against Spark 4.1.1: `array_intersect(array(1, NULL, 2),
         // array(NULL, 2))` returns `[NULL, 2]` (a NULL common to both
         // sides is kept), which `list_contains` alone cannot reproduce.
-        "array_intersect" if f.args.len() == 2 => {
+        SpecialFunction::ArrayIntersect if f.args.len() == 2 => {
             let [a, b] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND {}) END",
@@ -4637,14 +4513,12 @@ fn render_function_call_dispatch(
         // NULL). DuckDB's `list_position` returns NULL for not-found.
         // Coalesce with 0, but propagate NULL for a NULL array. Corpus:
         // `arr-007`.
-        "array_position" if f.args.len() == 2 => {
+        SpecialFunction::ArrayPosition if f.args.len() == 2 => {
             let [arr, item] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN {arr} IS NULL THEN NULL ELSE CAST(coalesce(list_position({arr}, {item}), 0) AS BIGINT) END"
             ));
         }
-        "array_max" => "list_max",
-        "array_min" => "list_min",
         // Spark's `arrays_zip(a, b, ...)` returns `Array<Struct<f0, f1, ...>>`.
         // Field names follow Spark's argument-name rules: alias > column
         // reference name > positional `"0"`, `"1"` fallback (Spark uses
@@ -4661,13 +4535,13 @@ fn render_function_call_dispatch(
         // DuckDB's `flatten` silently drops NULL sub-arrays, producing a
         // non-NULL result — mismatch. Wrap with a null-propagation check.
         // Corpus: `arr-013`.
-        "flatten" if f.args.len() == 1 => {
+        SpecialFunction::Flatten if f.args.len() == 1 => {
             let [a] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({a}) IS NULL OR list_bool_or(list_transform({a}, x -> x IS NULL)) THEN NULL ELSE flatten({a}) END"
             ));
         }
-        "arrays_zip" if !f.args.is_empty() => {
+        SpecialFunction::ArraysZip if !f.args.is_empty() => {
             let arg_sqls: Vec<String> = f
                 .args
                 .iter()
@@ -4713,10 +4587,6 @@ fn render_function_call_dispatch(
                 "list_transform(range(1, {len_expr} + 1), {idx_var} -> {struct_body})"
             ));
         }
-        // Spark's `arrays_overlap(a, b)` → Boolean; DuckDB uses
-        // `list_has_any(a, b)` (no `arrays_overlap` function).
-        // Corpus: `arr-011`.
-        "arrays_overlap" => "list_has_any",
         // Spark's `size`/`cardinality` on a MAP → element count. DuckDB's
         // `len` rejects MAP (`len(VARCHAR|BIT|ANY[])` only); `cardinality`
         // is the MAP-only counterpart (DuckDB rejects `cardinality` on a
@@ -4726,13 +4596,13 @@ fn render_function_call_dispatch(
         // BIGINT (signed) to match the sibling `len` branch's native
         // return type and keep the wire type Arrow-safe. Array/other args
         // keep the existing `len` rename.
-        "size" | "cardinality"
+        SpecialFunction::Size | SpecialFunction::Cardinality
             if f.args.len() == 1 && matches!(f.args[0].data_type(schema), DataType::Map { .. }) =>
         {
             let [a] = rendered_args(f, schema)?;
             return Ok(format!("CAST(cardinality({a}) AS BIGINT)"));
         }
-        "size" | "cardinality" => "len",
+        SpecialFunction::Size | SpecialFunction::Cardinality => "len",
         // Spark's `element_at(coll, k)` — for Array, DuckDB's
         // `element_at(list, i)` returns a 1-element list containing the
         // element (or an empty list on OOB); for Map, it returns a
@@ -4740,7 +4610,7 @@ fn render_function_call_dispatch(
         // Both cases need the trailing `[1]` extractor to unwrap; the
         // wrapped list's `[1]` yields NULL on empty. Corpus: `map-004`,
         // `arr-008`.
-        "element_at" if f.args.len() == 2 => {
+        SpecialFunction::ElementAt if f.args.len() == 2 => {
             let [coll, key] = rendered_args(f, schema)?;
             let coll_ty = f.args[0].data_type(schema);
             if let DataType::Map { .. } = coll_ty {
@@ -4776,7 +4646,7 @@ fn render_function_call_dispatch(
         // the nullability arm at `expression.rs:1035` already declares
         // `try_element_at` — colocated here so future adds work
         // end-to-end.
-        "try_element_at" if f.args.len() == 2 => {
+        SpecialFunction::TryElementAt if f.args.len() == 2 => {
             let [coll, key] = rendered_args(f, schema)?;
             let coll_ty = f.args[0].data_type(schema);
             if let DataType::Map { .. } = coll_ty {
@@ -4788,7 +4658,7 @@ fn render_function_call_dispatch(
         // `decimal(9,2)`, `array<string>`); DuckDB's `typeof` returns
         // uppercase (`DOUBLE`, `DECIMAL(9,2)`). Wrap with `lower()` for
         // Spark parity. Corpus: `meta-003`.
-        "typeof" => {
+        SpecialFunction::Typeof => {
             let [a] = exact_args(f, schema, "`typeof` requires exactly 1 argument")?;
             return Ok(format!("lower(typeof({a}))"));
         }
@@ -4797,13 +4667,13 @@ fn render_function_call_dispatch(
         // DuckDB's `array_append`/`array_prepend` return `[elem]` for a NULL
         // array, silently coercing NULL to an empty list. Wrap with a NULL
         // guard on the array side to match Spark. Corpus: `arr2-001`.
-        "array_append" if f.args.len() == 2 => {
+        SpecialFunction::ArrayAppend if f.args.len() == 2 => {
             let [arr, elem] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL ELSE array_append({arr}, {elem}) END"
             ));
         }
-        "array_prepend" if f.args.len() == 2 => {
+        SpecialFunction::ArrayPrepend if f.args.len() == 2 => {
             // Spark signature is `array_prepend(arr, elem)`; the session
             // macro (see `session.rs`) rewrites this to DuckDB's
             // `list_prepend(elem, arr)`. Preserve NULL on the array arg.
@@ -4815,7 +4685,7 @@ fn render_function_call_dispatch(
         // Spark's `to_date(x)` (single-arg) → simple cast to DATE.
         // Two-arg form `to_date(str, fmt)` uses Spark SimpleDateFormat tokens;
         // DuckDB parses with `strptime` (strftime tokens) — translate + cast.
-        "to_date" => {
+        SpecialFunction::ToDate => {
             if !(1..=2).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`to_date` requires 1 or 2 arguments");
             }
@@ -4832,7 +4702,7 @@ fn render_function_call_dispatch(
         // Spark SimpleDateFormat tokens; DuckDB parses with `strptime`
         // (strftime tokens) — translate + parse. Both return TIMESTAMP
         // (Spark's default, not TIMESTAMP WITH TIME ZONE).
-        "to_timestamp" => {
+        SpecialFunction::ToTimestamp => {
             if !(1..=2).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`to_timestamp` requires 1 or 2 arguments");
             }
@@ -4852,7 +4722,7 @@ fn render_function_call_dispatch(
         //   would need special-casing; corpus does not exercise it yet.
         // - 2-arg (string, format): parse via `strptime` first, then epoch +
         //   cast. Uses the shared Spark→strftime format translation.
-        "unix_timestamp" => {
+        SpecialFunction::UnixTimestamp => {
             if !(1..=2).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`unix_timestamp` requires 1 or 2 arguments");
             }
@@ -4879,7 +4749,7 @@ fn render_function_call_dispatch(
         // `to_timestamp(DOUBLE)` in DuckDB interprets the value as
         // seconds-since-epoch and returns TIMESTAMP WITH TIME ZONE — strftime
         // renders it in the session TZ (UTC in test env), matching Spark.
-        "from_unixtime" => {
+        SpecialFunction::FromUnixtime => {
             if !(1..=2).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`from_unixtime` requires 1 or 2 arguments");
             }
@@ -4896,7 +4766,7 @@ fn render_function_call_dispatch(
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
         // Spark's `nanvl(a, b)` — if a is NaN, return b; else a.
-        "nanvl" => {
+        SpecialFunction::Nanvl => {
             let [a, b] = exact_args(f, schema, "`nanvl` requires exactly 2 arguments")?;
             return Ok(format!("CASE WHEN isnan({a}) THEN {b} ELSE {a} END"));
         }
@@ -4906,7 +4776,10 @@ fn render_function_call_dispatch(
         // domain so Spark-parity holds for the corpus `y=0` witness
         // (`math-005`). The two-arg `log(base, x)` form (Spark) also returns
         // NULL for x ≤ 0; guard the same way, on the value arg.
-        "ln" | "log" | "log10" | "log2" => {
+        SpecialFunction::Ln
+        | SpecialFunction::Log
+        | SpecialFunction::Log10
+        | SpecialFunction::Log2 => {
             if f.args.is_empty() || f.args.len() > 2 {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -4946,7 +4819,7 @@ fn render_function_call_dispatch(
         // Spark's result type is the input type (Int/Long); the analyzer
         // already types the FunctionCall, so the projection-slot cast in
         // `spark_return_cast` handles the outer type match.
-        "shiftleft" => {
+        SpecialFunction::Shiftleft => {
             let [x, n] = exact_args(f, schema, "`shiftleft` requires exactly 2 arguments")?;
             return Ok(format!("({x} * (1::BIGINT << ({n})))"));
         }
@@ -4956,7 +4829,7 @@ fn render_function_call_dispatch(
         // negative on 2's-complement. Pass-through the shift via arithmetic
         // division form for parity across widths: `x >> n` in DuckDB is
         // legal for negative x (unlike `<<`), so we can pass through.
-        "shiftright" => {
+        SpecialFunction::Shiftright => {
             let [x, n] = exact_args(f, schema, "`shiftright` requires exactly 2 arguments")?;
             return Ok(format!("({x} >> ({n}))"));
         }
@@ -4970,7 +4843,7 @@ fn render_function_call_dispatch(
         // parity for the corpus: emit as `round(x, n)`. Spark's `math-002`
         // witness has values whose half-even and half-up agree (e.g., 3.14
         // → 3.1 either way). Corpus witness: `math-002`.
-        "bround" => {
+        SpecialFunction::Bround => {
             if !(1..=2).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`bround` requires 1 or 2 arguments");
             }
@@ -5001,22 +4874,18 @@ fn render_function_call_dispatch(
         }
         // Spark's `hypot(a, b)` = sqrt(a*a + b*b). DuckDB has no `hypot`;
         // emit the inline form. Corpus witness: `math-006`.
-        "hypot" => {
+        SpecialFunction::Hypot => {
             let [a, b] = exact_args(f, schema, "`hypot` requires exactly 2 arguments")?;
             return Ok(format!(
                 "sqrt((CAST({a} AS DOUBLE) * CAST({a} AS DOUBLE)) + (CAST({b} AS DOUBLE) * CAST({b} AS DOUBLE)))"
             ));
         }
-        // Spark's `format_string(fmt, args...)` → DuckDB `printf(fmt, args...)`.
-        // Both use printf-style tokens (%s, %d, %f, ...). Corpus witness:
-        // `str-015`.
-        "format_string" => "printf",
         // Spark's `conv(str, from_base, to_base)` — convert numeric string
         // between bases. DuckDB has no direct equivalent. Emulate the
         // `to_base=2` and `to_base=16` common cases via bit conversions;
         // for other bases, fall through with a boundary error. Corpus
         // witness: `math-013` uses `conv(str, 10, 2)`.
-        "conv" => {
+        SpecialFunction::Conv => {
             if f.args.len() != 3 {
                 bail_boundary_fn!(f.name.clone(), "`conv` requires exactly 3 arguments");
             }
@@ -5061,7 +4930,7 @@ fn render_function_call_dispatch(
         // for negatives, Spark returns FFFFFFFFFFFFFFFD (16 chars); DuckDB
         // returns the signed hex. Adjust with a CASE. Corpus witness:
         // `math-013`.
-        "hex" => {
+        SpecialFunction::Hex => {
             let [a] = exact_args(f, schema, "`hex` requires exactly 1 argument")?;
             // Only remap for integer types; DuckDB's hex(VARCHAR) already
             // matches Spark's hex(String) which encodes bytes. Detect by
@@ -5077,7 +4946,7 @@ fn render_function_call_dispatch(
         }
         // Spark's `named_struct(k1, v1, k2, v2, ...)` → DuckDB
         // `struct_pack(k1 := v1, k2 := v2, ...)`.
-        "named_struct" => {
+        SpecialFunction::NamedStruct => {
             if !f.args.len().is_multiple_of(2) || f.args.is_empty() {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -5097,14 +4966,11 @@ fn render_function_call_dispatch(
             })?;
             return Ok(format!("struct_pack({parts})"));
         }
-        // Spark's `map_contains_key(m, k)` → DuckDB
-        // `map_contains(m, k)` (renamed in some DuckDB versions).
-        "map_contains_key" => "map_contains",
         // Spark's `map_concat(m1, m2, ...)` propagates NULL — if any input
         // map is NULL the result is NULL. DuckDB's `map_concat` silently
         // treats NULL as an empty map. Wrap with a NULL guard on every
         // argument. Corpus: `map-006`.
-        "map_concat" if !f.args.is_empty() => {
+        SpecialFunction::MapConcat if !f.args.is_empty() => {
             let arg_sqls: Vec<String> = f
                 .args
                 .iter()
@@ -5121,33 +4987,28 @@ fn render_function_call_dispatch(
             ));
         }
         // Spark's `isnull`/`isnotnull` — DuckDB uses `IS NULL`/`IS NOT NULL`.
-        "isnull" => {
+        SpecialFunction::Isnull => {
             let [a] = exact_args(f, schema, "`isnull` requires exactly 1 argument")?;
             return Ok(format!("({a} IS NULL)"));
         }
-        "isnotnull" => {
+        SpecialFunction::Isnotnull => {
             let [a] = exact_args(f, schema, "`isnotnull` requires exactly 1 argument")?;
             return Ok(format!("({a} IS NOT NULL)"));
         }
         // Spark's `like`/`ilike`/`rlike` as functions — DuckDB uses
         // operator syntax `x LIKE pattern` / `x ILIKE pattern` /
         // `regexp_matches(x, pattern)`.
-        "like" => {
+        SpecialFunction::Like => {
             let [a, b] = exact_args(f, schema, "`like` requires exactly 2 arguments")?;
             return Ok(format!("({a} LIKE {b})"));
         }
-        "ilike" => {
+        SpecialFunction::Ilike => {
             let [a, b] = exact_args(f, schema, "`ilike` requires exactly 2 arguments")?;
             return Ok(format!("({a} ILIKE {b})"));
         }
-        "rlike" | "regexp_like" | "regexp" => {
+        SpecialFunction::Rlike | SpecialFunction::RegexpLike | SpecialFunction::Regexp => {
             let [a, b] = exact_args(f, schema, "`rlike` requires exactly 2 arguments")?;
             return Ok(format!("regexp_matches({a}, {b})"));
-        }
-        // Spark's `<=>(a, b)` eqNullSafe — DuckDB uses IS NOT DISTINCT FROM.
-        "eqnullsafe" | "<=>" => {
-            let [a, b] = exact_args(f, schema, "`eqNullSafe` requires exactly 2 arguments")?;
-            return Ok(format!("({a} IS NOT DISTINCT FROM {b})"));
         }
         // Spark's `split(str, pattern[, limit])` — DuckDB's `split(str,
         // pat)` has no limit argument. `limit <= 0` means "unlimited",
@@ -5158,7 +5019,7 @@ fn render_function_call_dispatch(
         // the last piece is the delimiter-rejoined remainder (Java/Spark
         // `String.split(regex, limit)` semantics — the pattern is applied
         // at most `limit - 1` times, so the tail is never re-split).
-        "split" => {
+        SpecialFunction::Split => {
             if f.args.len() >= 3 {
                 let [a, b, c] = min_args(f, schema, "`split` requires at least 2 arguments")?;
                 let full = format!("split({a}, {b})");
@@ -5172,30 +5033,14 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
             let [a, b] = min_args(f, schema, "`split` requires at least 2 arguments")?;
             return Ok(format!("split({a}, {b})"));
         }
-        // Spark bitwise ops arriving as function calls (name is symbolic).
-        // DuckDB uses operator form.
-        "&" | "bitwise_and" | "bitwiseand" => {
-            let [a, b] = exact_args(f, schema, "`bitwiseAND` requires exactly 2 arguments")?;
-            return Ok(format!("({a} & {b})"));
-        }
-        "|" | "bitwise_or" | "bitwiseor" => {
-            let [a, b] = exact_args(f, schema, "`bitwiseOR` requires exactly 2 arguments")?;
-            return Ok(format!("({a} | {b})"));
-        }
-        "^" | "bitwise_xor" | "bitwisexor" => {
-            let [a, b] = exact_args(f, schema, "`bitwiseXOR` requires exactly 2 arguments")?;
-            return Ok(format!("xor({a}, {b})"));
-        }
         // (signum handled above with explicit DOUBLE cast.)
         // Spark's `sha2(str, bits)` → DuckDB `sha256(str)` (Spark defaults
         // bits=256; we ignore the bits arg — non-256 surfaces later as
         // per-case follow-up if it fires).
-        "sha2" => {
+        SpecialFunction::Sha2 => {
             let [s] = min_args(f, schema, "`sha2` requires at least 1 argument")?;
             return Ok(format!("sha256({s})"));
         }
-        // Spark `sha`/`sha1` → DuckDB `sha1`.
-        "sha" => "sha1",
         // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`,
         // but DuckDB promotes `DATE + INTERVAL` to TIMESTAMP. Spark's
         // `add_months` always returns DATE; the `render_function_call`
@@ -5203,13 +5048,13 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // DATE so collected values come back as date, not datetime. DuckDB's
         // end-of-month clamp (e.g. Jan 31 + 1 month = Feb 29 in a leap year)
         // survives the CAST.
-        "add_months" => {
+        SpecialFunction::AddMonths => {
             let [d, n] = exact_args(f, schema, "`add_months` requires exactly 2 arguments")?;
             return Ok(format!("({d} + INTERVAL ({n}) MONTH)"));
         }
         // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
         // `datediff('day', start, end)` (3 args, unit-prefixed).
-        "datediff" => {
+        SpecialFunction::Datediff => {
             let [end, start] = exact_args(f, schema, "`datediff` requires exactly 2 arguments")?;
             return Ok(format!("datediff('day', {start}, {end})"));
         }
@@ -5219,7 +5064,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // is emitted as `(n * 3) MONTH`. The projection-slot CAST stamps the
         // Spark-parity TIMESTAMP return type. Corpus witness: `intv-006`
         // (`timestampadd(MONTH, 3, last_login)`).
-        "timestampadd" => {
+        SpecialFunction::Timestampadd => {
             if f.args.len() != 3 {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -5239,7 +5084,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // arithmetic that τ does not yet emit — surface an honest
         // Thunderduck-boundary error (ADR-022) rather than the boundary-counting
         // `date_diff`, which diverges from Spark for sub-unit remainders.
-        "timestampdiff" => {
+        SpecialFunction::Timestampdiff => {
             if f.args.len() != 3 {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -5251,7 +5096,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
             let end = render_expr(&f.args[2], schema)?;
             return spark_diff_sql(&f.name, &unit, &start, &end);
         }
-        "months_between" => {
+        SpecialFunction::MonthsBetween => {
             let [a, b] = min_args(f, schema, "`months_between` requires at least 2 arguments")?;
             // Spark's `months_between(a, b)` returns a DOUBLE where the
             // integer part is the whole-month diff and the fractional part
@@ -5268,11 +5113,11 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // always returns DATE. The `render_function_call` wrapper (via
         // `needs_date_return_cast`) supplies the CAST back to DATE (same
         // rule as `add_months` above).
-        "date_add" => {
+        SpecialFunction::DateAdd => {
             let [d, n] = exact_args(f, schema, "`date_add` requires exactly 2 arguments")?;
             return Ok(format!("({d} + INTERVAL ({n}) DAY)"));
         }
-        "date_sub" => {
+        SpecialFunction::DateSub => {
             let [d, n] = exact_args(f, schema, "`date_sub` requires exactly 2 arguments")?;
             return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
         }
@@ -5282,7 +5127,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // Wrap in a CASE guard when any arg is nullable at the schema
         // level and every arg is a String type. Array/binary concat is
         // handled by other paths. Corpus witness: `type-015`.
-        "concat"
+        SpecialFunction::Concat
             if !f.args.is_empty()
                 && f.args
                     .iter()
@@ -5307,14 +5152,14 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // Spark's `isnan(x)` — schema is BOOLEAN non-nullable. DuckDB's
         // `isnan(NULL)` returns NULL; wrap in `COALESCE(..., FALSE)` to
         // match Spark's non-null semantics. Corpus witness: `cond-010`.
-        "isnan" | "is_nan" => {
+        SpecialFunction::Isnan => {
             let [a] = exact_args(f, schema, "`isnan` requires exactly 1 argument")?;
             return Ok(format!("COALESCE(isnan({a}), FALSE)"));
         }
         // Spark's `find_in_set(needle, csv)` — 1-based position of `needle`
         // in comma-separated `csv`, or 0 if not found. DuckDB has no
         // `find_in_set`; emit `COALESCE(list_position(string_split(csv, ','), needle), 0)`.
-        "find_in_set" => {
+        SpecialFunction::FindInSet => {
             let [needle, csv] =
                 exact_args(f, schema, "`find_in_set` requires exactly 2 arguments")?;
             // `list_position` is 1-based in DuckDB (returns NULL if missing);
@@ -5325,7 +5170,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         }
         // Spark's `elt(idx, s1, s2, ...)` — 1-based pick from arguments.
         // DuckDB list indexing is 1-based, so emit `[s1, s2, ...][idx]`.
-        "elt" => {
+        SpecialFunction::Elt => {
             if f.args.len() < 2 {
                 bail_boundary_fn!(f.name.clone(), "`elt` requires at least 2 arguments");
             }
@@ -5346,13 +5191,13 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // `!= 2` guard below — otherwise it would silently pass through
         // as literal `from_json(...)` and DuckDB would raise an opaque
         // scalar-not-found error.
-        "from_json" if f.args.len() != 2 => {
+        SpecialFunction::FromJson if f.args.len() != 2 => {
             bail_boundary_fn!(
                 f.name.clone(),
                 "`from_json` options-map form (3-arg) not supported — τ boundary",
             );
         }
-        "from_json" if f.args.len() == 2 => {
+        SpecialFunction::FromJson if f.args.len() == 2 => {
             let json_str = render_expr(&f.args[0], schema)?;
             if let Some(ddl) = literal_string_arg(&f.args[1]) {
                 if let Some(duck_schema) = spark_ddl_schema_to_duckdb_json(&ddl) {
@@ -5387,16 +5232,16 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // KNOWN DEVIATION: this manual split ignores CSV quoting rules
         // (embedded commas, quoted strings, escapes). The corpus witness
         // uses simple unquoted values; documenting the gap for future work.
-        "from_csv" if f.args.len() != 2 => {
+        SpecialFunction::FromCsv if f.args.len() != 2 => {
             bail_boundary_fn!(
                 f.name.clone(),
                 "`from_csv` options-map form (3-arg) not supported — τ boundary",
             );
         }
-        "from_csv" if f.args.len() == 2 => {
+        SpecialFunction::FromCsv if f.args.len() == 2 => {
             let csv_str = render_expr(&f.args[0], schema)?;
             if let Some(ddl) = literal_string_arg(&f.args[1]) {
-                if let Some(st) = from_csv_ddl_to_struct(&ddl) {
+                if let Some(st) = parse_from_csv_schema(&ddl) {
                     let parts = sql_join(st.fields.iter().enumerate(), ", ", |(i, field)| {
                         let idx = i + 1;
                         let split = format!("split_part({csv_str}, ',', {idx})");
@@ -5431,7 +5276,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // to a Thunderduck-boundary error — τ does not currently emulate
         // Spark's exact format-error semantics for those. Corpus witness:
         // `parse-004`.
-        "try_to_number" => {
+        SpecialFunction::TryToNumber => {
             let (_, cast, _) = to_number_parts(
                 f,
                 schema,
@@ -5456,7 +5301,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // CASE guard: NULL input passes through (Spark's `nullSafeEval`),
         // non-NULL input that fails `try_cast` raises the ANSI class.
         // Corpus witness: `parse-003`.
-        "to_number" => {
+        SpecialFunction::ToNumber => {
             let (s, cast, fmt) = to_number_parts(
                 f,
                 schema,
@@ -5488,14 +5333,14 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // encoding: spaces become `+`, everything else is `%HH`. DuckDB's
         // `url_encode(s)` uses RFC 3986 percent-encoding (spaces → `%20`).
         // Bridge by post-substituting `%20 → +`. Corpus witness: `parse-002`.
-        "url_encode" => {
+        SpecialFunction::UrlEncode => {
             let [s] = exact_args(f, schema, "`url_encode` requires exactly 1 argument")?;
             return Ok(format!("replace(url_encode({s}), '%20', '+')"));
         }
         // Spark's `url_decode(s)` mirrors form-urlencoded (accepts `+` as
         // space). DuckDB's `url_decode(s)` leaves `+` literal. Bridge by
         // pre-substituting `+` → `%20` before decoding.
-        "url_decode" => {
+        SpecialFunction::UrlDecode => {
             let [s] = exact_args(f, schema, "`url_decode` requires exactly 1 argument")?;
             return Ok(format!("url_decode(replace({s}, '+', '%20'))"));
         }
@@ -5507,7 +5352,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // Requires the second arg to be a STRING literal (the part name).
         // For QUERY-with-key, a third STRING literal is required.
         // Anchor: corpus parse-001.
-        "parse_url" => {
+        SpecialFunction::ParseUrl => {
             if !(2..=3).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`parse_url` requires 2 or 3 arguments");
             }
@@ -5555,7 +5400,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // via substring/concat: prefix := substring(str, 1, position-1),
         // suffix := substring(str, position + length_of_replaced), where
         // length_of_replaced defaults to length(replacement).
-        "overlay" => {
+        SpecialFunction::Overlay => {
             if !(3..=4).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`overlay` requires 3 or 4 arguments");
             }
@@ -5572,7 +5417,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // ADR-006: Spark ANSI `pmod`/`mod` throw REMAINDER_BY_ZERO on a zero
         // divisor; DuckDB's `pmod` macro / `mod` return NULL. Guard the call so
         // a zero second argument raises Spark's error class.
-        "pmod" | "mod" if f.args.len() == 2 => {
+        SpecialFunction::Pmod | SpecialFunction::Mod if f.args.len() == 2 => {
             let call = format!("{name_lower}({args_sql})");
             if is_nonzero_literal(&f.args[1]) {
                 return Ok(call);
@@ -5584,7 +5429,41 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
                 &call,
             ));
         }
-        _ => name_lower,
+        SpecialFunction::ArrayAppend
+        | SpecialFunction::ArrayDistinct
+        | SpecialFunction::ArrayExcept
+        | SpecialFunction::ArrayIntersect
+        | SpecialFunction::ArrayJoin
+        | SpecialFunction::ArrayPosition
+        | SpecialFunction::ArrayPrepend
+        | SpecialFunction::ArrayUnion
+        | SpecialFunction::ArraysZip
+        | SpecialFunction::Concat
+        | SpecialFunction::ConcatWs
+        | SpecialFunction::DateFormat
+        | SpecialFunction::ElementAt
+        | SpecialFunction::Exists
+        | SpecialFunction::Flatten
+        | SpecialFunction::Forall
+        | SpecialFunction::FromCsv
+        | SpecialFunction::FromJson
+        | SpecialFunction::FromUtcTimestamp
+        | SpecialFunction::Lag
+        | SpecialFunction::Lead
+        | SpecialFunction::MapConcat
+        | SpecialFunction::MapFilter
+        | SpecialFunction::Mod
+        | SpecialFunction::NthValue
+        | SpecialFunction::Pmod
+        | SpecialFunction::Reverse
+        | SpecialFunction::Round
+        | SpecialFunction::ToUtcTimestamp
+        | SpecialFunction::TransformKeys
+        | SpecialFunction::TransformValues
+        | SpecialFunction::Trunc
+        | SpecialFunction::TryElementAt
+        | SpecialFunction::ZipWith
+        | SpecialFunction::ToChar => name_lower,
     };
     Ok(format!("{duck_name}({args_sql})"))
 }
@@ -5620,7 +5499,10 @@ fn render_decimal_avg(
     let arg_type = f.args[0].data_type(schema);
     let distinct = if f.distinct { "DISTINCT " } else { "" };
     let arg_sql = render_expr(&f.args[0], schema)?;
-    let inner = format!("spark_avg({distinct}{arg_sql})");
+    let inner = format!(
+        "{}({distinct}{arg_sql})",
+        ExtensionFunction::Average.as_str()
+    );
     let inner = match over {
         Some(o) => format!("{inner} {o}"),
         None => inner,
@@ -5636,193 +5518,74 @@ fn render_decimal_avg(
 /// its own outer CAST. Unknown aggregate names surface as a `Function`-kinded
 /// Thunderduck-boundary [`EmissionError::Unsupported`] per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
-    // N5: `f.name` is already canonical lowercase — `lower` is kept as an
-    // owned `String` (not renamed to a borrow) so the rest of this function,
-    // which threads it through several `&lower` / `format!` sites, needs no
-    // further edits.
-    let lower = f.name.clone();
-    // Guard-based arms MUST come before the pass-through arm (else the
-    // pass-through catches `first`/`last` first and the guard never fires).
-    if matches!(
-        lower.as_str(),
-        "first" | "last" | "first_value" | "last_value"
-    ) && f.args.len() >= 2
-    {
-        // Spark's `first(col, ignorenulls)` / `last(col, ignorenulls)` —
-        // DuckDB's first/last are single-arg. Drop the ignorenulls flag
-        // UNCONDITIONALLY (corpus uses ignorenulls=True which matches
-        // DuckDB's default); keep-arity is single-homed in
-        // [`trailing_ignore_nulls_keep_arity`] — see its doc for the
-        // deliberate guard divergence from `render_function_call`.
-        if let Some(keep) = trailing_ignore_nulls_keep_arity(&lower) {
-            let distinct = if f.distinct { "DISTINCT " } else { "" };
-            let parts = sql_join(f.args.iter().take(keep), ", ", |arg| {
-                render_expr(arg, schema)
-            })?;
-            return Ok(format!("{lower}({distinct}{parts})"));
+    let lower = f.name.as_str();
+    let Some(spec) = function_registry::aggregate_spec(lower) else {
+        bail_boundary_fn!(
+            f.name.clone(),
+            "aggregate function not present in the live function registry",
+        );
+    };
+    let (duck_name, force_distinct) = match spec.emission {
+        AggregateEmission::Native => (lower, false),
+        AggregateEmission::Rename(target) => (target.as_str(), false),
+        AggregateEmission::Extension(target) => (target.as_str(), false),
+        AggregateEmission::Session(target) => (target.as_str(), false),
+        AggregateEmission::Distinct(target) => (target.as_str(), true),
+        AggregateEmission::Special(AggregateSpecial::FirstLast) => {
+            if f.args.len() >= 2 {
+                let keep = trailing_ignore_nulls_keep_arity(lower)
+                    .expect("FirstLast registry rows have a keep-arity rule");
+                let distinct = if f.distinct { "DISTINCT " } else { "" };
+                let args = sql_join(f.args.iter().take(keep), ", ", |arg| {
+                    render_expr(arg, schema)
+                })?;
+                return Ok(format!("{lower}({distinct}{args})"));
+            }
+            (lower, false)
         }
-    }
-    // Spark's `percentile_approx(col, quantile [, accuracy])` returns the
-    // discrete value at the requested percentile — for a small dataset,
-    // this matches the value at the ceil(q * n)-th sorted position, not
-    // the linear-interpolation continuous median. Map to DuckDB's
-    // `quantile_disc(col, quantile)` for exact Spark parity on the
-    // sample size the corpus witnesses use. Drop the optional accuracy arg.
-    // CAST the quantile to DOUBLE since Spark sends it as Decimal.
-    // Corpus witness: `agg-013` (percentile_approx returns 88000 for
-    // 8-row salary sample; `approx_quantile` returned 91500).
-    if (lower == "percentile_approx" || lower == "approx_percentile") && f.args.len() >= 2 {
-        let col = render_expr(&f.args[0], schema)?;
-        let q = render_expr(&f.args[1], schema)?;
-        return Ok(format!("quantile_disc({col}, CAST({q} AS DOUBLE))"));
-    }
-    // Spark `percentile(col, p)` = exact CONTINUOUS (linear-interpolation)
-    // quantile → DuckDB `quantile_cont` (percentile_approx above uses
-    // `quantile_disc` = discrete sample value). CAST the quantile to DOUBLE
-    // since Spark sends it as Decimal. Corpus witness: `agg-019`
-    // (percentile(salary, 0.5) = 91500 continuous, not 88000 discrete).
-    if lower == "percentile" && f.args.len() >= 2 {
-        let col = render_expr(&f.args[0], schema)?;
-        let q = render_expr(&f.args[1], schema)?;
-        return Ok(format!("quantile_cont({col}, CAST({q} AS DOUBLE))"));
-    }
-    // Spark `avg`/`mean` over a DECIMAL argument — DuckDB's native `avg`
-    // returns DOUBLE over a DECIMAL input (precision loss vs Spark, which
-    // widens to a wider DECIMAL per `AggRet::AvgLike`). Route through the
-    // ext6 extension's `spark_avg`, which already returns DECIMAL natively
-    // (re-honors rearchitect ADR-020; `try_avg` from the same extension
-    // family is wired above at the `try_avg` arm). Guard MUST come before
-    // the `"avg" | "mean"` pass-through arm below (else the pass-through
-    // catches it first). Integer/float `avg` and `try_avg` are untouched —
-    // `is_decimal_avg` only fires on a single DECIMAL argument.
-    if is_decimal_avg(f, schema) {
-        return render_decimal_avg(f, None, schema);
-    }
-    let (duck_name, force_distinct) = match lower.as_str() {
-        // Direct pass-through — DuckDB accepts the Spark name unchanged.
-        "count"
-        | "sum"
-        | "avg"
-        | "mean"
-        | "min"
-        | "max"
-        | "first"
-        | "last"
-        | "first_value"
-        | "last_value"
-        | "any_value"
-        | "approx_count_distinct"
-        | "stddev"
-        | "stddev_samp"
-        | "stddev_pop"
-        | "variance"
-        | "var_samp"
-        | "var_pop"
-        | "bit_and"
-        | "bit_or"
-        | "bit_xor"
-        | "bool_and"
-        | "bool_or"
-        | "corr"
-        | "covar_samp"
-        | "covar_pop"
-        | "regr_slope"
-        | "regr_r2"
-        | "regr_intercept"
-        | "regr_avgx"
-        | "regr_avgy"
-        | "regr_sxx"
-        | "regr_sxy"
-        | "regr_syy"
-        | "median"
-        // `collect_list` / `collect_set` are macro-backed (registered at
-        // session startup: collect_list → LIST(x) FILTER (WHERE x IS NOT
-        // NULL), collect_set → LIST(DISTINCT x) FILTER (...)), not
-        // DuckDB-native aggregates. Pass the name through verbatim;
-        // force_distinct stays false — collect_set's DISTINCT lives inside
-        // the macro and Spark never sets distinct=true here.
-        | "collect_list"
-        | "collect_set"
-        | "grouping"
-        | "grouping_id" => (lower.as_str(), false),
-        // Spark's population-formula `skewness` — DuckDB's `skewness` uses
-        // the sample formula. The ext6 extension provides `spark_skewness`
-        // with Spark-parity semantics (checklist §4.1).
-        "skewness" => ("spark_skewness", false),
-        // Spark's `max_by(x, y)` / `min_by(x, y)` return the VALUE at the
-        // ordering-extreme row even when that value is NULL. DuckDB's
-        // `arg_max`/`arg_min` instead SKIP rows whose value arg is NULL —
-        // wrong-scalar divergence, not just a naming difference. DuckDB's
-        // `arg_max_null`/`arg_min_null` match Spark's null-at-extreme
-        // semantics exactly (verified empirically: `arg_max_null(name, val)`
-        // over `('a',1),(NULL,5),('c',0),(NULL,-2)` returns NULL — the value
-        // at the max `val` row, which is NULL). Args pass through unchanged
-        // via `args_sql` below (same 2-arg shape: value column, ordering
-        // column).
-        "max_by" => ("arg_max_null", false),
-        "min_by" => ("arg_min_null", false),
-        // Spark's `kurtosis` uses the population formula; DuckDB has
-        // `kurtosis_pop` for that (native, not via extension).
-        "kurtosis" => ("kurtosis_pop", false),
-        // Additional aggregates: percentile_approx / approx_percentile /
-        // mode / any / every / some / all.
-        // percentile_approx handled with an explicit arm below.
-        // Spark's `mode(col[, ignoreNulls])` — DuckDB's `mode` is single-arg
-        // and rejects BOOLEAN. Drop the trailing boolean-literal
-        // `ignoreNulls` flag (corpus default), and CAST-wrap boolean args
-        // to INTEGER (with an outer CAST back to BOOLEAN). Anchors:
-        // corpus `agg-014` (`mode(active, false)` on BOOLEAN column).
-        "mode" => {
-            // Extract the first arg; drop any trailing boolean-literal flags.
-            let first = f.args.first().cloned();
-            let trailing_bool_only = f.args.iter().skip(1).all(|e| bool_literal(e).is_some());
-            if let Some(arg) = first {
-                if trailing_bool_only {
-                    let distinct = if f.distinct { "DISTINCT " } else { "" };
-                    // Peek through any wrapping Alias for the type check.
-                    let inner = arg.unaliased();
-                    let a = render_expr(inner, schema)?;
-                    // Boolean sniff: either the analyzer-resolved type is
-                    // Boolean, OR the argument is a boolean literal.
-                    let is_bool = matches!(inner.data_type(schema), DataType::Boolean)
-                        || bool_literal(inner).is_some();
-                    if is_bool {
-                        return Ok(format!(
-                            "CAST(mode({distinct}CAST({a} AS INTEGER)) AS BOOLEAN)"
-                        ));
-                    }
-                    return Ok(format!("mode({distinct}{a})"));
+        AggregateEmission::Special(AggregateSpecial::ApproxPercentile) => {
+            let [value, quantile] =
+                min_args(f, schema, "percentile_approx requires at least 2 arguments")?;
+            return Ok(format!(
+                "quantile_disc({value}, CAST({quantile} AS DOUBLE))"
+            ));
+        }
+        AggregateEmission::Special(AggregateSpecial::Percentile) => {
+            let [value, quantile] =
+                min_args(f, schema, "percentile requires at least 2 arguments")?;
+            return Ok(format!(
+                "quantile_cont({value}, CAST({quantile} AS DOUBLE))"
+            ));
+        }
+        AggregateEmission::Special(AggregateSpecial::Average) => {
+            if is_decimal_avg(f, schema) {
+                return render_decimal_avg(f, None, schema);
+            }
+            (lower, false)
+        }
+        AggregateEmission::Special(AggregateSpecial::Mode) => {
+            let [arg] = min_args(f, schema, "mode requires at least 1 argument")?;
+            if f.args
+                .iter()
+                .skip(1)
+                .all(|expr| bool_literal(expr).is_some())
+            {
+                let distinct = if f.distinct { "DISTINCT " } else { "" };
+                let input = f.args[0].unaliased();
+                if matches!(input.data_type(schema), DataType::Boolean)
+                    || bool_literal(input).is_some()
+                {
+                    return Ok(format!(
+                        "CAST(mode({distinct}CAST({arg} AS INTEGER)) AS BOOLEAN)"
+                    ));
                 }
+                return Ok(format!("mode({distinct}{arg})"));
             }
-            ("mode", false)
+            (lower, false)
         }
-        "any" | "some" => ("bool_or", false),
-        "every" | "all" => ("bool_and", false),
-        // `try_sum` / `try_avg` — ext6 extension arms.
-        "try_sum" => ("spark_try_sum", false),
-        "try_avg" => ("spark_try_avg", false),
-        "std" => ("stddev", false),
-        // Spark's `count_if(cond)` → DuckDB `count(*) FILTER (WHERE cond)`
-        // or simpler `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. DuckDB accepts
-        // `count_if` in recent versions, but safest to lower.
-        "count_if" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`count_if` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!("SUM(CASE WHEN {a} THEN 1 ELSE 0 END)"));
-        }
-        // Spark's `mean` is an alias for `avg`; DuckDB accepts both — treat
-        // both identically above. `count_distinct` and `sum_distinct` lower
-        // to DISTINCT-flagged calls.
-        "count_distinct" => ("count", true),
-        "sum_distinct" => ("sum", true),
-        // Non-primitive aggregates surface as Thunderduck-boundary.
-        _ => {
-            bail_boundary_fn!(
-                f.name.clone(),
-                "aggregate function not yet in the primitive arm set",
-            );
+        AggregateEmission::Special(AggregateSpecial::CountIf) => {
+            let [arg] = exact_args(f, schema, "`count_if` requires exactly 1 argument")?;
+            return Ok(format!("SUM(CASE WHEN {arg} THEN 1 ELSE 0 END)"));
         }
     };
     // Zero-arg aggregate calls are legal for a handful of Spark functions
@@ -6081,7 +5844,10 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
             } else {
                 format!("CAST(({r}) AS {rty})")
             };
-            return Ok(format!("spark_decimal_div({lsql}, {rsql})"));
+            return Ok(format!(
+                "{}({lsql}, {rsql})",
+                ExtensionFunction::DecimalDivide.as_str()
+            ));
         }
     }
     let op = match b.op {
@@ -6480,17 +6246,6 @@ fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
     }
 }
 
-/// Parse a Spark numeric format string (as used by `to_number` /
-/// `try_to_number`) into `(precision, scale)`. Supports only the common
-/// digit-template shape composed of `9` and `0` optionally split by a
-/// single `.` (e.g. `"999.99"` → `(5, 2)`). Returns `None` for any format
-/// that carries grouping / sign / currency markers.
-///
-/// The `parse-004` shape exercises this accepted digit-template form.
-pub(crate) fn parse_number_format_for_type_inference(fmt: &str) -> Option<(u8, u8)> {
-    parse_number_format(fmt)
-}
-
 /// Parse Spark's `F.window` duration-literal grammar for the 2-arg tumbling
 /// form: `"N unit"` where `N` is a positive integer and `unit ∈
 /// {second, minute, hour, day, week}` (singular or plural, case-insensitive).
@@ -6537,39 +6292,6 @@ pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static st
     Some((n, canonical))
 }
 
-/// Parse a Spark DDL schema string (field list, e.g. `"a INT, b
-/// ARRAY<STRING>"`, or `struct<...>` wrapper) into a [`StructType`] with the
-/// shared strict Spark-DDL parser. Returns `None` when τ cannot translate the
-/// DDL, allowing callers to report the unsupported schema at the boundary.
-///
-/// The grammar covers decimal, interval, null/void, primitive aliases, NOT
-/// NULL qualifiers, and the `struct<...>` wrapper form; unknown types still
-/// yield `None` so callers can report the unsupported schema at the boundary.
-pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<StructType> {
-    crate::types::spark_ddl::parse_spark_schema(ddl)
-}
-
-/// Parse a Spark DDL schema string for `from_csv`. Spark's
-/// `from_csv` accepts only flat primitive schemas (no nested STRUCT / ARRAY
-/// / MAP) — this helper enforces that narrower surface so we fail loud on
-/// shapes Spark itself would reject. Returns `None` when τ cannot translate
-/// the DDL. The `json-007` shape exercises this path.
-pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
-    let st = crate::types::spark_ddl::parse_spark_schema(ddl)?;
-    // from_csv is flat-only: reject nested/composite types (Spark
-    // itself would reject these too — from_csv operates row-per-row on
-    // a single delimited line).
-    if st.fields.iter().any(|f| {
-        matches!(
-            f.data_type,
-            DataType::Struct(_) | DataType::Array(_, _) | DataType::Map { .. }
-        )
-    }) {
-        return None;
-    }
-    Some(st)
-}
-
 /// Translate a Spark DDL field-list schema (as used by `from_json`,
 /// e.g. `"a INT, b ARRAY<STRING>, c STRUCT<d:BOOLEAN>"`) into a DuckDB
 /// JSON-schema object literal (e.g.
@@ -6589,11 +6311,11 @@ pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
 /// The `json-003` and `json-004` shapes exercise this path.
 ///
 /// Parses ONCE via the typed DDL parser
-/// ([`from_json_ddl_to_struct_for_type_inference`], the same grammar the
+/// ([`parse_from_json_schema`], the same grammar the
 /// type-inference side uses) and renders the JSON schema from the resulting
 /// [`StructType`] directly.
 fn spark_ddl_schema_to_duckdb_json(ddl: &str) -> Option<String> {
-    let st = from_json_ddl_to_struct_for_type_inference(ddl)?;
+    let st = parse_from_json_schema(ddl)?;
     struct_type_to_duckdb_json(&st)
 }
 
@@ -6654,38 +6376,6 @@ fn duckdb_primitive_name(dt: &DataType) -> Option<&'static str> {
         DataType::Timestamp | DataType::TimestampNtz => Some("TIMESTAMP"),
         _ => None,
     }
-}
-
-fn parse_number_format(fmt: &str) -> Option<(u8, u8)> {
-    let trimmed = fmt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut pre = 0u32;
-    let mut post = 0u32;
-    let mut seen_dot = false;
-    for ch in trimmed.chars() {
-        match ch {
-            '9' | '0' => {
-                if seen_dot {
-                    post += 1;
-                } else {
-                    pre += 1;
-                }
-            }
-            '.' if !seen_dot => seen_dot = true,
-            // Grouping separator (Spark's `G` / `,`): permitted only in the
-            // integer part; contributes no digit slot to precision or scale.
-            // Corpus witness: `parse-003` uses `'9,999.99'`.
-            ',' if !seen_dot => {}
-            _ => return None,
-        }
-    }
-    let precision_u32 = pre + post;
-    if precision_u32 == 0 || precision_u32 > 38 {
-        return None;
-    }
-    Some((precision_u32 as u8, post as u8))
 }
 
 /// Render the `try_cast(<input> AS DECIMAL(p, s))` payload for the
@@ -6837,15 +6527,6 @@ pub(crate) fn render_data_type(dt: &DataType) -> String {
 /// substrate names and the stamp's target names line up bit-for-bit.
 fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
     crate::types::pyspark_parity::dedup_names(names)
-}
-
-/// The set of DuckDB extension function names τ emits. Currently empty; τ's
-/// extension-target wiring will populate this with the ext6 allow-list and
-/// activate INV6 (`transpiler_v2/invariants.rs::inv6_extension_targets_exist`,
-/// currently DEFER-marked).
-#[allow(dead_code)] // INV6 activator (currently DEFER); populated when extension-target wiring lands.
-pub(crate) fn extension_targets() -> HashSet<&'static str> {
-    HashSet::new()
 }
 
 #[cfg(test)]
@@ -7011,6 +6692,19 @@ mod tests {
 
     fn render_fn(name: &str, args: Vec<Expression>) -> String {
         render_function_call(&fcall(name, args), &empty_schema()).expect("render")
+    }
+
+    #[test]
+    fn unregistered_function_never_reaches_native_emission() {
+        let error =
+            render_function_call(&fcall("not_a_registered_function", vec![]), &empty_schema())
+                .expect_err("unregistered call must stop at the registry boundary");
+        expect_unsupported(
+            error,
+            UnsupportedKind::Function,
+            "not_a_registered_function",
+            &["not present in the live function registry"],
+        );
     }
 
     /// Asserts `err` is [`EmissionError::Unsupported`] with the given `kind`
@@ -11673,11 +11367,6 @@ mod tests {
     // `avg_of_decimal_routes_through_spark_avg` plus `avg_of_{integer,double}_stays_native`.
 
     #[test]
-    fn extension_targets_is_empty_by_default() {
-        assert!(extension_targets().is_empty());
-    }
-
-    #[test]
     fn render_interval_emits_interval_literal() {
         let i = IntervalExpression {
             months: 1,
@@ -13784,15 +13473,10 @@ mod tests {
         assert_eq!(sql, "(CAST(10.5 AS DOUBLE))");
     }
 
-    /// Item 4 (grab-bag): Spark's `negative(x)`/`negate(x)` (`UnaryMinus`)
-    /// render as unary minus, self-contained in emission (no reliance on
-    /// the runtime session macro). `num-008` covers `negative`'s schema;
-    /// `negate` is not a real Spark SQL function — unit test only.
+    /// Spark's `negative(x)` (`UnaryMinus`) renders as unary minus.
     #[test]
-    fn render_negative_and_negate_are_unary_minus() {
+    fn render_negative_is_unary_minus() {
         let sql = render_fn("negative", vec![double_lit(10.5)]);
-        assert_eq!(sql, "(-(CAST(10.5 AS DOUBLE)))");
-        let sql = render_fn("negate", vec![double_lit(10.5)]);
         assert_eq!(sql, "(-(CAST(10.5 AS DOUBLE)))");
     }
 
@@ -15380,25 +15064,6 @@ mod tests {
         );
     }
 
-    /// Same DDL, but resolved to a core `StructType` for τ's projection
-    /// schema inference. Nested `STRUCT<...>` must recurse into
-    /// `DataType::Struct(...)`.
-    #[test]
-    fn from_json_ddl_resolves_to_struct_type() {
-        let st = from_json_ddl_to_struct_for_type_inference("a INT, c STRUCT<d:BOOLEAN>").unwrap();
-        assert_eq!(st.fields.len(), 2);
-        assert_eq!(st.fields[0].name, "a");
-        assert_eq!(st.fields[0].data_type, DataType::Integer);
-        match &st.fields[1].data_type {
-            DataType::Struct(inner) => {
-                assert_eq!(inner.fields.len(), 1);
-                assert_eq!(inner.fields[0].name, "d");
-                assert_eq!(inner.fields[0].data_type, DataType::Boolean);
-            }
-            other => panic!("expected Struct, got {other:?}"),
-        }
-    }
-
     /// `from_csv(csv_str, "qty INT, label STRING, price DOUBLE")`
     /// emits a per-field `split_part` synthesis wrapped in a NULL guard so
     /// a NULL input yields a NULL struct (not a struct-of-NULLs).
@@ -15439,24 +15104,6 @@ mod tests {
             sql.contains("price := try_cast(nullif(split_part(csv_str, ',', 3), '') AS DOUBLE)"),
             "got: {sql}"
         );
-    }
-
-    /// DDL parsed into a flat `StructType` for τ's projection
-    /// schema inference. Nested composite types are rejected (Spark's own
-    /// `from_csv` accepts only flat primitives).
-    #[test]
-    fn from_csv_ddl_resolves_to_flat_struct_type() {
-        let st = from_csv_ddl_to_struct("qty INT, label STRING, price DOUBLE").unwrap();
-        assert_eq!(st.fields.len(), 3);
-        assert_eq!(st.fields[0].name, "qty");
-        assert_eq!(st.fields[0].data_type, DataType::Integer);
-        assert_eq!(st.fields[1].name, "label");
-        assert_eq!(st.fields[1].data_type, DataType::String);
-        assert_eq!(st.fields[2].name, "price");
-        assert_eq!(st.fields[2].data_type, DataType::Double);
-        // Nested composite types → None (Spark's from_csv rejects them).
-        assert!(from_csv_ddl_to_struct("a STRUCT<b:INT>").is_none());
-        assert!(from_csv_ddl_to_struct("a ARRAY<INT>").is_none());
     }
 
     /// Spark's `from_csv(csv_str, schema_ddl, options_map)`
@@ -15615,21 +15262,6 @@ mod tests {
             sql.contains(" UNION ALL "),
             "expected UNION ALL combinator, got: {sql}"
         );
-    }
-
-    /// `parse_number_format` recognizes digit templates.
-    #[test]
-    fn parse_number_format_digit_template() {
-        assert_eq!(parse_number_format("999.99"), Some((5, 2)));
-        assert_eq!(parse_number_format("9999"), Some((4, 0)));
-        assert_eq!(parse_number_format("0.00"), Some((3, 2)));
-        // Grouping separator `,` is accepted in the integer part
-        // (contributes no digit slot). Corpus witness: `parse-003`.
-        assert_eq!(parse_number_format("9,999.99"), Some((6, 2)));
-        // Sign / currency / other markers → None (τ boundary).
-        assert_eq!(parse_number_format("S999.99"), None);
-        // Empty / all-zero-precision → None.
-        assert_eq!(parse_number_format(""), None);
     }
 
     /// `to_number(col, '9,999.99')` on non-parseable input emits a

@@ -34,9 +34,9 @@ use crate::transpiler_v2::expression::{
     StarExpression, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
     WindowFunction,
 };
+use crate::transpiler_v2::function_registry;
 use crate::transpiler_v2::generator::Generator;
 use crate::transpiler_v2::macros::ProtoFieldExt;
-use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
 use crate::transpiler_v2::EmissionError;
 use crate::transpiler_v2::Qualifier;
 use crate::types::{DataType, DayTimeField, YearMonthField};
@@ -2323,7 +2323,7 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
 /// [`resolve_named_windows_in_expr`]'s `&mut` mirror — the two walkers share
 /// the "missed a composite shape" bug class, one classifying aggregates, the
 /// other rewriting named windows. The parse-from-SQL parity test
-/// `expr_has_aggregate_classifier_table` guards against drift.
+/// `expr_has_aggregate_registry_entry` guards against drift.
 fn expr_has_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(f) => function_call_has_aggregate(f),
@@ -2378,7 +2378,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         // `TRIM`/`OVERLAY` and bracket field access to dedicated `Expr`
         // variants (NOT `Expr::Function`). These arms MUST stay in lockstep
         // with `resolve_named_windows_in_expr`'s mirror set; the parse-from-
-        // SQL parity test `expr_has_aggregate_classifier_table` guards drift.
+        // SQL parity test `expr_has_aggregate_registry_entry` guards drift.
         Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
             expr_has_aggregate(expr)
         }
@@ -2474,7 +2474,7 @@ fn function_arg_has_aggregate(arg: &FunctionArg) -> bool {
 }
 
 fn is_aggregate_function_name(name: &str) -> bool {
-    is_aggregate_classifier_name(name)
+    function_registry::is_aggregate(name)
 }
 
 /// Build a non-null boolean literal expression — used to lower `IS [NOT] TRUE`
@@ -3508,7 +3508,7 @@ fn resolve_named_windows_in_select(select: &mut Select) -> Result<(), EmissionEr
 /// (`Extract`/`Ceil`/`Floor`/`Substring`/`Position`/`Trim`/`Overlay`/
 /// `CompoundFieldAccess`) — kept in lockstep to defeat the same "walker
 /// missed a composite shape" bug class (different walker); the parity test
-/// `expr_has_aggregate_classifier_table` guards the bool half against drift.
+/// `expr_has_aggregate_registry_entry` guards the bool half against drift.
 /// Deliberately does NOT descend into a
 /// subquery (`Expr::Subquery`, `Expr::Exists`, or the subquery half of
 /// `InSubquery`) — a `WINDOW` clause is scoped to its containing `SELECT`
@@ -3622,7 +3622,7 @@ fn resolve_named_windows_in_expr(
         // `&mut` mirror of `expr_has_aggregate`'s special-form arms — a
         // named-window ref can legally nest inside any of these (e.g.
         // `extract(YEAR FROM lag(ts) OVER w)`). Keep in lockstep; the parity
-        // test `expr_has_aggregate_classifier_table` guards the bool walker.
+        // test `expr_has_aggregate_registry_entry` guards the bool walker.
         Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
             resolve_named_windows_in_expr(expr, defs)?;
         }
@@ -4626,7 +4626,7 @@ mod tests {
     }
 
     /// Parse a single SparkDialect scalar expression into a sqlparser `Expr`,
-    /// for the `expr_has_aggregate` classifier parity table.
+    /// for the `expr_has_aggregate` registry parity table.
     fn parse_expr(sql: &str) -> Expr {
         let dialect = SparkDialect;
         Parser::new(&dialect)
@@ -5628,7 +5628,7 @@ mod tests {
     // both a missed arm AND a wrong-field-shape assumption).
 
     #[test]
-    fn expr_has_aggregate_classifier_table() {
+    fn expr_has_aggregate_registry_entry() {
         let positive = [
             "extract(year from max(ts))",
             "substring(max(name) from 1 for 2)",

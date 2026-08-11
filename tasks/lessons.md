@@ -13,6 +13,13 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
 ## Workflow shape
 
+- **A closed route must remain closed at every consumer.** The Phase-4 function-registry
+  cleanup initially added `FunctionImplementation::Special`, but inference, nullability,
+  and emission still selected handlers with open string matches and a native fallback.
+  That preserved the old second authority behind a declarative facade. Rule: when an enum
+  defines architectural routes, downstream dispatch must exhaustively match its variants;
+  adding a new special case must produce compiler errors at every semantic consumer.
+
 - **Do not infer a missing host credential from a devcontainer fallback test.** The Codex devcontainer setup (2026-08-06) initially treated absent captured files under `/workspace/.devcontainer/` as evidence that no OpenAI credential was available. A safe host check showed both `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` unset, while `codex login status` reported a ChatGPT login cached in `~/.codex/auth.json`. Rule: distinguish environment credentials from Codex's persisted ChatGPT session; inspect both without printing secrets before recommending an auth path.
 
 - **Substrate-only efforts are the right shape when the runway to the next unlock is long.**

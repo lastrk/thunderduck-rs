@@ -276,6 +276,14 @@ Production dispatch uses the **compiled approach**: a build-time procedural macr
 
 **Anti-pattern: declarative row data structures without a live interpreter.** Rows that no runtime dispatch consults are dead data; they inflate INV3's coverage denominator with false coverage and drift silently from the `match`-based dispatch. Full Approach B (rich declarative table + interpreter) is a legitimate alternative *if* both land together; half-declarative is worse than either fully hand-written or fully interpreted.
 
+**Amendment (2026-08-11) — one interpreted function registry.** Callable identity, kind, catalog exposure, ordinary type/nullability rules, and simple emission targets had grown into independent name rosters and drifted. τ now has one const `FunctionSpec` row for every supported Spark or Connect spelling; catalog operations and every semantic consumer read that registry. There is no legacy catalog or open native fallback.
+
+`FunctionImplementation` has exactly five routes: `Scalar(ordinary interpreted rules)`, `Aggregate(ordinary interpreted rules)`, `Generator(structured generator)`, `Special(closed handwritten handler)`, and `Lowered(frontend-owned syntax/IR)`. Native calls, closed DuckDB renames, mandatory-extension targets, and session targets are ordinary row data. A `Special` row names one closed enum discriminant, and type inference, nullability, and emission exhaustively match that enum. Spark-specific expression bodies remain Rust rather than becoming a second template language. `Lowered` calls must disappear at the frontend boundary; they never fall through to scalar emission.
+
+The registry uses closed enums, a sorted const slice, and binary search. It has no callbacks, trait objects, proc macro, `build.rs` generation, aliases, test-only rows, or duplicated migration roster. Arity remains with the handler that can preserve Spark's error precedence. Adding an ordinary function is one row; adding a special handler creates compiler exhaustiveness errors at every semantic consumer.
+
+This amendment supersedes ADR-009's compiled-dispatch preference for the function-name surface only. Structural AST emission remains handwritten node dispatch. The acceptance gate remains simplification: old authorities must be deleted and pre-test production Rust must decrease.
+
 ---
 
 ## ADR-010 — Extension functions are a minimal gap-filler for Spark/DuckDB divergence, implemented in the C++ extension project

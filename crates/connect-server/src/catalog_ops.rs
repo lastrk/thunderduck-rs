@@ -350,16 +350,17 @@ mod tests {
         match &ast.op {
             CommonOp::Values { rows, column_names } => {
                 assert_eq!(column_names.len(), 6);
+                let names: Vec<_> = function_catalog::supported_function_names().collect();
                 assert_eq!(
                     rows.len(),
-                    function_catalog::SUPPORTED_FUNCTIONS.len(),
-                    "row count must match SUPPORTED_FUNCTIONS length"
+                    names.len(),
+                    "row count must match the live catalog length"
                 );
                 match &rows[0][0] {
                     Expression::Literal(Literal {
                         value: LiteralValue::String(s),
                         ..
-                    }) => assert_eq!(s, function_catalog::SUPPORTED_FUNCTIONS[0]),
+                    }) => assert_eq!(s, names[0]),
                     other => panic!("expected string literal, got: {other:?}"),
                 }
             }

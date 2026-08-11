@@ -23,6 +23,7 @@ pub mod error;
 pub mod expression;
 pub mod function_catalog;
 pub mod generator;
+pub mod identifier;
 pub mod invariants;
 pub mod macros;
 /// Re-export, not a module: [`name_fold`](crate::types::name_fold) moved to
@@ -48,6 +49,7 @@ pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
 pub use generator::{Generator, GeneratorKind};
+pub use identifier::{parse_multipart_identifier, parse_sql_multipart_identifier, Qualifier};
 pub use schema::{Attribute, ExprId, ResolvedSchema};
 pub use statement::{render_ddl, DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;
@@ -133,7 +135,7 @@ mod tests {
         // `UnknownTable` has a known `spark_class()`
         // (`TABLE_OR_VIEW_NOT_FOUND`) — rather than any τ-boundary marker.
         let plan = CommonAst::new(CommonOp::TableScan {
-            table: "no_such_table".to_owned(),
+            table: Qualifier::single("no_such_table"),
         });
         let base_types = BaseTypes::empty();
         let result = generate(&plan, &base_types);
@@ -174,20 +176,20 @@ mod tests {
             StructField::nullable("dept_name", DataType::String),
         ]);
         let base_types = BaseTypes::empty()
-            .with_entry("emp", emp_schema)
-            .with_entry("dept", dept_schema);
+            .with_entry(&Qualifier::single("emp"), emp_schema)
+            .with_entry(&Qualifier::single("dept"), dept_schema);
 
         let scan = |table: &str| {
             CommonAst::new(CommonOp::TableScan {
-                table: table.to_owned(),
+                table: Qualifier::single(table),
             })
         };
         // `dept_id` is present on both sides of the join — unqualified
         // reference is ambiguous.
         let ambiguous_condition = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "dept_id".to_owned(),
-            qualifier: None,
+            name_parts: vec!["dept_id".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         });
         let plan = CommonAst::new(CommonOp::Join {
             left: Box::new(scan("emp")),
@@ -197,8 +199,6 @@ mod tests {
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
 
         let err = generate(&plan, &base_types).expect_err("ambiguous column must error");

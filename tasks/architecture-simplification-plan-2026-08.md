@@ -208,13 +208,14 @@ Fix comments that currently contradict the code or the authoritative ADRs:
 
 ## Phase 2 — mirror Spark Connect plan-ID lookup
 
-### Current duplication
+### Starting duplication
 
-`CommonAst` discards each relation's `plan_id`. The converter later reconstructs
-selected descendant IDs with the partial `collect_relation_plan_ids` proto walk
-and stores whole-side `left_plan_ids` / `right_plan_ids` on joins. The vectors
-are threaded through both common and typed operators, erasing the plan-node
-depth and ancestor-output checks that participate in Spark resolution.
+At plan adoption, `CommonAst` discarded each relation's `plan_id`. Until Step 5,
+the converter also reconstructs selected descendant IDs with the partial
+`collect_relation_plan_ids` proto walk and stores whole-side `left_plan_ids` /
+`right_plan_ids` on joins. The vectors are threaded through both common and
+typed operators, erasing the plan-node depth and ancestor-output checks that
+participate in Spark resolution.
 
 ### Target invariant
 
@@ -733,3 +734,80 @@ self-join ambiguity; and output filtering for USING, set, semi, and anti joins.
 If the direct resolver does not delete the collector, vectors, initializers, and
 their ambiguity bookkeeping for a net production-code reduction, stop and
 re-evaluate the migration.
+
+### Ordered implementation checklist
+
+Complete these steps strictly in order. A step is complete only after its
+targeted checks pass and an independent reviewer reports no unresolved
+correctness, parity, or architecture findings. Do not begin the next step while
+the preceding review is open.
+
+- [x] **Step 1 — make ancestor filtering identity-safe.** Amend ADR-024/026 and
+  add Spark-parity witnesses for every mint-versus-copy decision made observable
+  by plan-ID ancestor filtering. Correct rename, `ToDf`, touched `NaFill` and
+  `NaReplace` outputs, full-outer `USING`/natural keys, and
+  `unionByName(allowMissingColumns = true)` padding. Run focused unit tests and
+  the DataFrame corpus, then obtain an independent review.
+  Completed 2026-08-10: independent review approved; format, lint, 1,381
+  workspace tests, and SQL corpus passed. The DataFrame corpus retained its
+  exact seven-case baseline (421 passed) with no regression.
+- [x] **Step 2 — preserve exact relation-node identity.** Store
+  `plan_id: Option<i64>` on `CommonAst` and `TypedAst`, populate it once at the
+  outer Connect conversion boundary, keep SparkSQL nodes untagged, and retain
+  currently collapsed tagged cosmetic relations through one transparent unary
+  boundary. Run focused converter/analyzer tests and both corpora, then obtain
+  an independent review.
+  Completed 2026-08-10: independent review approved; format, lint, 1,389
+  workspace tests, and both focused metadata paths and SQL corpus passed. The
+  DataFrame corpus retained its exact seven-case baseline (421 passed) with no
+  regression.
+- [x] **Step 3 — mirror Connect expression conversion.** Match Spark 4.1.1 for
+  unresolved attributes, top-level Project DataFrame-star and true-regex
+  expansion, invalid target/plan-ID combinations, and metadata-column flags
+  without conflating `SubqueryExpression.plan_id`. Run focused
+  converter/analyzer tests and the DataFrame corpus, then obtain an independent
+  review. Side-qualified hidden
+  `USING`/natural keys and qualified stars remain an honest boundary: exact
+  support needs hidden donor outputs propagated through SQL wrappers, a
+  separate join-output feature. Until Step 4 installs exact tree lookup, a
+  known plan ID carried through a `USING`/natural join uses the same boundary
+  when its requested root is a merged key. Step 4 replaces that check with
+  tree/`ExprId` survival; Step 5 deletes the inert join-side vectors.
+  NamedTable `IDENTIFIER(...)` remains a
+  `ProtoShape` boundary rather than duplicating Spark's SQL string-literal
+  parser inside the Connect converter. DataFrame stars and true regexes nested
+  inside another expression likewise validate their Spark lookup/pattern
+  errors, then stop at an honest boundary until τ has a general 1:N child
+  expression rewrite; they must never degrade to an unqualified SQL `*`.
+  Plan-tagged columns inside opaque lambda bodies validate tree lookup, then
+  stop at `plan-tagged-column-in-lambda`; ordinary lambda variables stay
+  opaque.
+  Completed 2026-08-10: independent review approved; format, lint, and 1,471
+  workspace unit tests passed. The SQL corpus passed 424 cases with its two
+  declared skips, and the DataFrame corpus retained its exact seven-case
+  baseline (421 passed) with no regression.
+- [x] **Step 4 — install direct tree lookup.** Add a `PlanIdResolver` that
+  searches the roots supplied by each owning analyzer rule, stops below a
+  matching node, filters candidates through ancestor `ExprId` outputs, and
+  implements Spark's depth, ambiguity, `Union`, star, and missing-column rules.
+  Join conditions must search both children for every join type. Run focused
+  resolver tests and both corpora, then obtain an independent review.
+  Completed 2026-08-11: independent review approved the direct resolver,
+  delayed missing-column recovery, frozen `Deduplicate`/`NaDrop` inputs, and
+  the `Distinct`/`Deduplicate` split. Format and lint passed; Connect passed 161
+  tests and core passed 1,325 with five ignored. The SQL corpus passed 424
+  cases with two declared skips, and the DataFrame corpus retained its exact
+  seven-case baseline (421 passed) with no regression.
+- [x] **Step 5 — remove the superseded architecture.** Switch fully to the
+  direct resolver; delete `collect_relation_plan_ids`, join-side ID vectors,
+  plan-ID `RelScope` ranges/ambiguity state, empty initializers, obsolete tests,
+  and stale comments. Require a net production-line reduction and run the full
+  format, lint, unit, and differential gates before the final independent
+  review.
+  Completed 2026-08-11: independent review approved with no findings. Exact
+  SCIP queries report zero removed symbols and leave `PlanIdResolver` as the
+  sole lookup path. The eight affected Rust files fell from 49,357 to 48,856
+  lines. Format and lint passed; Connect passed 160 tests and core passed 1,323
+  with five ignored. The SQL corpus passed 424 cases with two declared skips,
+  and the DataFrame corpus retained its exact seven-case baseline (421 passed)
+  with no regression.

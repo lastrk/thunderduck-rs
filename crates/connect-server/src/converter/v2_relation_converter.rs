@@ -16,12 +16,9 @@
 //! [`EmissionError::Unsupported`] (`kind: ProtoShape`) — the SparkSQL path belongs to
 //! `parser_v2`.
 //!
-//! `CommonOp::Join` carries
-//! `left_plan_ids: Vec<i64>` / `right_plan_ids: Vec<i64>`; every
-//! `UnresolvedColumn` produced by the expression converter carries
-//! `plan_id: Option<i64>` sourced from `UnresolvedAttribute::plan_id`.
-
-use std::collections::HashSet;
+//! Each converted relation retains `RelationCommon.plan_id` on its exact
+//! [`CommonAst`] node. DataFrame-reference metadata stays on unresolved
+//! attributes and stars.
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DurationMicrosecondArray,
@@ -45,8 +42,11 @@ use thunderduck_core::transpiler_v2::expression::{
     UpdateFieldsExpression, WindowFunction,
 };
 use thunderduck_core::transpiler_v2::generator::Generator;
+use thunderduck_core::transpiler_v2::identifier::SqlIdentifierError;
 use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
-use thunderduck_core::transpiler_v2::EmissionError;
+use thunderduck_core::transpiler_v2::{
+    parse_multipart_identifier, parse_sql_multipart_identifier, EmissionError, Qualifier,
+};
 use thunderduck_core::types::{DataType, StructField, StructType};
 
 use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
@@ -98,11 +98,12 @@ impl V2RelationConverter {
     /// Convert a proto [`proto::Relation`] into a [`CommonAst`].
     pub fn convert(&mut self, relation: &proto::Relation) -> Result<CommonAst, EmissionError> {
         use proto::relation::RelType;
+        let plan_id = relation.common.as_ref().and_then(|common| common.plan_id);
         let rel_type = relation.rel_type.as_ref().require_proto(
             "Relation::rel_type::None",
             "proto Relation carries no rel_type",
         )?;
-        match rel_type {
+        let converted = match rel_type {
             RelType::Project(p) => self.convert_project(p),
             RelType::Filter(f) => self.convert_filter(f),
             RelType::Sort(s) => self.convert_sort(s),
@@ -139,11 +140,17 @@ impl V2RelationConverter {
             RelType::Sample(s) => self.convert_sample(s),
             RelType::SampleBy(s) => self.convert_sample_by(s),
             RelType::Range(r) => self.convert_range(r),
-            RelType::Hint(h) => self.convert_input(h.input.as_deref(), "Hint"),
-            RelType::RepartitionByExpression(r) => {
-                self.convert_input(r.input.as_deref(), "RepartitionByExpression")
+            RelType::Hint(h) => {
+                self.convert_cosmetic(h.input.as_deref(), "Hint", plan_id.is_some())
             }
-            RelType::Repartition(r) => self.convert_input(r.input.as_deref(), "Repartition"),
+            RelType::RepartitionByExpression(r) => self.convert_cosmetic(
+                r.input.as_deref(),
+                "RepartitionByExpression",
+                plan_id.is_some(),
+            ),
+            RelType::Repartition(r) => {
+                self.convert_cosmetic(r.input.as_deref(), "Repartition", plan_id.is_some())
+            }
             RelType::ToSchema(ts) => self.convert_to_schema(ts),
             RelType::Sql(_) => bail_boundary_proto!(
                 "RelType::Sql",
@@ -157,7 +164,11 @@ impl V2RelationConverter {
                 format!("RelType::{}", rel_type_kind(other)),
                 "relation shape not covered by V2RelationConverter",
             ),
-        }
+        }?;
+        Ok(match plan_id {
+            Some(id) => converted.with_plan_id(id),
+            None => converted,
+        })
     }
 
     fn convert_input(
@@ -171,6 +182,22 @@ impl V2RelationConverter {
                 format!("{ctx}::missing_input"),
                 format!("{ctx} has no input relation"),
             ),
+        }
+    }
+
+    fn convert_cosmetic(
+        &mut self,
+        input: Option<&proto::Relation>,
+        ctx: &str,
+        retain_boundary: bool,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(input, ctx)?;
+        if retain_boundary {
+            Ok(CommonAst::new(CommonOp::PlanBoundary {
+                input: Box::new(input),
+            }))
+        } else {
+            Ok(input)
         }
     }
 
@@ -458,9 +485,9 @@ impl V2RelationConverter {
             .iter()
             .map(|f| {
                 let col = Expression::UnresolvedColumn(UnresolvedColumn {
-                    name: f.name.clone(),
-                    qualifier: None,
+                    name_parts: vec![f.name.clone()],
                     plan_id: None,
+                    is_metadata_column: false,
                 });
                 let cast = Expression::Cast(CastExpression {
                     expr: Box::new(col),
@@ -716,9 +743,30 @@ impl V2RelationConverter {
     fn convert_read(&mut self, r: &proto::Read) -> Result<CommonAst, EmissionError> {
         use proto::read::ReadType;
         match &r.read_type {
-            Some(ReadType::NamedTable(nt)) => Ok(CommonAst::new(CommonOp::TableScan {
-                table: nt.unparsed_identifier.clone(),
-            })),
+            Some(ReadType::NamedTable(nt)) => {
+                let name = &nt.unparsed_identifier;
+                if has_hint_comment(name) {
+                    return Err(sql_identifier_error(name, SqlIdentifierError::ParseSyntax));
+                }
+                let table = match parse_sql_multipart_identifier(name) {
+                    Ok(parts) => Qualifier::from_parts(parts),
+                    Err(error) => {
+                        if let Some(masked) = mask_identifier_clauses(name) {
+                            match parse_sql_multipart_identifier(&masked) {
+                                Ok(_) => bail_boundary_proto!(
+                                    "Read::NamedTable::identifier_clause",
+                                    "NamedTable IDENTIFIER(...) clauses are not implemented",
+                                ),
+                                Err(masked_error) => {
+                                    return Err(sql_identifier_error(name, masked_error));
+                                }
+                            }
+                        }
+                        return Err(sql_identifier_error(name, error));
+                    }
+                };
+                Ok(CommonAst::new(CommonOp::TableScan { table }))
+            }
             Some(ReadType::DataSource(ds)) => {
                 if ds.paths.is_empty() {
                     bail_boundary_proto!(
@@ -787,20 +835,12 @@ impl V2RelationConverter {
             ProtoJoinType::LeftSemi => JoinType::LeftSemi,
             ProtoJoinType::Cross => JoinType::Cross,
         };
-        let mut left_ids: HashSet<i64> = HashSet::new();
-        let mut right_ids: HashSet<i64> = HashSet::new();
-        collect_relation_plan_ids(left_proto, &mut left_ids);
-        collect_relation_plan_ids(right_proto, &mut right_ids);
         let condition = match &j.join_condition {
             Some(c) => Some(self.expr.convert(c)?),
             None => None,
         };
         let left = self.convert(left_proto)?;
         let right = self.convert(right_proto)?;
-        let mut left_plan_ids: Vec<i64> = left_ids.into_iter().collect();
-        let mut right_plan_ids: Vec<i64> = right_ids.into_iter().collect();
-        left_plan_ids.sort_unstable();
-        right_plan_ids.sort_unstable();
         Ok(CommonAst::new(CommonOp::Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -809,8 +849,6 @@ impl V2RelationConverter {
             using_columns: j.using_columns.clone(),
             natural: false,
             lateral: false,
-            left_plan_ids,
-            right_plan_ids,
         }))
     }
 }
@@ -843,16 +881,7 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedFunction(func) => self.convert_unresolved_function(func),
             ExprType::Alias(alias) => self.convert_alias(alias),
             ExprType::Cast(cast) => self.convert_cast(cast),
-            ExprType::UnresolvedStar(star) => {
-                let qualifier = star.unparsed_target.as_ref().map(|s| {
-                    if let Some(base) = s.strip_suffix(".*") {
-                        base.to_owned()
-                    } else {
-                        s.clone()
-                    }
-                });
-                Ok(Expression::Star(StarExpression { qualifier }))
-            }
+            ExprType::UnresolvedStar(star) => self.convert_unresolved_star(star),
             ExprType::LambdaFunction(lf) => {
                 let func_proto = lf.function.as_deref().require_proto(
                     "LambdaFunction::function::None",
@@ -925,7 +954,11 @@ impl V2ExpressionConverter {
                     updates,
                 }))
             }
-            ExprType::UnresolvedRegex(ur) => Ok(convert_unresolved_regex(ur)),
+            ExprType::UnresolvedRegex(regex) => self.convert_unresolved_regex(regex),
+            ExprType::SubqueryExpression(_) => bail_boundary_proto!(
+                "Expression::SubqueryExpression",
+                "requires the separate WithRelations plan-substitution protocol",
+            ),
             other => bail_boundary_proto!(
                 format!("Expression::{}", expr_type_kind(other)),
                 "expression shape not covered by V2ExpressionConverter",
@@ -1105,32 +1138,67 @@ impl V2ExpressionConverter {
         &self,
         attr: &proto::expression::UnresolvedAttribute,
     ) -> Result<Expression, EmissionError> {
-        let name = &attr.unparsed_identifier;
-        if name == "*" {
-            return Ok(Expression::Star(StarExpression { qualifier: None }));
+        self.convert_unresolved_column(
+            &attr.unparsed_identifier,
+            attr.plan_id,
+            attr.is_metadata_column == Some(true),
+        )
+    }
+
+    fn convert_unresolved_column(
+        &self,
+        identifier: &str,
+        plan_id: Option<i64>,
+        is_metadata_column: bool,
+    ) -> Result<Expression, EmissionError> {
+        let name_parts = parse_multipart_identifier(identifier)
+            .map_err(|_| invalid_attribute_name(identifier))?;
+        Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+            name_parts,
+            plan_id,
+            is_metadata_column,
+        }))
+    }
+
+    fn convert_unresolved_star(
+        &self,
+        star: &proto::expression::UnresolvedStar,
+    ) -> Result<Expression, EmissionError> {
+        match (&star.unparsed_target, star.plan_id) {
+            (None, None) => Ok(Expression::Star(StarExpression::Unqualified)),
+            (Some(target), None) => {
+                let raw_qualifier = target.strip_suffix(".*").ok_or_else(|| {
+                    EmissionError::SparkEmulated {
+                        class: None,
+                        message: format!(
+                            "UnresolvedStar requires a unparsed target ending with '.*', but got {target}."
+                        ),
+                    }
+                })?;
+                let qualifier = parse_multipart_identifier(raw_qualifier)
+                    .map(Qualifier::from_parts)
+                    .map_err(|_| invalid_attribute_name(raw_qualifier))?;
+                Ok(Expression::Star(StarExpression::Qualified(qualifier)))
+            }
+            (None, Some(plan_id)) => Ok(Expression::Star(StarExpression::DataFrame(plan_id))),
+            (Some(_), Some(_)) => Err(EmissionError::SparkEmulated {
+                class: None,
+                message: "UnresolvedStar with both target and plan id is not supported.".to_owned(),
+            }),
         }
-        if let Some(plan_id) = attr.plan_id {
-            let col_name = name.split('.').next_back().unwrap_or(name).to_owned();
-            return Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-                name: col_name,
-                qualifier: None,
-                plan_id: Some(plan_id),
+    }
+
+    fn convert_unresolved_regex(
+        &self,
+        regex: &proto::expression::UnresolvedRegex,
+    ) -> Result<Expression, EmissionError> {
+        if let Some((qualifier, pattern)) = true_regex_parts(&regex.col_name) {
+            return Ok(Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier,
             }));
         }
-        let parts: Vec<&str> = name.splitn(2, '.').collect();
-        if parts.len() == 2 {
-            Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-                name: parts[1].to_owned(),
-                qualifier: Some(parts[0].to_owned()),
-                plan_id: None,
-            }))
-        } else {
-            Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-                name: name.clone(),
-                qualifier: None,
-                plan_id: None,
-            }))
-        }
+        self.convert_unresolved_column(&regex.col_name, regex.plan_id, false)
     }
 
     fn convert_unresolved_function(
@@ -1334,25 +1402,256 @@ pub(crate) fn arrow_field_to_struct_field(f: &Field) -> Result<StructField, Emis
     })
 }
 
-/// Convert an unresolved regex, stripping one pair of surrounding backticks.
-fn convert_unresolved_regex(ur: &proto::expression::UnresolvedRegex) -> Expression {
-    let pattern = strip_regex_backticks(&ur.col_name);
-    Expression::UnresolvedRegex(UnresolvedRegexExpression {
-        pattern,
-        plan_id: ur.plan_id,
+fn true_regex_parts(name: &str) -> Option<(Option<Qualifier>, String)> {
+    if let Some(pattern) = name
+        .strip_prefix('`')
+        .and_then(|body| body.strip_suffix('`'))
+    {
+        if !pattern.is_empty() {
+            return Some((None, pattern.to_owned()));
+        }
+    }
+    let body = name.strip_suffix('`')?;
+    let opening_backtick = body.rfind('`')?;
+    let pattern = &body[opening_backtick + 1..];
+    if pattern.is_empty() {
+        return None;
+    }
+    let qualifier_and_separator = &body[..opening_backtick];
+    let (separator, separator_char) = qualifier_and_separator.char_indices().next_back()?;
+    if matches!(
+        separator_char,
+        '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    ) {
+        return None;
+    }
+    let qualifier = &qualifier_and_separator[..separator];
+    if qualifier.is_empty() {
+        return None;
+    }
+    Some((Some(Qualifier::single(qualifier)), pattern.to_owned()))
+}
+
+fn invalid_attribute_name(name: &str) -> EmissionError {
+    EmissionError::SparkEmulated {
+        class: Some("INVALID_ATTRIBUTE_NAME_SYNTAX"),
+        message: format!(
+            "Syntax error in the attribute name: {name}. Check that backticks appear in pairs, a quoted string is a complete name part and use a backtick only inside quoted name parts."
+        ),
+    }
+}
+
+fn sql_identifier_error(name: &str, error: SqlIdentifierError) -> EmissionError {
+    EmissionError::SparkEmulated {
+        class: Some(error.error_class()),
+        message: format!("Invalid SQL relation identifier: {name}"),
+    }
+}
+
+fn mask_identifier_clauses(name: &str) -> Option<String> {
+    const KEYWORD: &[u8] = b"identifier";
+    let bytes = name.as_bytes();
+    let mut index = 0;
+    let mut clauses = Vec::new();
+    while index + KEYWORD.len() <= bytes.len() {
+        if bytes[index] == b'`' {
+            index = skip_quoted(bytes, index, b'`');
+            continue;
+        }
+        if bytes[index] == b'\'' || bytes[index] == b'"' {
+            index = skip_quoted(bytes, index, bytes[index]);
+            continue;
+        }
+        let after_trivia = skip_sql_trivia(name, index);
+        if after_trivia != index {
+            index = after_trivia;
+            continue;
+        }
+        if bytes[index..index + KEYWORD.len()].eq_ignore_ascii_case(KEYWORD)
+            && !is_inside_uri_identifier(name, index)
+            && name[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !is_identifier_char(ch))
+            && name[index + KEYWORD.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_identifier_char(ch))
+        {
+            let next = skip_sql_trivia(name, index + KEYWORD.len());
+            if bytes.get(next) == Some(&b'(') {
+                let end = identifier_clause_end(bytes, next);
+                clauses.push(index..end);
+                index = end;
+                continue;
+            }
+        }
+        index += name[index..].chars().next().map_or(1, char::len_utf8);
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    let mut masked = name.to_owned();
+    for clause in clauses.into_iter().rev() {
+        let replacement = if name.as_bytes().get(clause.end) == Some(&b'.') {
+            "td_identifier"
+        } else {
+            "td_identifier "
+        };
+        masked.replace_range(clause, replacement);
+    }
+    Some(masked)
+}
+
+fn identifier_clause_end(bytes: &[u8], mut index: usize) -> usize {
+    let mut depth = 0;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'`' | b'\'' | b'"') {
+            index = skip_quoted(bytes, index, bytes[index]);
+        } else if bytes.get(index..index + 2) == Some(b"/*") {
+            index = skip_block_comment(bytes, index);
+        } else if bytes.get(index..index + 2) == Some(b"--") {
+            index = skip_line_comment(bytes, index);
+        } else if bytes[index] == b'(' {
+            depth += 1;
+            index += 1;
+        } else if bytes[index] == b')' {
+            depth -= 1;
+            index += 1;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_inside_uri_identifier(name: &str, index: usize) -> bool {
+    let token_start = name[..index]
+        .char_indices()
+        .rev()
+        .find_map(|(offset, ch)| is_spark_whitespace(ch).then_some(offset + ch.len_utf8()))
+        .unwrap_or(0);
+    name[token_start..index].contains("://")
+}
+
+fn skip_quoted(bytes: &[u8], mut index: usize, quote: u8) -> usize {
+    index += 1;
+    while index < bytes.len() {
+        if quote != b'`' && bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            if bytes.get(index + 1) == Some(&quote) {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn skip_sql_trivia(name: &str, mut index: usize) -> usize {
+    let bytes = name.as_bytes();
+    loop {
+        while let Some(ch) = name[index..]
+            .chars()
+            .next()
+            .filter(|ch| is_spark_whitespace(*ch))
+        {
+            index += ch.len_utf8();
+        }
+        if bytes.get(index..index + 2) == Some(b"--") {
+            index += 2;
+            while index < bytes.len() {
+                if bytes.get(index..index + 2) == Some(b"\\\n") {
+                    index += 2;
+                } else if bytes[index] == b'\n' || bytes[index] == b'\r' {
+                    break;
+                } else {
+                    index += 1;
+                }
+            }
+        } else if bytes.get(index..index + 2) == Some(b"/*") {
+            index = skip_block_comment(bytes, index);
+        } else {
+            return index;
+        }
+    }
+}
+
+fn is_spark_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}' | '\u{2028}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
+}
+
+fn has_hint_comment(name: &str) -> bool {
+    outside_quotes(name, |bytes, index| {
+        (bytes.get(index..index + 3) == Some(b"/*+")).then_some(index + 3)
     })
 }
 
-/// Strip a single leading `` ` `` AND a single trailing `` ` `` from `name`
-/// when both are present and `name.len() >= 2`. All other inputs pass through
-/// unchanged.
-fn strip_regex_backticks(name: &str) -> String {
+fn outside_quotes(name: &str, mut predicate: impl FnMut(&[u8], usize) -> Option<usize>) -> bool {
     let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes.first() == Some(&b'`') && bytes.last() == Some(&b'`') {
-        name[1..name.len() - 1].to_owned()
-    } else {
-        name.to_owned()
+    let mut index = 0;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'`' | b'\'' | b'"') {
+            index = skip_quoted(bytes, index, bytes[index]);
+        } else if let Some(next) = predicate(bytes, index) {
+            return next > index;
+        } else if bytes.get(index..index + 2) == Some(b"/*") {
+            index = skip_block_comment(bytes, index);
+        } else if bytes.get(index..index + 2) == Some(b"--") {
+            index = skip_line_comment(bytes, index);
+        } else {
+            index += name[index..].chars().next().map_or(1, char::len_utf8);
+        }
     }
+    false
+}
+
+fn skip_block_comment(bytes: &[u8], mut index: usize) -> usize {
+    let mut depth = 1;
+    index += 2;
+    while index < bytes.len() && depth > 0 {
+        if bytes.get(index..index + 3) == Some(b"/*+") {
+            index += 3;
+        } else if bytes.get(index..index + 2) == Some(b"/*") {
+            depth += 1;
+            index += 2;
+        } else if bytes.get(index..index + 2) == Some(b"*/") {
+            depth -= 1;
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn skip_line_comment(bytes: &[u8], mut index: usize) -> usize {
+    index += 2;
+    while index < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"\\\n") {
+            index += 2;
+        } else if bytes[index] == b'\n' || bytes[index] == b'\r' {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    index
 }
 
 fn rel_type_kind(rt: &proto::relation::RelType) -> &'static str {
@@ -1857,30 +2156,6 @@ fn format_decimal128(unscaled: i128, scale: i8) -> String {
     }
 }
 
-/// Collect plan IDs through relation shapes whose output preserves join-column
-/// resolution. New plan-carrying wrappers must be added here explicitly.
-fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut HashSet<i64>) {
-    if let Some(common) = &rel.common {
-        if let Some(id) = common.plan_id {
-            ids.insert(id);
-        }
-    }
-    use proto::relation::RelType;
-    let children: [Option<&proto::Relation>; 2] = match &rel.rel_type {
-        Some(RelType::Filter(f)) => [f.input.as_deref(), None],
-        Some(RelType::Project(p)) => [p.input.as_deref(), None],
-        Some(RelType::Aggregate(a)) => [a.input.as_deref(), None],
-        Some(RelType::Sort(s)) => [s.input.as_deref(), None],
-        Some(RelType::Limit(l)) => [l.input.as_deref(), None],
-        Some(RelType::Offset(o)) => [o.input.as_deref(), None],
-        Some(RelType::Join(j)) => [j.left.as_deref(), j.right.as_deref()],
-        _ => [None, None],
-    };
-    for child in children.into_iter().flatten() {
-        collect_relation_plan_ids(child, ids);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2003,6 +2278,69 @@ mod tests {
             }
             _ => panic!("expected Project"),
         }
+    }
+
+    #[test]
+    fn convert_preserves_each_relation_plan_id() {
+        let input = table_scan_rel_with_plan_id("t", 10);
+        let project = rel_with_plan_id(
+            proto::relation::RelType::Project(Box::new(proto::Project {
+                input: Some(Box::new(input)),
+                expressions: vec![int_literal(1)],
+            })),
+            20,
+        );
+        let converted = convert_ok(&project);
+        assert_eq!(converted.plan_id, Some(20));
+        let CommonOp::Project { input, .. } = converted.op else {
+            panic!("expected Project");
+        };
+        assert_eq!(input.plan_id, Some(10));
+        assert!(matches!(input.op, CommonOp::TableScan { .. }));
+    }
+
+    #[test]
+    fn tagged_cosmetic_relations_retain_distinct_boundaries() {
+        let variants = vec![
+            proto::relation::RelType::Hint(Box::new(proto::Hint {
+                input: Some(Box::new(table_scan_rel_with_plan_id("t", 10))),
+                name: "broadcast".to_owned(),
+                parameters: vec![],
+            })),
+            proto::relation::RelType::Repartition(Box::new(proto::Repartition {
+                input: Some(Box::new(table_scan_rel_with_plan_id("t", 10))),
+                num_partitions: 2,
+                shuffle: Some(true),
+            })),
+            proto::relation::RelType::RepartitionByExpression(Box::new(
+                proto::RepartitionByExpression {
+                    input: Some(Box::new(table_scan_rel_with_plan_id("t", 10))),
+                    partition_exprs: vec![],
+                    num_partitions: Some(2),
+                },
+            )),
+        ];
+        for rel_type in variants {
+            let converted = convert_ok(&rel_with_plan_id(rel_type, 20));
+            assert_eq!(converted.plan_id, Some(20));
+            let CommonOp::PlanBoundary { input } = converted.op else {
+                panic!("expected retained PlanBoundary");
+            };
+            assert_eq!(input.plan_id, Some(10));
+            assert!(matches!(input.op, CommonOp::TableScan { .. }));
+        }
+    }
+
+    #[test]
+    fn untagged_cosmetic_relation_does_not_erase_child_plan_id() {
+        let hint = rel(proto::relation::RelType::Hint(Box::new(proto::Hint {
+            input: Some(Box::new(table_scan_rel_with_plan_id("t", 10))),
+            name: "broadcast".to_owned(),
+            parameters: vec![],
+        })));
+        let converted = convert_ok(&hint);
+        assert_eq!(converted.plan_id, Some(10));
+        assert!(matches!(converted.op, CommonOp::TableScan { .. }));
     }
 
     #[test]
@@ -2305,8 +2643,267 @@ mod tests {
     fn convert_read_named_table_round_trip() {
         let out = convert_ok(&table_scan_rel("orders"));
         match out.op {
-            CommonOp::TableScan { table, .. } => assert_eq!(table, "orders"),
+            CommonOp::TableScan { table, .. } => {
+                assert_eq!(table, Qualifier::single("orders"));
+            }
             _ => panic!("expected TableScan"),
+        }
+    }
+
+    #[test]
+    fn convert_read_named_table_preserves_identifier_boundaries() {
+        let multipart = convert_ok(&table_scan_rel("catalog.orders"));
+        let CommonOp::TableScan { table } = multipart.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table.parts(), ["catalog", "orders"]);
+
+        let quoted_dot = convert_ok(&table_scan_rel("`catalog.orders`"));
+        let CommonOp::TableScan { table } = quoted_dot.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table.parts(), ["catalog.orders"]);
+    }
+
+    #[test]
+    fn convert_read_named_table_identifier_clause_is_an_honest_boundary() {
+        for name in [
+            "identifier('foo')",
+            "IDENTIFIER('a.b')",
+            "identifier('a').b",
+            "identifier('a')._b",
+            r"identifier('\u0061')",
+            "identifier(R'foo')",
+            "identifier/* comment */('foo')",
+            "identifier(?)",
+            "identifier(:foo)",
+            r"`a\`.identifier('foo')",
+            "identifier\u{00A0}('foo')",
+            "identifier\u{1680}('foo')",
+            "identifier\u{2003}('foo')",
+            "identifier\u{3000}('foo')",
+        ] {
+            assert_eq!(
+                convert_proto_shape_err(&table_scan_rel(name)),
+                "Read::NamedTable::identifier_clause",
+                "unexpected boundary for {name}"
+            );
+        }
+
+        for name in [
+            "a b identifier('foo')",
+            "s3://bucket identifier('foo')",
+            ".identifier('foo')",
+            "identifier('foo') junk",
+            "identifier('foo').a b",
+            "identifier('a')1",
+            "identifier('a')abc",
+            "identifier('a')identifier('b')",
+            "a.identifier('b')identifier('c')",
+        ] {
+            let error = V2RelationConverter::new()
+                .convert(&table_scan_rel(name))
+                .expect_err("malformed surrounding SQL");
+            assert!(
+                matches!(error, EmissionError::SparkEmulated { .. }),
+                "unexpected boundary for {name}: {error:?}"
+            );
+        }
+
+        let hyphen = V2RelationConverter::new()
+            .convert(&table_scan_rel("identifier('a')-b"))
+            .expect_err("malformed identifier suffix");
+        assert!(matches!(
+            hyphen,
+            EmissionError::SparkEmulated {
+                class: Some("INVALID_IDENTIFIER"),
+                ..
+            }
+        ));
+
+        let quoted = convert_ok(&table_scan_rel("`identifier('foo')`"));
+        let CommonOp::TableScan { table } = quoted.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table.parts(), ["identifier('foo')"]);
+
+        let commented = convert_ok(&table_scan_rel("/* identifier('foo') */ orders"));
+        let CommonOp::TableScan { table } = commented.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table.parts(), ["orders"]);
+
+        for name in ["-- /*+ x */\n orders", "/* text /*+ */ orders"] {
+            let commented = convert_ok(&table_scan_rel(name));
+            let CommonOp::TableScan { table } = commented.op else {
+                panic!("expected TableScan");
+            };
+            assert_eq!(table.parts(), ["orders"]);
+        }
+
+        assert_eq!(
+            convert_proto_shape_err(&table_scan_rel("/* text /*+ */ identifier('foo')")),
+            "Read::NamedTable::identifier_clause"
+        );
+
+        let unicode = V2RelationConverter::new()
+            .convert(&table_scan_rel("Δidentifier('foo')"))
+            .expect_err("unquoted Unicode identifier");
+        assert!(matches!(
+            unicode,
+            EmissionError::SparkEmulated {
+                class: Some("INVALID_IDENTIFIER"),
+                ..
+            }
+        ));
+
+        for name in [
+            "-- x\\\n identifier('foo')\n orders",
+            "orders -- x\\\n junk",
+        ] {
+            let commented = convert_ok(&table_scan_rel(name));
+            let CommonOp::TableScan { table } = commented.op else {
+                panic!("expected TableScan");
+            };
+            assert_eq!(table.parts(), ["orders"]);
+        }
+        let comments_only = V2RelationConverter::new()
+            .convert(&table_scan_rel("-- x\\\n orders"))
+            .expect_err("continued comment consumes the identifier");
+        assert!(matches!(
+            comments_only,
+            EmissionError::SparkEmulated {
+                class: Some("PARSE_SYNTAX_ERROR"),
+                ..
+            }
+        ));
+
+        for name in ["s3://identifier('foo')", "s3://bucket/identifier('foo')"] {
+            let error = V2RelationConverter::new()
+                .convert(&table_scan_rel(name))
+                .expect_err("URI path is not an IDENTIFIER clause");
+            assert!(matches!(
+                error,
+                EmissionError::SparkEmulated {
+                    class: Some("PARSE_SYNTAX_ERROR"),
+                    ..
+                }
+            ));
+        }
+
+        let uri = V2RelationConverter::new()
+            .convert(&table_scan_rel("ab://x/identifier /*c*/ ('foo')"))
+            .expect_err("URI path is not an IDENTIFIER clause");
+        assert!(
+            matches!(
+                uri,
+                EmissionError::SparkEmulated {
+                    class: Some("INVALID_IDENTIFIER"),
+                    ..
+                }
+            ),
+            "unexpected URI error: {uri:?}"
+        );
+
+        for name in [
+            "/*+ x */ orders",
+            "orders /*+ x */",
+            "/*+ identifier('foo') */ orders",
+        ] {
+            let error = V2RelationConverter::new()
+                .convert(&table_scan_rel(name))
+                .expect_err("hint is not identifier trivia");
+            assert!(matches!(
+                error,
+                EmissionError::SparkEmulated {
+                    class: Some("PARSE_SYNTAX_ERROR"),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn convert_read_named_table_rejects_malformed_identifier() {
+        let error = V2RelationConverter::new()
+            .convert(&table_scan_rel("`broken"))
+            .expect_err("malformed name");
+        assert!(matches!(
+            error,
+            EmissionError::SparkEmulated {
+                class: Some("PARSE_SYNTAX_ERROR"),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn convert_read_named_table_applies_sql_identifier_validation() {
+        for name in ["1a", "1_", "_1", "select"] {
+            let accepted = convert_ok(&table_scan_rel(name));
+            let CommonOp::TableScan { table } = accepted.op else {
+                panic!("expected TableScan");
+            };
+            assert_eq!(table, Qualifier::single(name));
+        }
+
+        let quoted_empty = convert_ok(&table_scan_rel("``"));
+        let CommonOp::TableScan { table } = quoted_empty.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table, Qualifier::single(""));
+
+        let quoted_unicode = convert_ok(&table_scan_rel("`Δelta`"));
+        let CommonOp::TableScan { table } = quoted_unicode.op else {
+            panic!("expected TableScan");
+        };
+        assert_eq!(table, Qualifier::single("Δelta"));
+
+        for name in [" a ", "a . b", "a/*x*/.b", "a --x\n . b"] {
+            let accepted = convert_ok(&table_scan_rel(name));
+            let CommonOp::TableScan { table } = accepted.op else {
+                panic!("expected TableScan");
+            };
+            let expected = if name.trim() == "a" {
+                vec!["a".to_owned()]
+            } else {
+                vec!["a".to_owned(), "b".to_owned()]
+            };
+            assert_eq!(table.parts(), expected);
+        }
+
+        for (name, class) in [
+            ("", "PARSE_EMPTY_STATEMENT"),
+            ("a b", "PARSE_SYNTAX_ERROR"),
+            ("a-b", "INVALID_IDENTIFIER"),
+            ("Δelta", "INVALID_IDENTIFIER"),
+            ("a*b", "PARSE_SYNTAX_ERROR"),
+            ("a/b", "PARSE_SYNTAX_ERROR"),
+            ("a:b", "PARSE_SYNTAX_ERROR"),
+            ("s3://bucket/table", "PARSE_SYNTAX_ERROR"),
+            ("/*x*/", "PARSE_SYNTAX_ERROR"),
+            ("--x\n", "PARSE_SYNTAX_ERROR"),
+            ("123", "PARSE_SYNTAX_ERROR"),
+            ("12e3", "PARSE_SYNTAX_ERROR"),
+            ("12D", "PARSE_SYNTAX_ERROR"),
+            ("12L", "PARSE_SYNTAX_ERROR"),
+            ("12S", "PARSE_SYNTAX_ERROR"),
+            ("12Y", "PARSE_SYNTAX_ERROR"),
+            ("12F", "PARSE_SYNTAX_ERROR"),
+            ("12BD", "PARSE_SYNTAX_ERROR"),
+            ("12e3f", "PARSE_SYNTAX_ERROR"),
+        ] {
+            let error = V2RelationConverter::new()
+                .convert(&table_scan_rel(name))
+                .expect_err("invalid SQL table identifier");
+            let EmissionError::SparkEmulated {
+                class: actual_class,
+                ..
+            } = error
+            else {
+                panic!("expected Spark-emulated identifier error");
+            };
+            assert_eq!(actual_class, Some(class), "unexpected class for {name}");
         }
     }
 
@@ -2393,32 +2990,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_join_populates_left_plan_ids_and_right_plan_ids() {
-        let left = table_scan_rel_with_plan_id("a", 100);
-        let right = table_scan_rel_with_plan_id("b", 200);
-        let j = rel(proto::relation::RelType::Join(Box::new(proto::Join {
-            left: Some(Box::new(left)),
-            right: Some(Box::new(right)),
-            join_condition: None,
-            join_type: proto::join::JoinType::Inner as i32,
-            using_columns: vec![],
-            join_data_type: None,
-        })));
-        let out = convert_ok(&j);
-        match out.op {
-            CommonOp::Join {
-                left_plan_ids,
-                right_plan_ids,
-                ..
-            } => {
-                assert_eq!(left_plan_ids, vec![100i64]);
-                assert_eq!(right_plan_ids, vec![200i64]);
-            }
-            _ => panic!("expected Join"),
-        }
-    }
-
-    #[test]
     fn convert_join_condition_unresolved_column_plan_id_first_class() {
         let left = table_scan_rel_with_plan_id("a", 100);
         let right = table_scan_rel_with_plan_id("b", 200);
@@ -2439,11 +3010,7 @@ mod tests {
         match cond {
             Expression::UnresolvedColumn(u) => {
                 assert_eq!(u.plan_id, Some(100));
-                assert!(
-                    u.qualifier.is_none(),
-                    "no string qualifier encoding — got {:?}",
-                    u.qualifier
-                );
+                assert_eq!(u.name_parts, ["id"]);
             }
             other => panic!("expected UnresolvedColumn, got {other:?}"),
         }
@@ -3095,36 +3662,406 @@ mod tests {
         assert_eq!(normalize_decimal_literal("0", Some(3), Some(5)), (5, 5));
     }
 
+    fn convert_expression(expr_type: proto::expression::ExprType) -> Expression {
+        V2ExpressionConverter::new()
+            .convert(&proto::Expression {
+                common: None,
+                expr_type: Some(expr_type),
+            })
+            .expect("expression conversion must succeed")
+    }
+
+    fn convert_expression_error(expr_type: proto::expression::ExprType) -> EmissionError {
+        V2ExpressionConverter::new()
+            .convert(&proto::Expression {
+                common: None,
+                expr_type: Some(expr_type),
+            })
+            .expect_err("expression conversion must fail")
+    }
+
     #[test]
-    fn convert_unresolved_regex_strips_matching_backticks() {
-        let ur = proto::expression::UnresolvedRegex {
-            col_name: "`.*_id`".to_owned(),
-            plan_id: None,
+    fn convert_unresolved_attribute_preserves_name_plan_and_metadata() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "`a.b`".to_owned(),
+                plan_id: Some(7),
+                is_metadata_column: Some(true),
+            },
+        ));
+
+        let Expression::UnresolvedColumn(column) = converted else {
+            panic!("expected UnresolvedColumn");
         };
-        let out = super::convert_unresolved_regex(&ur);
-        match out {
-            Expression::UnresolvedRegex(r) => {
-                assert_eq!(r.pattern, ".*_id");
-                assert!(r.plan_id.is_none());
+        assert_eq!(column.name_parts, ["a.b"]);
+        assert_eq!(column.plan_id, Some(7));
+        assert!(column.is_metadata_column);
+    }
+
+    #[test]
+    fn convert_plan_tagged_dotted_attribute_keeps_the_struct_path() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "address.city".to_owned(),
+                plan_id: Some(7),
+                is_metadata_column: Some(false),
+            },
+        ));
+
+        let Expression::UnresolvedColumn(column) = converted else {
+            panic!("expected UnresolvedColumn");
+        };
+        assert_eq!(column.name_parts, ["address", "city"]);
+        assert_eq!(column.plan_id, Some(7));
+        assert!(!column.is_metadata_column);
+    }
+
+    #[test]
+    fn convert_attribute_keeps_quoted_dots_distinct_from_multipart_names() {
+        let quoted = convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "a.`b.c`".to_owned(),
+                plan_id: None,
+                is_metadata_column: None,
+            },
+        ));
+        let multipart = convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "a.b.c".to_owned(),
+                plan_id: None,
+                is_metadata_column: None,
+            },
+        ));
+
+        let Expression::UnresolvedColumn(quoted) = quoted else {
+            panic!("expected quoted UnresolvedColumn");
+        };
+        let Expression::UnresolvedColumn(multipart) = multipart else {
+            panic!("expected multipart UnresolvedColumn");
+        };
+        assert_eq!(quoted.name_parts, ["a", "b.c"]);
+        assert_eq!(multipart.name_parts, ["a", "b", "c"]);
+        assert_ne!(quoted.name_parts, multipart.name_parts);
+    }
+
+    #[test]
+    fn convert_attribute_preserves_empty_name_parts() {
+        let convert = |identifier: &str| {
+            convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+                proto::expression::UnresolvedAttribute {
+                    unparsed_identifier: identifier.to_owned(),
+                    plan_id: None,
+                    is_metadata_column: None,
+                },
+            ))
+        };
+
+        let Expression::UnresolvedColumn(empty) = convert("") else {
+            panic!("expected empty UnresolvedColumn");
+        };
+        assert_eq!(empty.name_parts, [""]);
+
+        let Expression::UnresolvedColumn(quoted_empty) = convert("``") else {
+            panic!("expected quoted-empty UnresolvedColumn");
+        };
+        assert_eq!(quoted_empty.name_parts, [""]);
+
+        let Expression::UnresolvedColumn(leading_empty) = convert("``.a") else {
+            panic!("expected leading-empty UnresolvedColumn");
+        };
+        assert_eq!(leading_empty.name_parts, ["", "a"]);
+    }
+
+    #[test]
+    fn convert_unresolved_attribute_named_star_stays_an_attribute() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "*".to_owned(),
+                plan_id: None,
+                is_metadata_column: None,
+            },
+        ));
+
+        assert!(matches!(
+            converted,
+            Expression::UnresolvedColumn(UnresolvedColumn { name_parts, .. })
+                if name_parts == ["*"]
+        ));
+    }
+
+    #[test]
+    fn convert_unresolved_attribute_rejects_malformed_backticks() {
+        let error = convert_expression_error(proto::expression::ExprType::UnresolvedAttribute(
+            proto::expression::UnresolvedAttribute {
+                unparsed_identifier: "`broken".to_owned(),
+                plan_id: None,
+                is_metadata_column: None,
+            },
+        ));
+
+        assert!(matches!(
+            error,
+            EmissionError::SparkEmulated {
+                class: Some("INVALID_ATTRIBUTE_NAME_SYNTAX"),
+                ..
             }
-            other => panic!("expected UnresolvedRegex, got {other:?}"),
+        ));
+    }
+
+    #[test]
+    fn convert_unresolved_star_covers_all_valid_forms() {
+        let unqualified = convert_expression(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: None,
+                plan_id: None,
+            },
+        ));
+        let qualified = convert_expression(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: Some("`a.b`.*".to_owned()),
+                plan_id: None,
+            },
+        ));
+        let dataframe = convert_expression(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: None,
+                plan_id: Some(9),
+            },
+        ));
+
+        assert!(matches!(
+            unqualified,
+            Expression::Star(StarExpression::Unqualified)
+        ));
+        assert!(matches!(
+            qualified,
+            Expression::Star(StarExpression::Qualified(target)) if target.parts() == ["a.b"]
+        ));
+        assert!(matches!(
+            dataframe,
+            Expression::Star(StarExpression::DataFrame(9))
+        ));
+    }
+
+    #[test]
+    fn convert_unresolved_star_rejects_invalid_target_and_combination() {
+        let target_error = convert_expression_error(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: Some("t".to_owned()),
+                plan_id: None,
+            },
+        ));
+        assert_eq!(
+            target_error.to_string(),
+            "UnresolvedStar requires a unparsed target ending with '.*', but got t."
+        );
+
+        let combination_error = convert_expression_error(
+            proto::expression::ExprType::UnresolvedStar(proto::expression::UnresolvedStar {
+                unparsed_target: Some("also-invalid".to_owned()),
+                plan_id: Some(9),
+            }),
+        );
+        assert_eq!(
+            combination_error.to_string(),
+            "UnresolvedStar with both target and plan id is not supported."
+        );
+    }
+
+    #[test]
+    fn convert_qualified_star_keeps_quoted_dots_distinct_from_multipart_target() {
+        let quoted = convert_expression(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: Some("a.`b.c`.*".to_owned()),
+                plan_id: None,
+            },
+        ));
+        let multipart = convert_expression(proto::expression::ExprType::UnresolvedStar(
+            proto::expression::UnresolvedStar {
+                unparsed_target: Some("a.b.c.*".to_owned()),
+                plan_id: None,
+            },
+        ));
+
+        assert!(matches!(
+            quoted,
+            Expression::Star(StarExpression::Qualified(parts)) if parts.parts() == ["a", "b.c"]
+        ));
+        assert!(matches!(
+            multipart,
+            Expression::Star(StarExpression::Qualified(parts)) if parts.parts() == ["a", "b", "c"]
+        ));
+    }
+
+    #[test]
+    fn convert_qualified_star_uses_attribute_name_grammar() {
+        for alias in ["", "a-b", "a b", "a:b", "123"] {
+            let expression = convert_expression(proto::expression::ExprType::UnresolvedStar(
+                proto::expression::UnresolvedStar {
+                    unparsed_target: Some(format!("{alias}.*")),
+                    plan_id: None,
+                },
+            ));
+            assert!(matches!(
+                expression,
+                Expression::Star(StarExpression::Qualified(target))
+                    if target.parts() == [alias]
+            ));
         }
     }
 
     #[test]
-    fn convert_unresolved_regex_preserves_plan_id() {
-        let ur = proto::expression::UnresolvedRegex {
-            col_name: "col_.*".to_owned(),
-            plan_id: Some(1234),
-        };
-        let out = super::convert_unresolved_regex(&ur);
-        match out {
-            Expression::UnresolvedRegex(r) => {
-                assert_eq!(r.pattern, "col_.*");
-                assert_eq!(r.plan_id, Some(1234));
-            }
-            other => panic!("expected UnresolvedRegex, got {other:?}"),
+    fn convert_true_regex_ignores_plan_id_and_keeps_qualifier() {
+        let unqualified = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "`.*_id`".to_owned(),
+                plan_id: Some(7),
+            },
+        ));
+        let qualified = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "t.`.*_id`".to_owned(),
+                plan_id: Some(8),
+            },
+        ));
+
+        assert!(matches!(
+            unqualified,
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier: None,
+            }) if pattern == ".*_id"
+        ));
+        assert!(matches!(
+            qualified,
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier: Some(qualifier),
+            }) if pattern == ".*_id" && qualifier == Qualifier::single("t")
+        ));
+    }
+
+    #[test]
+    fn convert_qualified_regex_uses_sparks_arbitrary_separator_split() {
+        for name in ["t.`p`", "tX`p`", "t/`p`"] {
+            let converted = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+                proto::expression::UnresolvedRegex {
+                    col_name: name.to_owned(),
+                    plan_id: None,
+                },
+            ));
+            assert!(matches!(
+                converted,
+                Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                    pattern,
+                    qualifier: Some(qualifier),
+                }) if pattern == "p" && qualifier == Qualifier::single("t")
+            ));
         }
+    }
+
+    #[test]
+    fn java_line_terminator_is_not_a_regex_separator() {
+        assert!(true_regex_parts("t\n`p`").is_none());
+    }
+
+    #[test]
+    fn convert_unqualified_regex_keeps_internal_backticks_in_pattern() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "`a`b`".to_owned(),
+                plan_id: None,
+            },
+        ));
+        assert!(matches!(
+            converted,
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier: None,
+            }) if pattern == "a`b"
+        ));
+    }
+
+    #[test]
+    fn convert_qualified_regex_keeps_raw_dotted_capture_single_part() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "catalog.t.`p`".to_owned(),
+                plan_id: None,
+            },
+        ));
+        assert!(matches!(
+            converted,
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier: Some(qualifier),
+            }) if pattern == "p" && qualifier.parts() == ["catalog.t"]
+        ));
+    }
+
+    #[test]
+    fn convert_qualified_regex_keeps_literal_dot_alias_single_part() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "a.b.`p`".to_owned(),
+                plan_id: None,
+            },
+        ));
+        assert!(matches!(
+            converted,
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern,
+                qualifier: Some(qualifier),
+            }) if pattern == "p" && qualifier == Qualifier::single("a.b")
+        ));
+    }
+
+    #[test]
+    fn convert_non_backtick_regex_falls_back_to_plan_tagged_attribute() {
+        let converted = convert_expression(proto::expression::ExprType::UnresolvedRegex(
+            proto::expression::UnresolvedRegex {
+                col_name: "col_.*".to_owned(),
+                plan_id: Some(1234),
+            },
+        ));
+
+        let Expression::UnresolvedColumn(column) = converted else {
+            panic!("expected UnresolvedColumn");
+        };
+        assert_eq!(column.name_parts, ["col_", "*"]);
+        assert_eq!(column.plan_id, Some(1234));
+    }
+
+    #[test]
+    fn shared_fallback_parser_preserves_quoted_dot_boundary() {
+        let converted = V2ExpressionConverter::new()
+            .convert_unresolved_column("a.`b.c`", Some(55), false)
+            .expect("valid multipart attribute");
+
+        let Expression::UnresolvedColumn(column) = converted else {
+            panic!("expected UnresolvedColumn");
+        };
+        assert_eq!(column.name_parts, ["a", "b.c"]);
+        assert_eq!(column.plan_id, Some(55));
+    }
+
+    #[test]
+    fn convert_subquery_plan_id_stays_on_its_separate_protocol_boundary() {
+        let error = convert_expression_error(proto::expression::ExprType::SubqueryExpression(
+            proto::SubqueryExpression {
+                plan_id: 99,
+                ..Default::default()
+            },
+        ));
+
+        assert!(matches!(
+            error,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name,
+                ..
+            } if name == "Expression::SubqueryExpression"
+        ));
     }
 
     fn range_proto(
@@ -3247,7 +4184,7 @@ mod tests {
         let Expression::UnresolvedColumn(u0) = c0.expr.as_ref() else {
             panic!("expected UnresolvedColumn, got {:?}", c0.expr);
         };
-        assert_eq!(u0.name, "b");
+        assert_eq!(u0.name_parts, ["b"]);
 
         let Expression::Alias(a1) = &projections[1] else {
             panic!("expected Alias, got {:?}", projections[1]);
@@ -3260,7 +4197,7 @@ mod tests {
         let Expression::UnresolvedColumn(u1) = c1.expr.as_ref() else {
             panic!("expected UnresolvedColumn, got {:?}", c1.expr);
         };
-        assert_eq!(u1.name, "a");
+        assert_eq!(u1.name_parts, ["a"]);
     }
 
     #[test]

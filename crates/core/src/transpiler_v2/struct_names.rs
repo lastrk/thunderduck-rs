@@ -23,7 +23,7 @@ use super::expression::Expression;
 /// `Alias.tryUnaliasedName`:
 /// 1. `Alias(inner, name)` → `name`.
 /// 2. `ColumnReference { name, .. }` → `name`.
-/// 3. `UnresolvedColumn { name, .. }` → `name` (defensive; usually resolved
+/// 3. `UnresolvedColumn { name_parts, .. }` → final name part (defensive; usually resolved
 ///    into `ColumnReference` before emission).
 /// 4. Anything else → `col{i+1}` (1-indexed) — Spark's documented fallback.
 ///    This includes `Literal(String(_))`: Spark's `struct(lit("colA"))`
@@ -34,7 +34,7 @@ pub(super) fn derive_struct_field_name(arg: &Expression, i: usize) -> String {
     match arg {
         Expression::Alias(a) => a.alias.clone(),
         Expression::ColumnReference(c) => c.name.clone(),
-        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::UnresolvedColumn(u) => u.last_name_part().unwrap_or_default().to_owned(),
         _ => format!("col{}", i + 1),
     }
 }
@@ -53,7 +53,7 @@ pub(super) fn derive_zip_field_name(arg: &Expression, i: usize) -> String {
     match arg {
         Expression::Alias(a) => a.alias.clone(),
         Expression::ColumnReference(c) => c.name.clone(),
-        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::UnresolvedColumn(u) => u.last_name_part().unwrap_or_default().to_owned(),
         _ => i.to_string(),
     }
 }
@@ -79,9 +79,9 @@ mod tests {
 
     fn unresolved(name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
+            name_parts: vec![name.to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })
     }
 

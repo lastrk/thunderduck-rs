@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{DataType, StructField, StructType};
 
+use super::identifier::Qualifier;
+
 // τ's ONE case-folding authority for user-identifier (column/qualifier/alias
 // name) comparisons now lives in [`super::name_fold`] — see [`eq_fold`]/
 // [`fold_key`]'s doc there. Every name-lookup site in the resolution
@@ -64,15 +66,10 @@ pub struct Attribute {
     pub nullable: bool,
     /// This column's stable identity — see [`ExprId`].
     pub expr_id: ExprId,
-    /// Source-qualifier lineage (Spark attribute lineage) —
-    /// which relation qualifiers (table names / user aliases) this column
-    /// inherits, now intrinsic to `Attribute` rather than a parallel
-    /// per-node parallel vector. Empty for a genuinely
-    /// CREATED column (an `Alias` or a computed expression) — see
-    /// [`Attribute::minted`]. Seeded at leaf origination points (`TableScan`,
-    /// `AliasedRelation`) via [`Attribute::with_quals`]; carried through
-    /// every passthrough `.clone()` otherwise.
-    pub source_quals: BTreeSet<String>,
+    /// Historical relation qualifiers carried with this value.
+    pub source_quals: BTreeSet<Qualifier>,
+    /// Catalyst's current output qualifier.
+    pub qualifier: Option<Qualifier>,
 }
 
 impl Attribute {
@@ -86,6 +83,7 @@ impl Attribute {
             nullable,
             expr_id: ExprId::fresh(),
             source_quals: BTreeSet::new(),
+            qualifier: None,
         }
     }
 
@@ -97,39 +95,25 @@ impl Attribute {
         Self::minted(field.name.clone(), field.data_type.clone(), field.nullable)
     }
 
-    /// Chainable: overwrite `source_quals` — for LEAF mint sites
-    /// (`TableScan`, `AliasedRelation`) that seed lineage at origination.
-    /// Every other production site inherits `source_quals` by cloning an
-    /// existing `Attribute` (never re-derive it) — see the module doc's
-    /// CONVENTION — with ONE enumerated exception: a USING-join's key-column
-    /// donor (`analyzer.rs`'s `build_using_prefix`) is not a leaf, but IS
-    /// re-derived, because a USING key is referenceable via EITHER side's
-    /// qualifier regardless of which side donates the value/id — the donor
-    /// clone's inherited `source_quals` (only one side's lineage) is
-    /// deliberately overwritten with the UNION of both sides' lineage before
-    /// use.
-    pub fn with_quals(mut self, quals: BTreeSet<String>) -> Self {
+    /// Overwrite origin lineage without changing the current qualifier.
+    pub fn with_quals(mut self, quals: BTreeSet<Qualifier>) -> Self {
         self.source_quals = quals;
         self
     }
 
-    /// Project back down to a plain [`StructField`], dropping the id AND the
-    /// source-qualifier lineage. This is a one-way door — there is no
-    /// `From<StructField>` and no implicit conversion, precisely so every
-    /// re-mint is a visible `::minted` call.
+    /// Set the current output qualifier without changing lineage.
+    pub fn with_qualifier(mut self, qualifier: Qualifier) -> Self {
+        self.qualifier = Some(qualifier);
+        self
+    }
+
+    /// Project to a [`StructField`], dropping analysis metadata.
     pub fn to_field(&self) -> StructField {
         StructField::new(self.name.clone(), self.data_type.clone(), self.nullable)
     }
 }
 
-/// Hand-written `PartialEq` EXCLUDING `expr_id` and `source_quals`: neither
-/// is part of the column's logical value — `expr_id` is derived identity
-/// bookkeeping and `source_quals` is derived lineage bookkeeping (ADR-023
-/// tier-3) — mirrors `ColumnReference`'s hand-written `PartialEq` excluding
-/// `expr_id` (`expression.rs`, `ColumnReference`) and `TypedAst`/`RelScope`'s
-/// derived-data exclusions elsewhere in this module tree. Keeps every
-/// pre-existing schema-equality test (written against `StructField`/
-/// `StructType` semantics) passing unchanged once schemas carry ids.
+/// Value-only equality excludes identity and analysis metadata.
 impl PartialEq for Attribute {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -380,24 +364,38 @@ mod tests {
     fn minted_has_empty_source_quals() {
         let a = Attribute::minted("x", DataType::Integer, false);
         assert!(a.source_quals.is_empty());
+        assert!(a.qualifier.is_none());
     }
 
     #[test]
     fn with_quals_overwrites_source_quals_and_keeps_expr_id() {
         let a = Attribute::minted("x", DataType::Integer, false);
         let id = a.expr_id;
-        let quals: BTreeSet<String> = ["t".to_owned(), "alias".to_owned()].into_iter().collect();
+        let quals: BTreeSet<Qualifier> = [Qualifier::single("t"), Qualifier::single("alias")]
+            .into_iter()
+            .collect();
         let a = a.with_quals(quals.clone());
         assert_eq!(a.source_quals, quals);
         assert_eq!(a.expr_id, id);
     }
 
     #[test]
+    fn current_qualifier_is_independent_of_lineage() {
+        let lineage: BTreeSet<Qualifier> = [Qualifier::single("source")].into_iter().collect();
+        let a = Attribute::minted("x", DataType::Integer, false)
+            .with_quals(lineage.clone())
+            .with_qualifier(Qualifier::single("current"));
+        assert_eq!(a.source_quals, lineage);
+        assert_eq!(a.qualifier, Some(Qualifier::single("current")));
+    }
+
+    #[test]
     fn attribute_eq_excludes_source_quals() {
         let a = Attribute::minted("x", DataType::Integer, false);
         let b = Attribute::minted("x", DataType::Integer, false)
-            .with_quals(["t".to_owned()].into_iter().collect());
-        assert_eq!(a, b, "Attribute equality must ignore source_quals");
+            .with_quals([Qualifier::single("t")].into_iter().collect())
+            .with_qualifier(Qualifier::single("current"));
+        assert_eq!(a, b, "Attribute equality must ignore qualifier metadata");
     }
 
     #[test]

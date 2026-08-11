@@ -282,7 +282,21 @@ mod tests {
     //! via `ExpressionString`.
 
     use super::SparkSqlParserV2;
-    use crate::transpiler_v2::{generate, BaseTypes, Expression};
+    use crate::transpiler_v2::{generate, BaseTypes, CommonAst, Expression};
+
+    #[test]
+    fn sparksql_plan_nodes_have_no_connect_plan_id() {
+        fn assert_untagged(ast: &CommonAst) {
+            assert_eq!(ast.plan_id, None);
+            for child in ast.op.children() {
+                assert_untagged(child);
+            }
+        }
+
+        let ast = SparkSqlParserV2::parse("SELECT id FROM emp WHERE id > 0")
+            .expect("SparkSQL plan parses");
+        assert_untagged(&ast);
+    }
 
     /// ADR-022 classification of `sqlparser` failures — the
     /// `classify_parse_failure` contract, pinned end-to-end through

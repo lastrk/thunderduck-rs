@@ -7,7 +7,7 @@ use arrow::datatypes::{Field, Schema};
 use futures::stream;
 use thunderduck_core::error::ThunderduckError;
 use thunderduck_core::parser_v2::SparkSqlParserV2;
-use thunderduck_core::transpiler_v2::{self, BaseTypes, CommonAst};
+use thunderduck_core::transpiler_v2::{self, BaseTypes, CommonAst, Qualifier};
 use thunderduck_core::types::{DataType, StructType};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -74,7 +74,12 @@ async fn relation_to_common_ast_with_session(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
 ) -> Result<CommonAst, Status> {
     if let Some(ast) = crate::catalog_ops::resolve_catalog_relation(relation, session).await? {
-        return Ok(ast);
+        return Ok(
+            match relation.common.as_ref().and_then(|common| common.plan_id) {
+                Some(plan_id) => ast.with_plan_id(plan_id),
+                None => ast,
+            },
+        );
     }
     relation_to_common_ast(relation)
 }
@@ -129,12 +134,16 @@ async fn build_base_types(
     if tables.is_empty() {
         return BaseTypes::empty();
     }
-    let mut map: HashMap<String, StructType> = HashMap::new();
+    let mut map: HashMap<Qualifier, StructType> = HashMap::new();
     for table in tables {
         if map.contains_key(&table) {
             continue;
         }
-        if let Some(schema) = session.get_view_schema(&table).await {
+        let lookup_name = match table.parts() {
+            [part] => part.clone(),
+            _ => table.display_name(),
+        };
+        if let Some(schema) = session.get_view_schema(&lookup_name).await {
             map.insert(table, schema);
         }
     }
@@ -178,9 +187,9 @@ async fn resolve_implicit_pivots(
         };
         let col2_expr = thunderduck_core::transpiler_v2::Expression::UnresolvedColumn(
             thunderduck_core::transpiler_v2::expression::UnresolvedColumn {
-                name: col2.clone(),
-                qualifier: None,
+                name_parts: vec![col2.clone()],
                 plan_id: None,
+                is_metadata_column: false,
             },
         );
         // NULL is a real Spark crosstab bucket; retain it with DISTINCT and
@@ -637,6 +646,19 @@ fn post_transcode_schema(src: &Schema, cols: &[ArrayRef]) -> Schema {
     Schema::new(new_fields).with_metadata(src.metadata.clone())
 }
 
+/// Remove DuckDB's placeholder from a logical zero-column projection.
+fn output_columns(
+    batch: &RecordBatch,
+    plan: &IntervalPlan,
+    resolved_schema: &StructType,
+) -> Result<Vec<ArrayRef>, arrow_interval_transcode::TranscodeError> {
+    if resolved_schema.fields.is_empty() {
+        Ok(Vec::new())
+    } else {
+        arrow_interval_transcode::apply(batch, plan)
+    }
+}
+
 /// One iteration of the streaming state machine. Returns
 /// `Some((frame, next_state))` while there is work to do; `None` terminates
 /// the tonic stream cleanly.
@@ -653,7 +675,7 @@ async fn streaming_step(
     }
     match s.rx.recv().await {
         Some(thunderduck_core::runtime::StreamBatch::Batch(rb)) => {
-            let cols: Vec<ArrayRef> = match arrow_interval_transcode::apply(&rb, &s.plan) {
+            let cols: Vec<ArrayRef> = match output_columns(&rb, &s.plan, &s.resolved_schema) {
                 Ok(cols) => cols,
                 Err(e) => {
                     let status = Status::from(ConnectError::from(e));
@@ -1356,11 +1378,36 @@ mod tests {
         })
     }
 
+    #[test]
+    fn zero_column_output_preserves_row_count_without_the_sql_placeholder() {
+        use arrow::array::Int32Array;
+
+        let placeholder: ArrayRef = Arc::new(Int32Array::from(vec![1, 1, 1]));
+        let batch = RecordBatch::try_from_iter([("__td_empty_projection", placeholder)])
+            .expect("placeholder batch");
+        let resolved_schema = StructType::empty();
+        let columns = output_columns(
+            &batch,
+            &IntervalPlan::build(&resolved_schema),
+            &resolved_schema,
+        )
+        .expect("zero-column output");
+        let schema = Arc::new(post_transcode_schema(&batch.schema(), &columns));
+        let options = RecordBatchOptions::new()
+            .with_match_field_names(false)
+            .with_row_count(Some(batch.num_rows()));
+        let output = RecordBatch::try_new_with_options(schema, columns, &options)
+            .expect("zero-column Arrow batch");
+
+        assert_eq!(output.num_columns(), 0);
+        assert_eq!(output.num_rows(), 3);
+    }
+
     fn col(name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
+            name_parts: vec![name.to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })
     }
 
@@ -1488,6 +1535,29 @@ mod tests {
             sql.contains("SELECT"),
             "expected DuckDB SELECT emission; got: {sql}",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_relation_preserves_plan_id() {
+        let session = test_session("test-catalog-plan-id").await;
+        let relation = proto::Relation {
+            common: Some(proto::RelationCommon {
+                plan_id: Some(42),
+                ..Default::default()
+            }),
+            rel_type: Some(proto::relation::RelType::Catalog(proto::Catalog {
+                cat_type: Some(proto::catalog::CatType::CurrentCatalog(
+                    proto::CurrentCatalog {},
+                )),
+            })),
+        };
+
+        let ast = relation_to_common_ast_with_session(&relation, &session)
+            .await
+            .expect("supported catalog relation must convert");
+
+        assert_eq!(ast.plan_id, Some(42));
+        assert!(matches!(ast.op, transpiler_v2::CommonOp::Values { .. }));
     }
 
     /// SparkSQL syntax errors surface via `parser_v2`'s boundary policy
@@ -1991,6 +2061,29 @@ mod tests {
             vec!["id".to_owned(), "name".to_owned()],
             "stamped schema field names must match the registered view",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_bridge_preserves_quoted_dot_view_name() {
+        use thunderduck_core::transpiler_v2::{CommonOp, Qualifier};
+        use thunderduck_core::types::StructField;
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
+        let session = session_manager
+            .get_or_create("catalog-bridge-quoted-dot-session")
+            .await
+            .expect("session must be creatable");
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        session
+            .create_temp_view_with_schema("a.b", "SELECT 1 AS id", schema.clone())
+            .await
+            .expect("quoted-dot view registration must succeed");
+
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: Qualifier::single("a.b"),
+        });
+        let base_types = build_base_types(&session, &plan).await;
+        assert_eq!(base_types.lookup(&Qualifier::single("a.b")), Some(&schema));
     }
 
     /// `CreateDataframeView` registers the view and returns a lone

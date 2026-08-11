@@ -27,7 +27,8 @@ clap       = { version = "4", features = ["derive"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"
 sqlparser  = "0.61"
-regex      = "1"
+java_regex = "=0.1.0"
+unicode-general-category = "1"
 # `preserve_order` uses `IndexMap` for `serde_json::Map`, matching Spark's
 # struct field-order semantics. Required by the `json_strip_nulls` UDF that
 # powers `to_json`'s `ignoreNullFields=true` default (Pass 89, `json-005`).

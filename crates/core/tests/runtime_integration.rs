@@ -12,13 +12,13 @@ async fn session_round_trip() {
 
     // 1. Create a simple view via range().
     session
-        .create_temp_view("nums", "SELECT \"range\" AS n FROM range(1, 6, 1)")
+        .create_temp_view("nums", "SELECT \"range\" AS n FROM range(1, 6, 1)", None)
         .await
         .expect("create_temp_view failed");
 
     // 2. Execute a query against the view.
     let batches = session
-        .execute("SELECT n, n*n AS squared FROM nums ORDER BY n")
+        .query("SELECT n, n*n AS squared FROM nums ORDER BY n")
         .await
         .expect("execute failed");
 
@@ -62,12 +62,12 @@ async fn session_manager_isolation() {
         .expect("get_or_create session-b failed");
 
     // Create a table in session-a.
-    s1.execute("CREATE TABLE t (x INT)")
+    s1.execute_batch("CREATE TABLE t (x INT)", None)
         .await
         .expect("CREATE TABLE failed");
 
     // session-b must NOT see table t.
-    let result = s2.execute("SELECT * FROM t").await;
+    let result = s2.query("SELECT * FROM t").await;
     assert!(
         result.is_err(),
         "sessions must be isolated: session-b should not see session-a's table t"
@@ -128,7 +128,7 @@ async fn check_parquet_types() {
     let session = DuckDbSession::spawn("parquet-type-check").expect("spawn failed");
 
     // Check supplier schema
-    let batches = session.execute("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");
+    let batches = session.query("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");
     println!("Supplier schema:");
     for batch in &batches {
         for row in 0..batch.num_rows() {
@@ -149,8 +149,8 @@ async fn check_parquet_types() {
     }
 
     // Check arithmetic type (use LIMIT on FROM to avoid GROUP BY requirement)
-    let batches = session.execute("SELECT typeof(1 - l_discount) AS t1, typeof(l_extendedprice * (1 - l_discount)) AS t2 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet') LIMIT 1").await.expect("failed");
-    let batches2 = session.execute("SELECT typeof(SUM(l_extendedprice * (1 - l_discount))) AS t3 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("failed");
+    let batches = session.query("SELECT typeof(1 - l_discount) AS t1, typeof(l_extendedprice * (1 - l_discount)) AS t2 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet') LIMIT 1").await.expect("failed");
+    let batches2 = session.query("SELECT typeof(SUM(l_extendedprice * (1 - l_discount))) AS t3 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("failed");
     let batches = batches;
     for batch in &batches {
         let t1 = batch
@@ -179,10 +179,10 @@ async fn check_parquet_types() {
     }
 
     // Register lineitem view (simulating createOrReplaceTempView)
-    session.create_temp_view("lineitem", "SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("create view failed");
+    session.create_temp_view("lineitem", "SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')", None).await.expect("create view failed");
 
     // Check ARROW schema types via view (like Q1 DataFrame generates)
-    let batches3 = session.execute("SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\" LIMIT 1").await.expect("failed");
+    let batches3 = session.query("SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\" LIMIT 1").await.expect("failed");
     if let Some(batch) = batches3.first() {
         let schema = batch.schema();
         println!("Arrow schema of batch:");

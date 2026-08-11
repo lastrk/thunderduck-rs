@@ -84,41 +84,36 @@ async fn relation_to_common_ast_with_session(
     relation_to_common_ast(relation)
 }
 
-/// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
-/// it into DuckDB SQL + resolved schema via τ.
-///
-/// Runs data-dependent schema discovery before finalization for command paths.
-pub(crate) async fn transpile_relation(
+type RelationTerminal<T> =
+    fn(&CommonAst, &BaseTypes) -> Result<T, thunderduck_core::transpiler_v2::EmissionError>;
+
+/// Convert, resolve runtime-dependent shapes, seed base types, then run the
+/// caller-selected terminal operation.
+async fn prepare_relation<T>(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     relation: &proto::Relation,
-) -> Result<(CommonAst, String, StructType), Status> {
-    let mut common_ast = relation_to_common_ast_with_session(relation, session).await?;
-    resolve_implicit_pivots(&mut common_ast, session).await?;
-    let (sql, schema) = finalize(session, &common_ast).await?;
-    Ok((common_ast, sql, schema))
+    terminal: RelationTerminal<T>,
+) -> Result<T, Status> {
+    let common_ast = relation_to_common_ast_with_session(relation, session).await?;
+    prepare_common_ast(session, common_ast, terminal).await
 }
 
-/// Build the per-path `BaseTypes` overlay and emit SQL with its resolved schema.
-pub(crate) async fn finalize(
+async fn prepare_common_ast<T>(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    common_ast: &CommonAst,
-) -> Result<(String, StructType), Status> {
-    let base_types = build_base_types(session, common_ast).await;
-    transpiler_v2::generate_with_schema(common_ast, &base_types)
-        .map_err(|e| Status::from(ConnectError::from(e)))
+    mut common_ast: CommonAst,
+    terminal: RelationTerminal<T>,
+) -> Result<T, Status> {
+    resolve_runtime_shapes(&mut common_ast, session).await?;
+    finish_common_ast(session, &common_ast, terminal).await
 }
 
-/// Run τ's analyzer on a `CommonAst` and return the root-node resolved schema.
-///
-/// Used by `AnalyzePlan(Schema)`; `ExecutePlan` receives the schema from
-/// [`finalize`].
-pub(crate) async fn analyze_schema(
+async fn finish_common_ast<T>(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
-) -> Result<StructType, Status> {
+    terminal: RelationTerminal<T>,
+) -> Result<T, Status> {
     let base_types = build_base_types(session, common_ast).await;
-    transpiler_v2::analyze_schema(common_ast, &base_types)
-        .map_err(|e| Status::from(ConnectError::from(e)))
+    terminal(common_ast, &base_types).map_err(|e| Status::from(ConnectError::from(e)))
 }
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
@@ -158,14 +153,14 @@ const PIVOT_MAX_VALUES: usize = 10000;
 /// Resolve values-less pivots, crosstabs, and schema-less file scans before
 /// finalization. Their schemas depend on runtime data or catalog state, so the
 /// async service layer must resolve them before synchronous τ analysis.
-async fn resolve_implicit_pivots(
+async fn resolve_runtime_shapes(
     ast: &mut CommonAst,
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
 ) -> Result<(), Status> {
     use thunderduck_core::transpiler_v2::CommonOp;
 
     for child in ast.op.children_mut() {
-        Box::pin(resolve_implicit_pivots(child, session)).await?;
+        Box::pin(resolve_runtime_shapes(child, session)).await?;
     }
 
     if let CommonOp::Pivot {
@@ -231,14 +226,19 @@ async fn discover_pivot_values(
         input: Box::new(input.clone()),
         projections: vec![pivot_column.clone()],
     });
-    let (project_sql, _schema) = finalize(session, &discovery_project).await?;
+    let (project_sql, _schema) = finish_common_ast(
+        session,
+        &discovery_project,
+        transpiler_v2::generate_with_schema,
+    )
+    .await?;
     let discovery_sql = format!(
         "SELECT DISTINCT * FROM ({project_sql}) AS __td_pivot_discover \
          ORDER BY 1 ASC NULLS FIRST LIMIT {}",
         PIVOT_MAX_VALUES + 1
     );
     let batches = session
-        .execute(&discovery_sql)
+        .query(&discovery_sql)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
@@ -277,7 +277,7 @@ async fn discover_file_schema(
     let discovery_sql = format!("SELECT * FROM {reader_call} LIMIT 0");
 
     let batches = session
-        .execute(&discovery_sql)
+        .query(&discovery_sql)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
@@ -327,10 +327,9 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let mut common_ast =
-                    relation_to_common_ast_with_session(&relation, &session).await?;
-                resolve_implicit_pivots(&mut common_ast, &session).await?;
-                let (sql, resolved_schema) = finalize(&session, &common_ast).await?;
+                let (sql, resolved_schema) =
+                    prepare_relation(&session, &relation, transpiler_v2::generate_with_schema)
+                        .await?;
                 return execute_streaming_query(
                     &session,
                     &sql,
@@ -379,10 +378,8 @@ impl SparkConnectService for ThunderduckService {
                     }
                 };
                 let session = self.session(&session_id).await?;
-                let mut common_ast =
-                    relation_to_common_ast_with_session(&relation, &session).await?;
-                resolve_implicit_pivots(&mut common_ast, &session).await?;
-                let struct_type = analyze_schema(&session, &common_ast).await?;
+                let struct_type =
+                    prepare_relation(&session, &relation, transpiler_v2::analyze_schema).await?;
                 // Unresolved serializes as proto Unparsed, which PySpark rejects;
                 // report the unsupported τ boundary instead.
                 if let Some(bad) = struct_type
@@ -502,7 +499,8 @@ async fn handle_command(
             let relation = view_cmd
                 .input
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
-            let (_ast, sql, schema) = transpile_relation(session, &relation).await?;
+            let (sql, schema) =
+                prepare_relation(session, &relation, transpiler_v2::generate_with_schema).await?;
             handle_create_dataframe_view(
                 session,
                 session_id,
@@ -525,7 +523,8 @@ async fn handle_command(
                 .input
                 .take()
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let (_common_ast, sql, _schema) = transpile_relation(session, &input_rel).await?;
+            let (sql, _schema) =
+                prepare_relation(session, &input_rel, transpiler_v2::generate_with_schema).await?;
             handle_write_operation(session, session_id, operation_id, &sql, &write_cmd).await
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
@@ -604,7 +603,7 @@ async fn execute_streaming_query(
     operation_id: &str,
 ) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
     let rx = session
-        .execute_streaming(sql.to_string().as_str(), 4)
+        .query_streaming(sql, 4)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
@@ -764,7 +763,7 @@ async fn handle_create_dataframe_view(
         tracing::warn!(view = %name, "global temp view registered as session-local");
     }
     session
-        .create_temp_view_with_schema(name, &sql, schema)
+        .create_temp_view(name, &sql, Some(schema))
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
     Ok(vec![result_complete_response(session_id, operation_id)])
@@ -825,7 +824,8 @@ async fn handle_sql_command_dispatch(
 
     match stmt {
         SqlStatement::Query(_) => {
-            let _ = transpile_relation(session, &input_rel).await?;
+            let _ =
+                prepare_relation(session, &input_rel, transpiler_v2::generate_with_schema).await?;
             handle_sql_command_echo(session_id, operation_id, input_rel)
         }
         SqlStatement::Ddl(DdlStatement::CreateTempView {
@@ -849,7 +849,7 @@ async fn handle_sql_command_dispatch(
 
 /// Handle DDL/DML statements from a `SqlCommand`.
 ///
-/// Renders the DDL to DuckDB SQL, executes it via `execute_ddl` with the
+/// Renders the DDL to DuckDB SQL, executes it via `execute_batch` with the
 /// appropriate schema-cache side effect, and returns a `ResultComplete`
 /// response (matching Spark's empty DataFrame result for DDL commands).
 ///
@@ -866,15 +866,15 @@ async fn handle_sql_ddl(
 
     let (body_sql, view_schema): (Option<String>, Option<StructType>) = match ddl {
         DdlStatement::CreateView { query, .. } => {
-            let mut body_ast = query.clone();
-            resolve_implicit_pivots(&mut body_ast, session).await?;
-            let (sql, schema) = finalize(session, &body_ast).await?;
+            let (sql, schema) =
+                prepare_common_ast(session, query.clone(), transpiler_v2::generate_with_schema)
+                    .await?;
             (Some(sql), Some(schema))
         }
         DdlStatement::InsertSelect { query, .. } => {
-            let mut body_ast = query.clone();
-            resolve_implicit_pivots(&mut body_ast, session).await?;
-            let (sql, _schema) = finalize(session, &body_ast).await?;
+            let (sql, _schema) =
+                prepare_common_ast(session, query.clone(), transpiler_v2::generate_with_schema)
+                    .await?;
             (Some(sql), None)
         }
         _ => (None, None),
@@ -890,40 +890,34 @@ async fn handle_sql_ddl(
             if_not_exists,
         } => {
             if *if_not_exists {
-                CacheEffect::CacheIfAbsent {
+                Some(CacheEffect::CacheIfAbsent {
                     name: name.clone(),
                     schema: columns.clone(),
-                }
+                })
             } else {
-                CacheEffect::Cache {
+                Some(CacheEffect::Cache {
                     name: name.clone(),
                     schema: columns.clone(),
-                }
+                })
             }
         }
-        DdlStatement::CreateView { name, .. } => {
-            if let Some(schema) = view_schema {
-                CacheEffect::Cache {
-                    name: name.clone(),
-                    schema,
-                }
-            } else {
-                CacheEffect::None
-            }
-        }
+        DdlStatement::CreateView { name, .. } => view_schema.map(|schema| CacheEffect::Cache {
+            name: name.clone(),
+            schema,
+        }),
         DdlStatement::DropTable { name, .. } | DdlStatement::DropView { name, .. } => {
-            CacheEffect::Evict { name: name.clone() }
+            Some(CacheEffect::Evict { name: name.clone() })
         }
         DdlStatement::TruncateTable { .. }
         | DdlStatement::InsertValues { .. }
-        | DdlStatement::InsertSelect { .. } => CacheEffect::None,
+        | DdlStatement::InsertSelect { .. } => None,
         DdlStatement::CreateTempView { .. } => {
             // Handled by handle_sql_create_temp_view.
-            CacheEffect::None
+            None
         }
     };
 
-    match session.execute_ddl(&sql, effect).await {
+    match session.execute_batch(&sql, effect).await {
         Ok(()) => Ok(vec![result_complete_response(session_id, operation_id)]),
         Err(e) => Err(map_ddl_error(ddl, e)),
     }
@@ -1035,9 +1029,8 @@ async fn handle_sql_create_temp_view(
         )));
     }
 
-    let mut body_ast = body.clone();
-    resolve_implicit_pivots(&mut body_ast, session).await?;
-    let (sql, schema) = finalize(session, &body_ast).await?;
+    let (sql, schema) =
+        prepare_common_ast(session, body.clone(), transpiler_v2::generate_with_schema).await?;
 
     handle_create_dataframe_view(
         session,
@@ -1137,19 +1130,19 @@ async fn write_delta_append(
     let detach_sql = "DETACH __td_dw";
 
     session
-        .execute(&attach_sql)
+        .execute_batch(&attach_sql, None)
         .await
         .map_err(|e| Status::internal(format!("delta ATTACH failed: {e}")))?;
 
-    let insert_result = session.execute(&insert_sql).await;
+    let insert_result = session.execute_batch(&insert_sql, None).await;
     if let Err(ref e) = insert_result {
         tracing::warn!(path, "delta INSERT failed, detaching: {e}");
-        let _ = session.execute(detach_sql).await;
+        let _ = session.execute_batch(detach_sql, None).await;
         return Err(Status::internal(format!("delta INSERT failed: {e}")));
     }
 
     session
-        .execute(detach_sql)
+        .execute_batch(detach_sql, None)
         .await
         .map_err(|e| Status::internal(format!("delta DETACH failed: {e}")))?;
 
@@ -1168,7 +1161,7 @@ async fn write_parquet_overwrite(
     let copy_sql = format!("COPY ({source_sql}) TO '{escaped_path}' (FORMAT parquet)");
 
     session
-        .execute(&copy_sql)
+        .execute_batch(&copy_sql, None)
         .await
         .map_err(|e| Status::internal(format!("parquet COPY failed: {e}")))?;
 
@@ -1483,7 +1476,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn transpile_relation_project_returns_unsupported_op() {
+    async fn prepare_relation_project_returns_unsupported_op() {
         let session = test_session("test-transpile-project").await;
         let input = table_scan_relation("t");
         let project = proto::Relation {
@@ -1495,7 +1488,7 @@ mod tests {
                 },
             ))),
         };
-        let err = transpile_relation(&session, &project)
+        let err = prepare_relation(&session, &project, transpiler_v2::generate_with_schema)
             .await
             .expect_err("τ emission must error at A.3");
         assert!(
@@ -1519,7 +1512,7 @@ mod tests {
 
     /// `RelType::Sql` MUST route through `parser_v2`, not `V2RelationConverter`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
+    async fn prepare_relation_sql_routes_to_parser_v2_not_converter() {
         let session = test_session("test-transpile-sql-route").await;
         let sql_rel = proto::Relation {
             common: None,
@@ -1528,13 +1521,36 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (_common_ast, sql, _schema) = transpile_relation(&session, &sql_rel)
-            .await
-            .expect("τ must emit SQL for `SELECT 1`");
+        let (sql, _schema) =
+            prepare_relation(&session, &sql_rel, transpiler_v2::generate_with_schema)
+                .await
+                .expect("τ must emit SQL for `SELECT 1`");
         assert!(
             sql.contains("SELECT"),
             "expected DuckDB SELECT emission; got: {sql}",
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_relation_shares_schema_between_execute_and_analyze() {
+        let session = test_session("test-prepare-relation-terminals").await;
+        let relation = proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                query: "SELECT 1 AS id, 'x' AS name".to_owned(),
+                ..Default::default()
+            })),
+        };
+
+        let (_, execute_schema) =
+            prepare_relation(&session, &relation, transpiler_v2::generate_with_schema)
+                .await
+                .expect("execute terminal");
+        let analyze_schema = prepare_relation(&session, &relation, transpiler_v2::analyze_schema)
+            .await
+            .expect("analyze terminal");
+
+        assert_eq!(execute_schema, analyze_schema);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1564,7 +1580,7 @@ mod tests {
     /// (`Unsupported { kind: ProtoShape, name: "sql::parse_error", ... }`), which
     /// maps to `Status::unimplemented` per `ConnectError::TranspilerV2Emission`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn transpile_relation_sql_syntax_error_surfaces_from_parser_v2() {
+    async fn prepare_relation_sql_syntax_error_surfaces_from_parser_v2() {
         let session = test_session("test-transpile-syntax-err").await;
         let sql_rel = proto::Relation {
             common: None,
@@ -1573,7 +1589,7 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let err = transpile_relation(&session, &sql_rel)
+        let err = prepare_relation(&session, &sql_rel, transpiler_v2::generate_with_schema)
             .await
             .expect_err("syntax error must surface");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
@@ -1589,7 +1605,7 @@ mod tests {
     /// `V2RelationConverter`'s `UnsupportedProtoShape` and maps to
     /// `Status::unimplemented`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn transpile_relation_unsupported_proto_shape_surfaces() {
+    async fn prepare_relation_unsupported_proto_shape_surfaces() {
         let session = test_session("test-transpile-unsupported-shape").await;
         let show = proto::Relation {
             common: None,
@@ -1602,7 +1618,7 @@ mod tests {
                 },
             ))),
         };
-        let err = transpile_relation(&session, &show)
+        let err = prepare_relation(&session, &show, transpiler_v2::generate_with_schema)
             .await
             .expect_err("deferred shape must error");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
@@ -1616,13 +1632,14 @@ mod tests {
 
     /// Plans without empty scans use `BaseTypes::empty()` and still emit SQL.
     #[tokio::test(flavor = "multi_thread")]
-    async fn finalize_short_circuits_on_plans_without_empty_scan() {
+    async fn finish_common_ast_short_circuits_without_empty_scan() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         let session = test_session("test-finalize-short-circuit").await;
         let plan = CommonAst::new(CommonOp::SingleRow);
-        let (sql, _schema) = finalize(&session, &plan)
-            .await
-            .expect("τ must emit for SingleRow");
+        let (sql, _schema) =
+            finish_common_ast(&session, &plan, transpiler_v2::generate_with_schema)
+                .await
+                .expect("τ must emit for SingleRow");
         assert_eq!(sql, "SELECT 1");
     }
 
@@ -1855,7 +1872,7 @@ mod tests {
     /// Values-less pivots include a NULL bucket and sort discovered values
     /// ascending.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_implicit_pivots_discovers_sorted_typed_values_with_null_bucket() {
+    async fn resolve_runtime_shapes_discovers_sorted_typed_pivot_values() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         use thunderduck_core::transpiler_v2::expression::FunctionCall;
 
@@ -1886,7 +1903,7 @@ mod tests {
             })],
         });
 
-        resolve_implicit_pivots(&mut ast, &session)
+        resolve_runtime_shapes(&mut ast, &session)
             .await
             .expect("discovery pass must succeed");
 
@@ -1920,7 +1937,7 @@ mod tests {
     /// Crosstab discovery produces a conditional-count aggregate with a
     /// Spark-compatible schema and executable SQL.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_implicit_pivots_desugars_crosstab_end_to_end() {
+    async fn resolve_runtime_shapes_desugars_crosstab_end_to_end() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
 
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
@@ -1944,7 +1961,7 @@ mod tests {
             col2: "active".to_owned(),
         });
 
-        resolve_implicit_pivots(&mut ast, &session)
+        resolve_runtime_shapes(&mut ast, &session)
             .await
             .expect("crosstab desugar must succeed");
         assert!(
@@ -1953,7 +1970,7 @@ mod tests {
             ast.op
         );
 
-        let (sql, schema) = finalize(&session, &ast)
+        let (sql, schema) = finish_common_ast(&session, &ast, transpiler_v2::generate_with_schema)
             .await
             .expect("desugared crosstab must emit SQL");
 
@@ -1969,7 +1986,7 @@ mod tests {
         assert!(!schema.fields[2].nullable);
 
         session
-            .execute(&sql)
+            .query(&sql)
             .await
             .expect("desugared crosstab SQL must execute in DuckDB");
     }
@@ -2020,10 +2037,10 @@ mod tests {
             StructField::nullable("name", DataType::String),
         ]);
         session
-            .create_temp_view_with_schema(
+            .create_temp_view(
                 "emp",
                 "SELECT * FROM (VALUES (1,'a'),(2,'b')) AS t(id, name)",
-                schema,
+                Some(schema),
             )
             .await
             .expect("view registration must succeed");
@@ -2075,7 +2092,7 @@ mod tests {
             .expect("session must be creatable");
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
         session
-            .create_temp_view_with_schema("a.b", "SELECT 1 AS id", schema.clone())
+            .create_temp_view("a.b", "SELECT 1 AS id", Some(schema.clone()))
             .await
             .expect("quoted-dot view registration must succeed");
 

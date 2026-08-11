@@ -451,6 +451,21 @@ in small service/runtime slices.
   error/result behavior.
 - Session-thread ownership, cancellation, and Arrow wire tests remain green.
 
+### Completion checkpoint (2026-08-11)
+
+- Session requests now encode query or batch-command intent explicitly; the
+  runtime no longer classifies SQL text.
+- Batch commands carry an optional `SchemaCacheEffect`, applied once on the
+  session thread after successful execution.
+- ExecutePlan and AnalyzePlan share `prepare_relation`; runtime-dependent
+  pivot, crosstab, and file-schema discovery lives in `resolve_runtime_shapes`.
+- The changed Rust source is net -117 lines, including the added witnesses.
+- Format, strict workspace Clippy, and all workspace tests pass (Connect
+  165/165; core 1332 passed with four declared ignores). The DataFrame corpus
+  remains 422 green with the same seven deferred cases, the SQL corpus remains
+  426 green with two intentional skips, and the 829-case prior-green oracle
+  reports zero regressions.
+
 ## Phase 6 — evaluate phase-typed plans and expressions
 
 This is an experiment, not a committed migration. Run it after the earlier

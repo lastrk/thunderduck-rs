@@ -55,9 +55,8 @@ crates/connect-server/              # gRPC binary (tonic)
   error.rs                          # ConnectError ↔ tonic::Status bridge
 ```
 
-`SessionManager` (session lifecycle; each session owns a DuckDB `Connection` on a
-dedicated OS thread) lives inside `service.rs` — there is no separate `session/`
-module.
+`runtime/session_manager.rs` owns session lifecycle;
+`runtime/session.rs` owns each dedicated DuckDB thread and its request protocol.
 
 ## Key Types
 
@@ -75,6 +74,10 @@ module.
 | **Runtime** | `DuckDbSession` | Owns `duckdb::Connection` on its dedicated OS thread |
 | **Types** | `TypeInferenceEngine` | Resolves expression types following Spark semantics |
 
+`service::prepare_relation` is the shared ExecutePlan/AnalyzePlan seam: it
+converts the relation, resolves runtime-dependent shapes, builds `BaseTypes`,
+then invokes the caller-selected emit-or-schema terminal.
+
 Missing-column recovery preserves Catalyst operator identity: SQL `Distinct`
 is separate from Dataset `Deduplicate`, and recovered child attributes do not
 change frozen deduplication keys or `NaDrop` predicates.
@@ -89,8 +92,12 @@ Use `render_expr` / `dispatch_op` inside `crates/core/src/transpiler_v2/emission
 
 ```
 tokio task → mpsc::Sender<SessionCommand> → session thread (owns Connection)
-session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
+session thread → oneshot::Sender<Result<T>> → tokio task → gRPC stream
 ```
+
+Requests carry intent as `Query`, `QueryStreaming`, or `ExecuteBatch`; the
+session never classifies SQL by text. `ExecuteBatch` applies its optional
+`SchemaCacheEffect` only after DuckDB succeeds.
 
 Never attempt to move a `Connection` across thread boundaries or hold it across `.await` points.
 

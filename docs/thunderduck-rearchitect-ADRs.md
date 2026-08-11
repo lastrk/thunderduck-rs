@@ -318,7 +318,7 @@ This amendment supersedes ADR-009's compiled-dispatch preference for the functio
 
 **Context.** The protocol's top-level `Plan` is `oneof { Relation root; Command command }`. Commands (CreateTable, WriteOperation / saveAsTable / insertInto, CreateView, RegisterFunction, catalog mutations) are side-effecting statements, not query-producing relations. Additionally, statement-rooted raw SQL (ADR-004) routes here after parsing. The relation-focused expression test matrix scoped commands out.
 
-**Decision.** Statement-shaped operations translate to DuckDB DDL/DML via a parallel `emit_command` path, with the same transliterate-don't-optimize (ADR-001) and forced-transliteration (ADR-007) discipline. Statement-rooted SQL from ADR-004's parser is routed here by parse-root. Their differential oracle is **catalog/table state**, not result rows: run on both engines, compare resulting catalog/table state.
+**Decision.** Statement-shaped operations translate to DuckDB DDL/DML via a parallel `emit_command` path, with the same transliterate-don't-optimize (ADR-001) and forced-transliteration (ADR-007) discipline. Statement-rooted SQL from ADR-004's parser is routed here by parse-root. Their differential oracle is **catalog/table state**, not result rows: run on both engines, compare resulting catalog/table state. This query/command distinction remains structural at the runtime boundary: callers submit explicit query, streaming-query, or batch-command requests; the session thread never infers intent from SQL text.
 
 **Consequences.**
 - (+) Closes a real gap — commands were silently excluded from the architecture — and gives statement-rooted raw SQL a home.
@@ -338,6 +338,8 @@ This amendment supersedes ADR-009's compiled-dispatch preference for the functio
 **Context.** Resolution (ADR-005) needs Spark types of base columns to seed inference. Commands (ADR-011) mutate what relations later resolve against. A full Spark shadow catalog is more than needed, since DuckDB's catalog handles existence and binding.
 
 **Decision.** thunderduck maintains a *narrow* overlay of Spark types on base relations, consulted by the inference pass and updated by commands. It is shared state between the command arm and the relation arm. DuckDB's catalog continues to handle existence and binding; the overlay carries only the Spark-semantics facts the divergent slice needs.
+
+Command-side cache mutation is a closed `SchemaCacheEffect` attached optionally to a batch command. The session thread applies that effect exactly once, only after DuckDB accepts the statement, so catalog and overlay updates share the connection's serialization boundary.
 
 The overlay additionally records, per base relation, its **access provenance** — `native` (a DuckDB-store table), `path-scan` (a Hive-Parquet / bare Delta or Iceberg path), or `attached-catalog` (an Iceberg-REST / Unity-Catalog attachment) — and, for the non-native cases, the **format** (Parquet / Delta / Iceberg / UC). Provenance is load-bearing because it determines *both* the emission surface (ADR-013) and the **type-source**: for `native` relations the overlay maps DuckDB catalog types → Spark types; for format-backed relations the source of truth is the *format's own* schema (Iceberg and Delta each have their own type systems), which should be mapped **directly** to the Spark type Spark would assign when reading that table, not laundered through a DuckDB-type intermediate that may not round-trip precision/timezone/nullability faithfully.
 

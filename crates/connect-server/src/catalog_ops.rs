@@ -170,7 +170,7 @@ async fn resolve_table_exists(
          ) AS v"
     );
     let batches = session
-        .execute(&sql)
+        .query(&sql)
         .await
         .map_err(|e| Status::internal(format!("tableExists query failed: {e}")))?;
     let exists = extract_bool_scalar(&batches);
@@ -191,7 +191,7 @@ async fn resolve_drop_temp_view(
          ) AS v"
     );
     let batches = session
-        .execute(&check_sql)
+        .query(&check_sql)
         .await
         .map_err(|e| Status::internal(format!("dropTempView check failed: {e}")))?;
     let existed = extract_bool_scalar(&batches);
@@ -200,11 +200,11 @@ async fn resolve_drop_temp_view(
         let ident = format!("\"{}\"", name.replace('"', "\"\""));
         let drop_sql = format!("DROP VIEW IF EXISTS {ident}");
         session
-            .execute_ddl(
+            .execute_batch(
                 &drop_sql,
-                SchemaCacheEffect::Evict {
+                Some(SchemaCacheEffect::Evict {
                     name: name.to_owned(),
-                },
+                }),
             )
             .await
             .map_err(|e| Status::internal(format!("dropTempView DROP failed: {e}")))?;
@@ -426,7 +426,7 @@ mod tests {
             .await
             .expect("session");
         session
-            .create_temp_view("catalog_drop_test_view", "SELECT 1 AS id")
+            .create_temp_view("catalog_drop_test_view", "SELECT 1 AS id", None)
             .await
             .expect("create temp view");
         let ast = resolve_drop_temp_view("catalog_drop_test_view", &session)
@@ -452,7 +452,7 @@ mod tests {
             .await
             .expect("session");
         session
-            .create_temp_view("catalog_exists_test_view", "SELECT 42 AS num")
+            .create_temp_view("catalog_exists_test_view", "SELECT 42 AS num", None)
             .await
             .expect("create temp view");
         let ast = resolve_table_exists("catalog_exists_test_view", &session)

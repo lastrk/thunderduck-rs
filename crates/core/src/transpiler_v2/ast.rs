@@ -315,7 +315,7 @@ pub enum CommonOp {
     /// Spark's `<pivot_value>_<agg_alias>` convention; when a single aggregate
     /// is supplied, output columns are named after the pivot values verbatim.
     /// Empty `pivot_values` (implicit / "eager discovery" per Spark) is
-    /// resolved by the connect-server pre-pass (`resolve_implicit_pivots` in
+    /// resolved by the connect-server pre-pass (`resolve_runtime_shapes` in
     /// `service.rs` runs the eager `SELECT DISTINCT` against the live session
     /// and rewrites this node to the explicit-values shape *before*
     /// `analyze`); the analyzer itself — a pure stage with no session hook
@@ -380,7 +380,7 @@ pub enum CommonOp {
     /// `df.stat.crosstab(col1, col2)` — Spark's `StatFunctions.crossTabulate`.
     /// The output column list is `DISTINCT(col2)` — unknowable at plan time —
     /// so this rides the same connect-server pre-pass as implicit Pivot:
-    /// `resolve_implicit_pivots` (`service.rs`) discovers `col2`'s distinct
+    /// `resolve_runtime_shapes` (`service.rs`) discovers `col2`'s distinct
     /// buckets from the live session and
     /// `analyzer::crosstab_to_aggregate` desugars this node into a
     /// conditional-count `Aggregate` *before* `analyze`. The analyzer itself

@@ -14,15 +14,28 @@ spec:
   tasks:
     check:
       resources:
-        cpu: 2
-        memory: 4Gi
+        cpu: 4
+        memory: 6Gi
       steps:
         - uses: checkout
+
+        # restore-cache has no --folder flag: it just untars whatever save-cache
+        # previously packed into $HOME and the repo's working dir (both shared
+        # across every step in this task, per Checkout).
+        - name: restore-cache
+          image: 193814090748.dkr.ecr.us-east-1.amazonaws.com/cicd/cache
+          run: |
+            restore-cache \
+              --cache-key-template='thunderduck-rs-cargo-{% checksum Cargo.lock %}' \
+              --cache-key-default='thunderduck-rs-cargo'
+
         # Must match the release Dockerfile's builder image, so a PR cannot
         # go green on a different compiler than the one that ships the artifact.
         - name: fmt-clippy-test
           image: rust:1.97.1-bookworm
           run: |
+            export CARGO_HOME="$HOME/.cargo-cache"
+            export PATH="$CARGO_HOME/bin:$PATH"
             rustup component add rustfmt clippy
             cargo fmt --all -- --check
             # `--locked` keeps CI on the committed Cargo.lock. Without it a
@@ -31,3 +44,11 @@ spec:
             # 2026-08-07 (ar_archive_writer 0.5.3 requires rustc 1.88).
             cargo clippy --locked --workspace --all-targets --features bundled -- -D warnings
             cargo test --locked --workspace --features bundled
+
+        - name: save-cache
+          image: 193814090748.dkr.ecr.us-east-1.amazonaws.com/cicd/cache
+          run: |
+            save-cache \
+              --cache-key-template='thunderduck-rs-cargo-{% checksum Cargo.lock %}' \
+              --folder=~/.cargo-cache \
+              --folder=target

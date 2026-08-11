@@ -9,6 +9,7 @@ spec:
   events:
     - push
   branches:
+    - "*"
     - "!$(workflow.repo.default-branch)"
   tasks:
     check:
@@ -19,7 +20,8 @@ spec:
         - uses: checkout
         # Must match the release Dockerfile's builder image, so a PR cannot
         # go green on a different compiler than the one that ships the artifact.
-        - image: rust:1.97.1-bookworm
+        - name: fmt-clippy-test
+          image: rust:1.97.1-bookworm
           run: |
             rustup component add rustfmt clippy
             cargo fmt --all -- --check

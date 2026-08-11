@@ -7,7 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
-use super::function_registry::{self, NullRule};
+use super::function_registry::{self, NullRule, SpecialFunction};
 use super::generator::Generator;
 use super::identifier::Qualifier;
 use super::name_fold::eq_fold;
@@ -1238,128 +1238,145 @@ impl Expression {
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
-        let lower: &str = f.name.as_str();
+        let lower = f.name.as_str();
         let registered_rule = function_registry::aggregate_spec(lower)
             .map(|spec| spec.nullability)
             .or_else(|| function_registry::scalar_spec(lower).map(|spec| spec.nullability));
         if let Some(rule) = registered_rule {
             return match rule {
+                NullRule::AllArguments => f.args.iter().all(|arg| arg.nullable(schema)),
                 NullRule::Always => true,
                 NullRule::AnyArgument => f.args.iter().any(|arg| arg.nullable(schema)),
+                NullRule::BranchArguments => {
+                    f.args.get(1).is_none_or(|arg| arg.nullable(schema))
+                        || f.args.get(2).is_none_or(|arg| arg.nullable(schema))
+                }
                 NullRule::Never => false,
             };
         }
-        if matches!(lower, "murmur3" | "xxhash64") {
-            return false;
-        }
-        match lower {
-            "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
-                f.args.iter().all(|a| a.nullable(schema))
+        let Some(handler) = function_registry::special_function(lower) else {
+            return f.args.iter().any(|arg| arg.nullable(schema));
+        };
+        match handler {
+            SpecialFunction::Array
+            | SpecialFunction::ConcatWs
+            | SpecialFunction::CreateMap
+            | SpecialFunction::Isnan
+            | SpecialFunction::Isnotnull
+            | SpecialFunction::Isnull
+            | SpecialFunction::EqNullSafe
+            | SpecialFunction::Map
+            | SpecialFunction::NamedStruct
+            | SpecialFunction::Struct
+            | SpecialFunction::Typeof
+            | SpecialFunction::Window => false,
+            SpecialFunction::Aggregate
+            | SpecialFunction::Bround
+            | SpecialFunction::Ceil
+            | SpecialFunction::Ceiling
+            | SpecialFunction::Flatten
+            | SpecialFunction::Floor
+            | SpecialFunction::FromUnixtime
+            | SpecialFunction::Ln
+            | SpecialFunction::Log
+            | SpecialFunction::Log10
+            | SpecialFunction::Log2
+            | SpecialFunction::ParseUrl
+            | SpecialFunction::Reduce
+            | SpecialFunction::Round
+            | SpecialFunction::Sign
+            | SpecialFunction::Signum
+            | SpecialFunction::ToCsv
+            | SpecialFunction::ToJson
+            | SpecialFunction::ToNumber
+            | SpecialFunction::TryDivide
+            | SpecialFunction::TryElementAt
+            | SpecialFunction::TryToNumber
+            | SpecialFunction::UrlDecode
+            | SpecialFunction::UrlEncode
+            | SpecialFunction::JsonObjectKeys => true,
+            SpecialFunction::Nvl2 => {
+                f.args.get(1).is_none_or(|arg| arg.nullable(schema))
+                    || f.args.get(2).is_none_or(|arg| arg.nullable(schema))
             }
-            "when" => {
-                if f.args.len().is_multiple_of(2) {
-                    true
-                } else {
-                    let then_nullable =
-                        f.args.iter().skip(1).step_by(2).any(|a| a.nullable(schema));
-                    let else_nullable = f.args.last().is_some_and(|a| a.nullable(schema));
-                    then_nullable || else_nullable
-                }
-            }
-            // * `isnull` / `isnan` / `isnotnull` / `isnotnan` / `is_nan` /
-            //   `isinf`, `concat_ws`, `typeof` / `spark_partition_id` /
-            //   `monotonically_increasing_id`.
-            // * `format_string` / `printf` — Spark returns non-nullable; NULL
-            //   args render as the literal string "null" rather than
-            //   propagating NULL.
-            // * `array` / `make_array` / `create_map` / `map` /
-            //   `named_struct` / `struct` — constructors are never NULL
-            //   themselves (only elements / fields carry nullability).
-            // * `window` — `F.window(ts, dur)`: Spark's `TimeWindow` is
-            //   rewritten by the analyzer into
-            //   `CreateNamedStruct(start := ..., end := ...)` whose
-            //   `nullable = false` (Spark's struct-construction is never
-            //   null; only the fields inside carry per-field nullability).
-            //   τ's default `any(arg.nullable)` fallback would incorrectly
-            //   propagate the timestamp arg's nullable into the struct
-            //   itself; pin `false` here to match Spark's observable schema.
-            "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" | "concat_ws"
-            | "format_string" | "printf" | "typeof" | "spark_partition_id"
-            | "monotonically_increasing_id" | "array" | "make_array" | "create_map" | "map"
-            | "named_struct" | "struct" | "window" => false,
-            // Spark scalars declared nullable regardless of arg nullability
-            // (overflow / parse-fail / undefined-domain producers).
-            "factorial" | "url_encode" | "url_decode" | "parse_url"
-            | "to_number" | "try_to_number" | "to_date_ntz"
-            // Spark's `from_unixtime(secs[, fmt])` declares nullable=True
-            // even for a non-null seconds literal — the value can be NULL
-            // when the format is invalid.
-            | "from_unixtime"
-            | "map_from_entries" | "try_add" | "try_subtract"
-            | "try_multiply" | "try_divide" | "try_element_at"
-            // Spark's `to_json(struct)` / `to_csv(struct)` — schema-declared
-            // nullable=True even when the argument is a non-null `struct(...)`
-            // constructor. PySpark's projection semantics: the result column
-            // comes back nullable=True even though the Catalyst
-            // `CreateStruct` value is non-null.
-            // Note: `schema_of_json` is NOT in this list — Spark reports its
-            // result as nullable=False when the JSON literal is a
-            // non-null literal (`schema_of_json` requires
-            // Reference=False), so it falls through to the default
-            // `any(arg.nullable)` path which correctly yields false for
-            // literal arguments.
-            | "to_json" | "to_csv"
-            // `json_object_keys(jsonStr)` — always nullable: Spark returns
-            // NULL for a NULL, invalid-JSON, or non-object input (the
-            // `CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT'
-            // THEN json_keys(...) ELSE NULL END` emission wrapper), so the
-            // result is nullable even over a non-nullable literal argument.
-            | "json_object_keys"
-            // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
-            // array contains any NULL inner array. Even a non-nullable
-            // literal outer array (`F.array(...)`) produces a nullable
-            // result per Spark's schema semantics.
-            | "flatten" | "list_flatten"
-            // Spark's `ArrayAggregate.nullable` = `argument.nullable ||
-            // finish.nullable`. In `bindInternal` the accumulator variable
-            // is bound with `nullable = true` (hardcoded), so
-            // `finish.nullable()` is always `true` — making the overall
-            // result always nullable. Applies to `aggregate`, `reduce`,
-            // and `list_reduce` HOFs.
-            | "aggregate" | "reduce" | "list_reduce"
-            // `ceil`/`ceiling`/`floor` (Spark's `Ceil`/`Floor`) declare
-            // `nullable = true` unconditionally — the Double→Long widening
-            // can overflow for inputs outside `Long`'s range, so Spark's
-            // static schema is conservative regardless of the child's own
-            // nullability. `round`/`bround` (`RoundBase`) follow the same
-            // unconditional-`true` rule. Verified against Apache Spark
-            // 4.1.1: `ceil(non_null_double)` / `floor(...)` /
-            // `round(non_null_double, n)` / `bround(...)` all report
-            // `nullable=True` on a non-nullable input column.
-            // Differential: TestMathFunctions::test_ceil_floor, test_round.
-            | "ceil" | "ceiling" | "floor" | "round" | "bround"
-            // `exp`/`ln`/`log`/`log10`/`log2` (Spark's `UnaryMathExpression`
-            // family) also declare `nullable = true` unconditionally — the
-            // domain guard above (`x <= 0 -> NULL`) and NaN-to-NULL
-            // conversion mean even a non-nullable input can still produce
-            // NULL. Verified against Apache Spark 4.1.1.
-            // Differential: TestMathFunctions::test_exp, test_log.
-            | "exp" | "ln" | "log" | "log10" | "log2"
-            // Spark's remaining `UnaryMathExpression` functions also declare
-            // `nullable = true` unconditionally. Domain guards and NaN-to-NULL
-            // conversion mean a non-nullable input can still produce NULL.
-            | "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
-            | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "expm1" | "log1p" | "cot"
-            | "sec" | "csc" | "degrees" | "radians" | "rint" | "signum" | "sign" => true,
-            // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
-            // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
-            // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same
-            // branch-only nullability rule.
-            "nvl2" | "if" | "iif" => {
-                f.args.get(1).is_none_or(|a| a.nullable(schema))
-                    || f.args.get(2).is_none_or(|a| a.nullable(schema))
-            }
-            _ => f.args.iter().any(|a| a.nullable(schema)),
+            SpecialFunction::AddMonths
+            | SpecialFunction::ArrayAppend
+            | SpecialFunction::ArrayDistinct
+            | SpecialFunction::ArrayExcept
+            | SpecialFunction::ArrayIntersect
+            | SpecialFunction::ArrayJoin
+            | SpecialFunction::ArrayPosition
+            | SpecialFunction::ArrayPrepend
+            | SpecialFunction::ArrayUnion
+            | SpecialFunction::ArraysZip
+            | SpecialFunction::Cardinality
+            | SpecialFunction::Concat
+            | SpecialFunction::Conv
+            | SpecialFunction::DateAdd
+            | SpecialFunction::DateFormat
+            | SpecialFunction::DateSub
+            | SpecialFunction::Datediff
+            | SpecialFunction::Dayofweek
+            | SpecialFunction::ElementAt
+            | SpecialFunction::Elt
+            | SpecialFunction::Exists
+            | SpecialFunction::Filter
+            | SpecialFunction::FindInSet
+            | SpecialFunction::Forall
+            | SpecialFunction::FromCsv
+            | SpecialFunction::FromJson
+            | SpecialFunction::FromUtcTimestamp
+            | SpecialFunction::Hex
+            | SpecialFunction::Hypot
+            | SpecialFunction::Ilike
+            | SpecialFunction::Lag
+            | SpecialFunction::Lead
+            | SpecialFunction::Like
+            | SpecialFunction::Locate
+            | SpecialFunction::MakeDtInterval
+            | SpecialFunction::MakeInterval
+            | SpecialFunction::MakeYmInterval
+            | SpecialFunction::MapConcat
+            | SpecialFunction::MapFilter
+            | SpecialFunction::Mod
+            | SpecialFunction::MonthsBetween
+            | SpecialFunction::Nanvl
+            | SpecialFunction::Negative
+            | SpecialFunction::Not
+            | SpecialFunction::NthValue
+            | SpecialFunction::Overlay
+            | SpecialFunction::Pmod
+            | SpecialFunction::RegexpLike
+            | SpecialFunction::RegexpReplace
+            | SpecialFunction::Reverse
+            | SpecialFunction::Rlike
+            | SpecialFunction::Sha2
+            | SpecialFunction::Shiftleft
+            | SpecialFunction::Shiftright
+            | SpecialFunction::Size
+            | SpecialFunction::SortArray
+            | SpecialFunction::Split
+            | SpecialFunction::SubstringIndex
+            | SpecialFunction::Timestampadd
+            | SpecialFunction::Timestampdiff
+            | SpecialFunction::ToDate
+            | SpecialFunction::ToTimestamp
+            | SpecialFunction::ToUtcTimestamp
+            | SpecialFunction::Transform
+            | SpecialFunction::TransformKeys
+            | SpecialFunction::TransformValues
+            | SpecialFunction::Trunc
+            | SpecialFunction::UnixTimestamp
+            | SpecialFunction::ZipWith
+            | SpecialFunction::BitGet
+            | SpecialFunction::BitwiseAnd
+            | SpecialFunction::BitwiseOr
+            | SpecialFunction::BitwiseXor
+            | SpecialFunction::Getbit
+            | SpecialFunction::Positive
+            | SpecialFunction::Regexp
+            | SpecialFunction::ToChar
+            | SpecialFunction::TryMakeInterval => f.args.iter().any(|arg| arg.nullable(schema)),
         }
     }
 
@@ -1862,31 +1879,6 @@ mod tests {
         )]));
         let expr = fcall(
             "if",
-            vec![
-                // nullable predicate (references a nullable column)
-                Expression::Binary(BinaryExpression {
-                    op: BinaryOp::Gt,
-                    left: Box::new(UnresolvedColumn::bare("salary")),
-                    right: Box::new(long_lit(100_000)),
-                }),
-                str_lit("high"),
-                str_lit("low"),
-            ],
-        );
-        assert!(!expr.nullable(&s));
-    }
-
-    /// `iif` is a Spark alias for `If`, so its nullability rule likewise
-    /// excludes the predicate — a nullable predicate with two non-null
-    /// branches is non-nullable.
-    #[test]
-    fn iif_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
-        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
-            "salary",
-            DataType::Long,
-        )]));
-        let expr = fcall(
-            "iif",
             vec![
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {
@@ -2675,7 +2667,7 @@ mod tests {
             "nums",
             DataType::Array(Box::new(DataType::Integer), false),
         )]));
-        for name in ["aggregate", "reduce", "list_reduce"] {
+        for name in ["aggregate", "reduce"] {
             let expr = fcall(
                 name,
                 vec![

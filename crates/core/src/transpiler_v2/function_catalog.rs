@@ -5,10 +5,10 @@
 //!
 //! INV10-safe: pure data, no runtime imports.
 
-/// Sorted, deduplicated lowercase names exposed through catalog APIs.
-/// Synthetic/internal names are excluded.
-pub const SUPPORTED_FUNCTIONS: &[&str] = &[
-    "abs",
+use super::function_registry;
+
+/// Unmigrated catalog spellings. Registry names must not appear here.
+pub const LEGACY_FUNCTIONS: &[&str] = &[
     "acos",
     "add_months",
     "aggregate",
@@ -25,7 +25,6 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "array_min",
     "array_position",
     "array_prepend",
-    "array_remove",
     "array_repeat",
     "array_union",
     "arrays_overlap",
@@ -34,17 +33,11 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "asin",
     "atan",
     "atan2",
-    "avg",
     "base64",
     "bin",
-    "bit_and",
     "bit_count",
     "bit_length",
-    "bit_or",
-    "bit_xor",
     "bitwise_not",
-    "bool_and",
-    "bool_or",
     "bround",
     "cardinality",
     "cast",
@@ -53,21 +46,12 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "ceiling",
     "char_length",
     "coalesce",
-    "collect_list",
-    "collect_set",
     "concat",
     "concat_ws",
     "contains",
     "conv",
-    "corr",
     "cos",
     "cosh",
-    "count",
-    "count_distinct",
-    "count_if",
-    "covar_pop",
-    "covar_samp",
-    "crc32",
     "create_map",
     "current_date",
     "current_timestamp",
@@ -86,14 +70,10 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "endswith",
     "exists",
     "exp",
-    "explode",
-    "explode_outer",
     "extract",
     "factorial",
     "filter",
     "find_in_set",
-    "first",
-    "first_value",
     "flatten",
     "floor",
     "forall",
@@ -103,9 +83,6 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "from_unixtime",
     "from_utc_timestamp",
     "greatest",
-    "grouping",
-    "grouping_id",
-    "hash",
     "hex",
     "hour",
     "hypot",
@@ -113,17 +90,11 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "ifnull",
     "ilike",
     "initcap",
-    "inline",
-    "inline_outer",
     "instr",
     "isnan",
     "isnotnull",
     "isnull",
-    "json_tuple",
-    "kurtosis",
     "lag",
-    "last",
-    "last_value",
     "lead",
     "least",
     "left",
@@ -152,14 +123,9 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "map_keys",
     "map_values",
     "map_zip_with",
-    "max",
     "md5",
-    "mean",
-    "median",
-    "min",
     "minute",
     "mod",
-    "mode",
     "month",
     "months_between",
     "named_struct",
@@ -173,11 +139,7 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "nvl2",
     "overlay",
     "parse_url",
-    "percentile",
-    "percentile_approx",
     "pmod",
-    "posexplode",
-    "posexplode_outer",
     "pow",
     "power",
     "quarter",
@@ -210,23 +172,15 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "sin",
     "sinh",
     "size",
-    "skewness",
     "slice",
     "sort_array",
     "split",
     "sqrt",
-    "stack",
     "starts_with",
     "startswith",
-    "std",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
     "struct",
     "substr",
     "substring",
-    "sum",
-    "sum_distinct",
     "tan",
     "tanh",
     "timestampadd",
@@ -253,9 +207,6 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
     "upper",
     "url_decode",
     "url_encode",
-    "var_pop",
-    "var_samp",
-    "variance",
     "week",
     "weekofyear",
     "window",
@@ -271,14 +222,21 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
 /// production `FunctionCall` names are canonicalized earlier.
 pub fn is_supported_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    SUPPORTED_FUNCTIONS
-        .binary_search_by(|probe| probe.cmp(&&*lower))
-        .is_ok()
+    function_registry::lookup(&lower).is_some()
+        || LEGACY_FUNCTIONS
+            .binary_search_by(|probe| probe.cmp(&&*lower))
+            .is_ok()
 }
 
 /// Returns a sorted iterator over τ's supported function names.
 pub fn supported_function_names() -> impl Iterator<Item = &'static str> {
-    SUPPORTED_FUNCTIONS.iter().copied()
+    let mut names: Vec<_> = LEGACY_FUNCTIONS
+        .iter()
+        .copied()
+        .chain(function_registry::function_names())
+        .collect();
+    names.sort_unstable();
+    names.into_iter()
 }
 
 #[cfg(test)]
@@ -288,11 +246,11 @@ mod tests {
     #[test]
     fn supported_functions_is_sorted_and_deduped() {
         let mut prev: Option<&str> = None;
-        for &name in SUPPORTED_FUNCTIONS {
+        for &name in LEGACY_FUNCTIONS {
             if let Some(p) = prev {
                 assert!(
                     p < name,
-                    "SUPPORTED_FUNCTIONS is not sorted/deduped: \
+                    "LEGACY_FUNCTIONS is not sorted/deduped: \
                      `{p}` appears before `{name}`"
                 );
             }
@@ -331,9 +289,16 @@ mod tests {
     #[test]
     fn supported_function_names_yields_sorted() {
         let names: Vec<&str> = supported_function_names().collect();
-        assert_eq!(names.len(), SUPPORTED_FUNCTIONS.len());
-        for (i, name) in names.iter().enumerate() {
-            assert_eq!(*name, SUPPORTED_FUNCTIONS[i]);
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn legacy_and_registry_are_disjoint() {
+        for name in function_registry::function_names() {
+            assert!(
+                LEGACY_FUNCTIONS.binary_search(&name).is_err(),
+                "duplicate `{name}`"
+            );
         }
     }
 }

@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::function_registry::{self, NullRule};
 use super::generator::Generator;
 use super::identifier::Qualifier;
 use super::name_fold::eq_fold;
@@ -1155,7 +1156,7 @@ impl Expression {
             "to_number" | "try_to_number" if f.args.len() == 2 => {
                 if let Some(fmt) = as_string_literal(&f.args[1]) {
                     if let Some((precision, scale)) =
-                        super::emission::parse_number_format_for_type_inference(fmt)
+                        super::function_literals::parse_number_format(fmt)
                     {
                         return DataType::Decimal { precision, scale };
                     }
@@ -1170,9 +1171,9 @@ impl Expression {
             name @ ("from_json" | "from_csv") if f.args.len() == 2 => {
                 if let Some(ddl) = as_string_literal(&f.args[1]) {
                     let st = if name == "from_json" {
-                        super::emission::from_json_ddl_to_struct_for_type_inference(ddl)
+                        super::function_literals::parse_from_json_schema(ddl)
                     } else {
-                        super::emission::from_csv_ddl_to_struct(ddl)
+                        super::function_literals::parse_from_csv_schema(ddl)
                     };
                     if let Some(st) = st {
                         return DataType::Struct(st);
@@ -1236,33 +1237,20 @@ impl Expression {
         TypeInferenceEngine::function_return_type(&f.name, &args)
     }
 
-    /// Names in this list report `nullable = false` regardless of arg nullability.
-    ///
-    /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
-    /// `debug_assert!` this; release builds trust the contract to avoid an
-    /// unnecessary allocation.
-    ///
-    /// Contains the count family and the hash family. Extending this list requires adding to the
-    /// symmetric-omission tests (§8) as well.
-    fn is_non_nullable_function_name_lower(name_lower: &str) -> bool {
-        debug_assert!(
-            name_lower.chars().all(|c| !c.is_ascii_uppercase()),
-            "is_non_nullable_function_name_lower requires pre-lowercased input; got `{name_lower}`",
-        );
-        // Non-nullable aggregates come from the AGG_SPECS table; the hash
-        // family is the only non-aggregate addition.
-        TypeInferenceEngine::aggregate_is_non_nullable_lower(name_lower)
-            || matches!(name_lower, "hash" | "murmur3" | "xxhash64")
-    }
-
     fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
-        // `f.name` is already canonical lowercase; the match below only reads it.
         let lower: &str = f.name.as_str();
-        if Self::is_non_nullable_function_name_lower(lower) {
-            return false;
+        let registered_rule = function_registry::aggregate_spec(lower)
+            .map(|spec| spec.nullability)
+            .or_else(|| function_registry::scalar_spec(lower).map(|spec| spec.nullability));
+        if let Some(rule) = registered_rule {
+            return match rule {
+                NullRule::Always => true,
+                NullRule::AnyArgument => f.args.iter().any(|arg| arg.nullable(schema)),
+                NullRule::Never => false,
+            };
         }
-        if TypeInferenceEngine::aggregate_is_always_nullable_lower(lower) {
-            return true;
+        if matches!(lower, "murmur3" | "xxhash64") {
+            return false;
         }
         match lower {
             "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
@@ -1802,9 +1790,8 @@ pub(super) fn apply_update_fields_ops<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::type_inference::{
-        aggregate_classifier_names, CORR_FAMILY_NAMES, HASH_FAMILY_NAMES,
-    };
+    use super::super::function_registry;
+    use super::super::type_inference::{CORR_FAMILY_NAMES, HASH_FAMILY_NAMES};
     use super::*;
 
     fn int_lit(v: i32) -> Expression {
@@ -2084,15 +2071,14 @@ mod tests {
 
     /// §8.2 — every name where `aggregate_is_non_nullable` is `true` must
     /// produce a `FunctionCall` that reports `nullable == false`.
-    /// (Rewritten for the AGG_SPECS table: iterates the classifier column in
-    /// place of the retired `AGGREGATE_NAMES` const — same membership.)
+    /// The live registry supplies the aggregate set.
     #[test]
     fn function_call_nullable_lists_are_symmetric_with_aggregate_is_non_nullable() {
         let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "x",
             DataType::Long,
         )]));
-        for name in aggregate_classifier_names() {
+        for name in function_registry::aggregate_names() {
             if !TypeInferenceEngine::aggregate_is_non_nullable(name) {
                 continue;
             }

@@ -113,17 +113,7 @@ fn inv5_schema_everywhere() {
     }
 }
 
-// ── INV6 (deferred — extension targets exist) ─────────────────────────────────
-
-/// DEFER INV6: every entry in `extension_targets()` MUST resolve
-/// against `duckdb_functions()` in a loaded extension session. Activation
-/// opens a session, loads the extension, and asserts the allow-list
-/// is a subset of the loaded function catalog.
-#[test]
-#[ignore]
-fn inv6_extension_targets_exist() {
-    todo!("INV6 activation requires extension_targets() + duckdb_functions() check")
-}
+// INV6 is enforced in `runtime::extension_loader`, avoiding a τ → runtime edge.
 
 // ── INV7 — OMITTED per ADR-022 §CV.5 ─────────────────────────────────────────
 

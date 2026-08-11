@@ -1006,11 +1006,28 @@ fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
 #[cfg(test)]
 mod tests {
     use super::configure_s3_credential_chain;
+    use super::DuckDbSession;
     use super::NEXT_DAY_MACRO_SQL;
     use super::SPARK_CRC32_MACRO_SQL;
+    use crate::transpiler_v2::function_registry::SessionFunction;
 
     fn fresh_conn() -> duckdb::Connection {
         duckdb::Connection::open_in_memory().expect("in-memory connection")
+    }
+
+    #[tokio::test]
+    async fn every_emitted_session_target_exists_after_startup() {
+        let session = DuckDbSession::spawn("function-registry-targets").expect("spawn session");
+        for target in SessionFunction::ALL {
+            let sql = format!(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM duckdb_functions() \
+                 WHERE function_name = '{}') THEN 1 ELSE error('missing session target') END",
+                target.as_str()
+            );
+            session.execute(&sql).await.unwrap_or_else(|error| {
+                panic!("missing session target `{}`: {error}", target.as_str())
+            });
+        }
     }
 
     /// Open a plain in-memory DuckDB connection and register the CRC-32

@@ -23,12 +23,19 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::function_literals::{
+    parse_from_csv_schema, parse_from_json_schema, parse_number_format,
+};
+use super::function_registry::{
+    self, AggregateEmission, AggregateSpecial, ExtensionFunction, ScalarEmission, ScalarSpec,
+    ScalarSpecial,
+};
 use super::generator::{Generator, GeneratorKind};
 pub(crate) use super::identifier::quote_ident;
 use super::identifier::Qualifier;
 use super::name_fold::{eq_fold, fold_key};
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
-use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
+use super::type_inference::TypeInferenceEngine;
 use crate::types::pyspark_parity::uniquify;
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
@@ -3219,9 +3226,7 @@ fn render_group_exprs(
 }
 
 fn is_aggregate_name(name: &str) -> bool {
-    // Classifier roster lives in the `AGG_SPECS` table (`type_inference.rs`);
-    // the lookup is case-insensitive without allocating a lowercased `String`.
-    is_aggregate_classifier_name(name)
+    function_registry::is_aggregate(name)
 }
 
 /// Wrap a rendered format-string expression (typically a string literal, but
@@ -3766,12 +3771,12 @@ fn render_ceil_floor(
 /// keep-arity, shared by the two trim sites. The sites' trim GUARDS are
 /// deliberately divergent — do NOT unify them without a corpus witness:
 ///
-/// * [`render_function_call`] (reached by `nth_value`/`lag`/`lead`, whose
-///   aggregate-classifier bit is false) trims ONLY when every extra trailing
+/// * [`render_function_call`] (reached by scalar/window-only
+///   `nth_value`/`lag`/`lead`) trims ONLY when every extra trailing
 ///   arg is a boolean literal — it never drops a real value. Anchor: corpus
 ///   win-006.
 /// * [`render_aggregate`] (reached by `first`/`last`/`first_value`/
-///   `last_value`, which the classifier routes there) trims UNCONDITIONALLY
+///   `last_value`, which the registry marks aggregate) trims UNCONDITIONALLY
 ///   whenever extra args are present (corpus uses ignorenulls=True, which
 ///   matches DuckDB's default).
 fn trailing_ignore_nulls_keep_arity(name_lower: &str) -> Option<usize> {
@@ -3809,6 +3814,35 @@ fn needs_date_return_cast(f: &FunctionCall) -> bool {
     }
 }
 
+fn render_registered_scalar(
+    f: &FunctionCall,
+    spec: &ScalarSpec,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let target = match spec.emission {
+        ScalarEmission::Special(special) => {
+            return match special {
+                ScalarSpecial::SubstringIndex => {
+                    let [value, delimiter, count] =
+                        exact_args(f, schema, "`substring_index` requires exactly 3 arguments")?;
+                    Ok(format!(
+                    "CASE WHEN ({count}) >= 0 \
+                     THEN array_to_string(list_slice(string_split({value}, {delimiter}), 1, ({count})), {delimiter}) \
+                     ELSE array_to_string(list_slice(string_split({value}, {delimiter}), ({count}), -1), {delimiter}) \
+                     END"
+                ))
+                }
+            }
+        }
+        ScalarEmission::Extension(target) => target.as_str(),
+        ScalarEmission::Native => f.name.as_str(),
+        ScalarEmission::Rename(target) => target.as_str(),
+        ScalarEmission::Session(target) => target.as_str(),
+    };
+    let args = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
+    Ok(format!("{target}({args})"))
+}
+
 fn render_function_call_dispatch(
     f: &FunctionCall,
     schema: &Schema,
@@ -3817,10 +3851,6 @@ fn render_function_call_dispatch(
     // rather than cloning (post-N5, no re-derivation is needed; the ~1900-
     // line match below reads it, never mutates or moves it).
     let name_lower: &str = f.name.as_str();
-    // Aggregate-name overlap check — if the analyzer classified a FunctionCall
-    // as aggregate, `render_expr` routes to `render_aggregate` before this
-    // function; anything reaching here is scalar by construction. Defense in
-    // depth: any name in the classifier roster should never be seen here.
     // Window-only functions with a trailing `ignoreNulls` argument that PySpark
     // serializes verbatim — DuckDB's `nth_value(col, n)` / `lag`/`lead`/
     // `first_value`/`last_value` do not accept the boolean flag. Drop the
@@ -3844,6 +3874,9 @@ fn render_function_call_dispatch(
                 }
             }
         }
+    }
+    if let Some(spec) = function_registry::scalar_spec(name_lower) {
+        return render_registered_scalar(f, spec, schema);
     }
     let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     // Handful of Spark-name → DuckDB-name remappings where the direct
@@ -3914,34 +3947,6 @@ fn render_function_call_dispatch(
             let [needle, haystack] = min_args(f, schema, "`locate` requires at least 2 arguments")?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
-        // Spark's `btrim(str[, trimStr])` trims characters in `trimStr`
-        // (default: whitespace) from both ends of `str`. DuckDB's `trim`
-        // has the identical signature and semantics — same name, same arg
-        // order; just rename.
-        "btrim" => "trim",
-        // Spark's `substring_index(str, delim, count)` returns the substring
-        // of `str` before the `count`-th occurrence of `delim`: `count > 0`
-        // counts from the left (keep the first `count` delimited pieces),
-        // `count < 0` counts from the right (keep the last `|count|`
-        // pieces), `count == 0` yields an empty string. DuckDB has no
-        // direct equivalent; emulate via `string_split` + `list_slice` +
-        // `array_to_string`. `list_slice` clamps out-of-range bounds (a
-        // count larger than the number of occurrences returns the whole
-        // list, matching Spark) and propagates NULL through a NULL `str`
-        // unchanged, so no separate NULL guard is needed. Empirically
-        // verified against live Spark 4.1.1 for count > 0 / < 0 / == 0, a
-        // count exceeding the occurrence count, and `delim` absent from
-        // `str`. Corpus: `test_substring_index`.
-        "substring_index" => {
-            let [s, delim, count] =
-                exact_args(f, schema, "`substring_index` requires exactly 3 arguments")?;
-            return Ok(format!(
-                "CASE WHEN ({count}) >= 0 \
-                 THEN array_to_string(list_slice(string_split({s}, {delim}), 1, ({count})), {delim}) \
-                 ELSE array_to_string(list_slice(string_split({s}, {delim}), ({count}), -1), {delim}) \
-                 END"
-            ));
-        }
         // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
         // 0..6 (Sunday=0). Add 1 to align with Spark.
         "dayofweek" => {
@@ -4000,25 +4005,13 @@ fn render_function_call_dispatch(
         // Spark → thdck_spark_funcs extension remaps.
         // These functions require the ext6 extension, loaded at session
         // start by `DuckDbSession`.
-        "hash" | "murmur3" => "spark_hash",
-        "xxhash64" => "spark_xxhash64",
-        "try_divide" => "spark_try_divide",
-        // Spark's `crc32(binary)` — no `spark_crc32` in `thdck_spark_funcs`
-        // ext6, so τ ships a bit-exact CRC-32-IEEE session macro
-        // (`java.util.zip.CRC32` emulation) registered by
-        // `DuckDbSession::spawn`. Long-term the C++ extension may absorb this;
-        // the dispatch arm stays either way. Corpus: `hash-001`.
-        "crc32" => "spark_crc32",
-        "spark_hash" => "spark_hash",
-        "spark_xxhash64" => "spark_xxhash64",
-        "spark_try_divide" => "spark_try_divide",
-        "spark_try_sum" => "spark_try_sum",
-        "spark_try_avg" => "spark_try_avg",
-        "spark_decimal_div" => "spark_decimal_div",
+        "murmur3" => ExtensionFunction::Hash.as_str(),
+        "xxhash64" => ExtensionFunction::XxHash64.as_str(),
+        "try_divide" => ExtensionFunction::TryDivide.as_str(),
         // Spark's `schema_of_json(json_str)` — DuckDB has no native
         // equivalent that returns Spark-DDL. The `thdck_spark_funcs`
         // extension provides `spark_schema_of_json`. Corpus: `json-006`.
-        "schema_of_json" => "spark_schema_of_json",
+        "schema_of_json" => ExtensionFunction::SchemaOfJson.as_str(),
         // Spark's `to_json(col[, options])` runs `JacksonGenerator` with
         // `SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true` by default, which
         // omits object entries whose value is JSON `null` at every nesting
@@ -5396,7 +5389,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         "from_csv" if f.args.len() == 2 => {
             let csv_str = render_expr(&f.args[0], schema)?;
             if let Some(ddl) = literal_string_arg(&f.args[1]) {
-                if let Some(st) = from_csv_ddl_to_struct(&ddl) {
+                if let Some(st) = parse_from_csv_schema(&ddl) {
                     let parts = sql_join(st.fields.iter().enumerate(), ", ", |(i, field)| {
                         let idx = i + 1;
                         let split = format!("split_part({csv_str}, ',', {idx})");
@@ -5620,7 +5613,10 @@ fn render_decimal_avg(
     let arg_type = f.args[0].data_type(schema);
     let distinct = if f.distinct { "DISTINCT " } else { "" };
     let arg_sql = render_expr(&f.args[0], schema)?;
-    let inner = format!("spark_avg({distinct}{arg_sql})");
+    let inner = format!(
+        "{}({distinct}{arg_sql})",
+        ExtensionFunction::Average.as_str()
+    );
     let inner = match over {
         Some(o) => format!("{inner} {o}"),
         None => inner,
@@ -5636,193 +5632,74 @@ fn render_decimal_avg(
 /// its own outer CAST. Unknown aggregate names surface as a `Function`-kinded
 /// Thunderduck-boundary [`EmissionError::Unsupported`] per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
-    // N5: `f.name` is already canonical lowercase — `lower` is kept as an
-    // owned `String` (not renamed to a borrow) so the rest of this function,
-    // which threads it through several `&lower` / `format!` sites, needs no
-    // further edits.
-    let lower = f.name.clone();
-    // Guard-based arms MUST come before the pass-through arm (else the
-    // pass-through catches `first`/`last` first and the guard never fires).
-    if matches!(
-        lower.as_str(),
-        "first" | "last" | "first_value" | "last_value"
-    ) && f.args.len() >= 2
-    {
-        // Spark's `first(col, ignorenulls)` / `last(col, ignorenulls)` —
-        // DuckDB's first/last are single-arg. Drop the ignorenulls flag
-        // UNCONDITIONALLY (corpus uses ignorenulls=True which matches
-        // DuckDB's default); keep-arity is single-homed in
-        // [`trailing_ignore_nulls_keep_arity`] — see its doc for the
-        // deliberate guard divergence from `render_function_call`.
-        if let Some(keep) = trailing_ignore_nulls_keep_arity(&lower) {
-            let distinct = if f.distinct { "DISTINCT " } else { "" };
-            let parts = sql_join(f.args.iter().take(keep), ", ", |arg| {
-                render_expr(arg, schema)
-            })?;
-            return Ok(format!("{lower}({distinct}{parts})"));
+    let lower = f.name.as_str();
+    let Some(spec) = function_registry::aggregate_spec(lower) else {
+        bail_boundary_fn!(
+            f.name.clone(),
+            "aggregate function not present in the live function registry",
+        );
+    };
+    let (duck_name, force_distinct) = match spec.emission {
+        AggregateEmission::Native => (lower, false),
+        AggregateEmission::Rename(target) => (target.as_str(), false),
+        AggregateEmission::Extension(target) => (target.as_str(), false),
+        AggregateEmission::Session(target) => (target.as_str(), false),
+        AggregateEmission::Distinct(target) => (target.as_str(), true),
+        AggregateEmission::Special(AggregateSpecial::FirstLast) => {
+            if f.args.len() >= 2 {
+                let keep = trailing_ignore_nulls_keep_arity(lower)
+                    .expect("FirstLast registry rows have a keep-arity rule");
+                let distinct = if f.distinct { "DISTINCT " } else { "" };
+                let args = sql_join(f.args.iter().take(keep), ", ", |arg| {
+                    render_expr(arg, schema)
+                })?;
+                return Ok(format!("{lower}({distinct}{args})"));
+            }
+            (lower, false)
         }
-    }
-    // Spark's `percentile_approx(col, quantile [, accuracy])` returns the
-    // discrete value at the requested percentile — for a small dataset,
-    // this matches the value at the ceil(q * n)-th sorted position, not
-    // the linear-interpolation continuous median. Map to DuckDB's
-    // `quantile_disc(col, quantile)` for exact Spark parity on the
-    // sample size the corpus witnesses use. Drop the optional accuracy arg.
-    // CAST the quantile to DOUBLE since Spark sends it as Decimal.
-    // Corpus witness: `agg-013` (percentile_approx returns 88000 for
-    // 8-row salary sample; `approx_quantile` returned 91500).
-    if (lower == "percentile_approx" || lower == "approx_percentile") && f.args.len() >= 2 {
-        let col = render_expr(&f.args[0], schema)?;
-        let q = render_expr(&f.args[1], schema)?;
-        return Ok(format!("quantile_disc({col}, CAST({q} AS DOUBLE))"));
-    }
-    // Spark `percentile(col, p)` = exact CONTINUOUS (linear-interpolation)
-    // quantile → DuckDB `quantile_cont` (percentile_approx above uses
-    // `quantile_disc` = discrete sample value). CAST the quantile to DOUBLE
-    // since Spark sends it as Decimal. Corpus witness: `agg-019`
-    // (percentile(salary, 0.5) = 91500 continuous, not 88000 discrete).
-    if lower == "percentile" && f.args.len() >= 2 {
-        let col = render_expr(&f.args[0], schema)?;
-        let q = render_expr(&f.args[1], schema)?;
-        return Ok(format!("quantile_cont({col}, CAST({q} AS DOUBLE))"));
-    }
-    // Spark `avg`/`mean` over a DECIMAL argument — DuckDB's native `avg`
-    // returns DOUBLE over a DECIMAL input (precision loss vs Spark, which
-    // widens to a wider DECIMAL per `AggRet::AvgLike`). Route through the
-    // ext6 extension's `spark_avg`, which already returns DECIMAL natively
-    // (re-honors rearchitect ADR-020; `try_avg` from the same extension
-    // family is wired above at the `try_avg` arm). Guard MUST come before
-    // the `"avg" | "mean"` pass-through arm below (else the pass-through
-    // catches it first). Integer/float `avg` and `try_avg` are untouched —
-    // `is_decimal_avg` only fires on a single DECIMAL argument.
-    if is_decimal_avg(f, schema) {
-        return render_decimal_avg(f, None, schema);
-    }
-    let (duck_name, force_distinct) = match lower.as_str() {
-        // Direct pass-through — DuckDB accepts the Spark name unchanged.
-        "count"
-        | "sum"
-        | "avg"
-        | "mean"
-        | "min"
-        | "max"
-        | "first"
-        | "last"
-        | "first_value"
-        | "last_value"
-        | "any_value"
-        | "approx_count_distinct"
-        | "stddev"
-        | "stddev_samp"
-        | "stddev_pop"
-        | "variance"
-        | "var_samp"
-        | "var_pop"
-        | "bit_and"
-        | "bit_or"
-        | "bit_xor"
-        | "bool_and"
-        | "bool_or"
-        | "corr"
-        | "covar_samp"
-        | "covar_pop"
-        | "regr_slope"
-        | "regr_r2"
-        | "regr_intercept"
-        | "regr_avgx"
-        | "regr_avgy"
-        | "regr_sxx"
-        | "regr_sxy"
-        | "regr_syy"
-        | "median"
-        // `collect_list` / `collect_set` are macro-backed (registered at
-        // session startup: collect_list → LIST(x) FILTER (WHERE x IS NOT
-        // NULL), collect_set → LIST(DISTINCT x) FILTER (...)), not
-        // DuckDB-native aggregates. Pass the name through verbatim;
-        // force_distinct stays false — collect_set's DISTINCT lives inside
-        // the macro and Spark never sets distinct=true here.
-        | "collect_list"
-        | "collect_set"
-        | "grouping"
-        | "grouping_id" => (lower.as_str(), false),
-        // Spark's population-formula `skewness` — DuckDB's `skewness` uses
-        // the sample formula. The ext6 extension provides `spark_skewness`
-        // with Spark-parity semantics (checklist §4.1).
-        "skewness" => ("spark_skewness", false),
-        // Spark's `max_by(x, y)` / `min_by(x, y)` return the VALUE at the
-        // ordering-extreme row even when that value is NULL. DuckDB's
-        // `arg_max`/`arg_min` instead SKIP rows whose value arg is NULL —
-        // wrong-scalar divergence, not just a naming difference. DuckDB's
-        // `arg_max_null`/`arg_min_null` match Spark's null-at-extreme
-        // semantics exactly (verified empirically: `arg_max_null(name, val)`
-        // over `('a',1),(NULL,5),('c',0),(NULL,-2)` returns NULL — the value
-        // at the max `val` row, which is NULL). Args pass through unchanged
-        // via `args_sql` below (same 2-arg shape: value column, ordering
-        // column).
-        "max_by" => ("arg_max_null", false),
-        "min_by" => ("arg_min_null", false),
-        // Spark's `kurtosis` uses the population formula; DuckDB has
-        // `kurtosis_pop` for that (native, not via extension).
-        "kurtosis" => ("kurtosis_pop", false),
-        // Additional aggregates: percentile_approx / approx_percentile /
-        // mode / any / every / some / all.
-        // percentile_approx handled with an explicit arm below.
-        // Spark's `mode(col[, ignoreNulls])` — DuckDB's `mode` is single-arg
-        // and rejects BOOLEAN. Drop the trailing boolean-literal
-        // `ignoreNulls` flag (corpus default), and CAST-wrap boolean args
-        // to INTEGER (with an outer CAST back to BOOLEAN). Anchors:
-        // corpus `agg-014` (`mode(active, false)` on BOOLEAN column).
-        "mode" => {
-            // Extract the first arg; drop any trailing boolean-literal flags.
-            let first = f.args.first().cloned();
-            let trailing_bool_only = f.args.iter().skip(1).all(|e| bool_literal(e).is_some());
-            if let Some(arg) = first {
-                if trailing_bool_only {
-                    let distinct = if f.distinct { "DISTINCT " } else { "" };
-                    // Peek through any wrapping Alias for the type check.
-                    let inner = arg.unaliased();
-                    let a = render_expr(inner, schema)?;
-                    // Boolean sniff: either the analyzer-resolved type is
-                    // Boolean, OR the argument is a boolean literal.
-                    let is_bool = matches!(inner.data_type(schema), DataType::Boolean)
-                        || bool_literal(inner).is_some();
-                    if is_bool {
-                        return Ok(format!(
-                            "CAST(mode({distinct}CAST({a} AS INTEGER)) AS BOOLEAN)"
-                        ));
-                    }
-                    return Ok(format!("mode({distinct}{a})"));
+        AggregateEmission::Special(AggregateSpecial::ApproxPercentile) => {
+            let [value, quantile] =
+                min_args(f, schema, "percentile_approx requires at least 2 arguments")?;
+            return Ok(format!(
+                "quantile_disc({value}, CAST({quantile} AS DOUBLE))"
+            ));
+        }
+        AggregateEmission::Special(AggregateSpecial::Percentile) => {
+            let [value, quantile] =
+                min_args(f, schema, "percentile requires at least 2 arguments")?;
+            return Ok(format!(
+                "quantile_cont({value}, CAST({quantile} AS DOUBLE))"
+            ));
+        }
+        AggregateEmission::Special(AggregateSpecial::Average) => {
+            if is_decimal_avg(f, schema) {
+                return render_decimal_avg(f, None, schema);
+            }
+            (lower, false)
+        }
+        AggregateEmission::Special(AggregateSpecial::Mode) => {
+            let [arg] = min_args(f, schema, "mode requires at least 1 argument")?;
+            if f.args
+                .iter()
+                .skip(1)
+                .all(|expr| bool_literal(expr).is_some())
+            {
+                let distinct = if f.distinct { "DISTINCT " } else { "" };
+                let input = f.args[0].unaliased();
+                if matches!(input.data_type(schema), DataType::Boolean)
+                    || bool_literal(input).is_some()
+                {
+                    return Ok(format!(
+                        "CAST(mode({distinct}CAST({arg} AS INTEGER)) AS BOOLEAN)"
+                    ));
                 }
+                return Ok(format!("mode({distinct}{arg})"));
             }
-            ("mode", false)
+            (lower, false)
         }
-        "any" | "some" => ("bool_or", false),
-        "every" | "all" => ("bool_and", false),
-        // `try_sum` / `try_avg` — ext6 extension arms.
-        "try_sum" => ("spark_try_sum", false),
-        "try_avg" => ("spark_try_avg", false),
-        "std" => ("stddev", false),
-        // Spark's `count_if(cond)` → DuckDB `count(*) FILTER (WHERE cond)`
-        // or simpler `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. DuckDB accepts
-        // `count_if` in recent versions, but safest to lower.
-        "count_if" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`count_if` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!("SUM(CASE WHEN {a} THEN 1 ELSE 0 END)"));
-        }
-        // Spark's `mean` is an alias for `avg`; DuckDB accepts both — treat
-        // both identically above. `count_distinct` and `sum_distinct` lower
-        // to DISTINCT-flagged calls.
-        "count_distinct" => ("count", true),
-        "sum_distinct" => ("sum", true),
-        // Non-primitive aggregates surface as Thunderduck-boundary.
-        _ => {
-            bail_boundary_fn!(
-                f.name.clone(),
-                "aggregate function not yet in the primitive arm set",
-            );
+        AggregateEmission::Special(AggregateSpecial::CountIf) => {
+            let [arg] = exact_args(f, schema, "`count_if` requires exactly 1 argument")?;
+            return Ok(format!("SUM(CASE WHEN {arg} THEN 1 ELSE 0 END)"));
         }
     };
     // Zero-arg aggregate calls are legal for a handful of Spark functions
@@ -6081,7 +5958,10 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
             } else {
                 format!("CAST(({r}) AS {rty})")
             };
-            return Ok(format!("spark_decimal_div({lsql}, {rsql})"));
+            return Ok(format!(
+                "{}({lsql}, {rsql})",
+                ExtensionFunction::DecimalDivide.as_str()
+            ));
         }
     }
     let op = match b.op {
@@ -6480,17 +6360,6 @@ fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
     }
 }
 
-/// Parse a Spark numeric format string (as used by `to_number` /
-/// `try_to_number`) into `(precision, scale)`. Supports only the common
-/// digit-template shape composed of `9` and `0` optionally split by a
-/// single `.` (e.g. `"999.99"` → `(5, 2)`). Returns `None` for any format
-/// that carries grouping / sign / currency markers.
-///
-/// The `parse-004` shape exercises this accepted digit-template form.
-pub(crate) fn parse_number_format_for_type_inference(fmt: &str) -> Option<(u8, u8)> {
-    parse_number_format(fmt)
-}
-
 /// Parse Spark's `F.window` duration-literal grammar for the 2-arg tumbling
 /// form: `"N unit"` where `N` is a positive integer and `unit ∈
 /// {second, minute, hour, day, week}` (singular or plural, case-insensitive).
@@ -6537,39 +6406,6 @@ pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static st
     Some((n, canonical))
 }
 
-/// Parse a Spark DDL schema string (field list, e.g. `"a INT, b
-/// ARRAY<STRING>"`, or `struct<...>` wrapper) into a [`StructType`] with the
-/// shared strict Spark-DDL parser. Returns `None` when τ cannot translate the
-/// DDL, allowing callers to report the unsupported schema at the boundary.
-///
-/// The grammar covers decimal, interval, null/void, primitive aliases, NOT
-/// NULL qualifiers, and the `struct<...>` wrapper form; unknown types still
-/// yield `None` so callers can report the unsupported schema at the boundary.
-pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<StructType> {
-    crate::types::spark_ddl::parse_spark_schema(ddl)
-}
-
-/// Parse a Spark DDL schema string for `from_csv`. Spark's
-/// `from_csv` accepts only flat primitive schemas (no nested STRUCT / ARRAY
-/// / MAP) — this helper enforces that narrower surface so we fail loud on
-/// shapes Spark itself would reject. Returns `None` when τ cannot translate
-/// the DDL. The `json-007` shape exercises this path.
-pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
-    let st = crate::types::spark_ddl::parse_spark_schema(ddl)?;
-    // from_csv is flat-only: reject nested/composite types (Spark
-    // itself would reject these too — from_csv operates row-per-row on
-    // a single delimited line).
-    if st.fields.iter().any(|f| {
-        matches!(
-            f.data_type,
-            DataType::Struct(_) | DataType::Array(_, _) | DataType::Map { .. }
-        )
-    }) {
-        return None;
-    }
-    Some(st)
-}
-
 /// Translate a Spark DDL field-list schema (as used by `from_json`,
 /// e.g. `"a INT, b ARRAY<STRING>, c STRUCT<d:BOOLEAN>"`) into a DuckDB
 /// JSON-schema object literal (e.g.
@@ -6589,11 +6425,11 @@ pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
 /// The `json-003` and `json-004` shapes exercise this path.
 ///
 /// Parses ONCE via the typed DDL parser
-/// ([`from_json_ddl_to_struct_for_type_inference`], the same grammar the
+/// ([`parse_from_json_schema`], the same grammar the
 /// type-inference side uses) and renders the JSON schema from the resulting
 /// [`StructType`] directly.
 fn spark_ddl_schema_to_duckdb_json(ddl: &str) -> Option<String> {
-    let st = from_json_ddl_to_struct_for_type_inference(ddl)?;
+    let st = parse_from_json_schema(ddl)?;
     struct_type_to_duckdb_json(&st)
 }
 
@@ -6654,38 +6490,6 @@ fn duckdb_primitive_name(dt: &DataType) -> Option<&'static str> {
         DataType::Timestamp | DataType::TimestampNtz => Some("TIMESTAMP"),
         _ => None,
     }
-}
-
-fn parse_number_format(fmt: &str) -> Option<(u8, u8)> {
-    let trimmed = fmt.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut pre = 0u32;
-    let mut post = 0u32;
-    let mut seen_dot = false;
-    for ch in trimmed.chars() {
-        match ch {
-            '9' | '0' => {
-                if seen_dot {
-                    post += 1;
-                } else {
-                    pre += 1;
-                }
-            }
-            '.' if !seen_dot => seen_dot = true,
-            // Grouping separator (Spark's `G` / `,`): permitted only in the
-            // integer part; contributes no digit slot to precision or scale.
-            // Corpus witness: `parse-003` uses `'9,999.99'`.
-            ',' if !seen_dot => {}
-            _ => return None,
-        }
-    }
-    let precision_u32 = pre + post;
-    if precision_u32 == 0 || precision_u32 > 38 {
-        return None;
-    }
-    Some((precision_u32 as u8, post as u8))
 }
 
 /// Render the `try_cast(<input> AS DECIMAL(p, s))` payload for the
@@ -6837,15 +6641,6 @@ pub(crate) fn render_data_type(dt: &DataType) -> String {
 /// substrate names and the stamp's target names line up bit-for-bit.
 fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
     crate::types::pyspark_parity::dedup_names(names)
-}
-
-/// The set of DuckDB extension function names τ emits. Currently empty; τ's
-/// extension-target wiring will populate this with the ext6 allow-list and
-/// activate INV6 (`transpiler_v2/invariants.rs::inv6_extension_targets_exist`,
-/// currently DEFER-marked).
-#[allow(dead_code)] // INV6 activator (currently DEFER); populated when extension-target wiring lands.
-pub(crate) fn extension_targets() -> HashSet<&'static str> {
-    HashSet::new()
 }
 
 #[cfg(test)]
@@ -11673,11 +11468,6 @@ mod tests {
     // `avg_of_decimal_routes_through_spark_avg` plus `avg_of_{integer,double}_stays_native`.
 
     #[test]
-    fn extension_targets_is_empty_by_default() {
-        assert!(extension_targets().is_empty());
-    }
-
-    #[test]
     fn render_interval_emits_interval_literal() {
         let i = IntervalExpression {
             months: 1,
@@ -15380,25 +15170,6 @@ mod tests {
         );
     }
 
-    /// Same DDL, but resolved to a core `StructType` for τ's projection
-    /// schema inference. Nested `STRUCT<...>` must recurse into
-    /// `DataType::Struct(...)`.
-    #[test]
-    fn from_json_ddl_resolves_to_struct_type() {
-        let st = from_json_ddl_to_struct_for_type_inference("a INT, c STRUCT<d:BOOLEAN>").unwrap();
-        assert_eq!(st.fields.len(), 2);
-        assert_eq!(st.fields[0].name, "a");
-        assert_eq!(st.fields[0].data_type, DataType::Integer);
-        match &st.fields[1].data_type {
-            DataType::Struct(inner) => {
-                assert_eq!(inner.fields.len(), 1);
-                assert_eq!(inner.fields[0].name, "d");
-                assert_eq!(inner.fields[0].data_type, DataType::Boolean);
-            }
-            other => panic!("expected Struct, got {other:?}"),
-        }
-    }
-
     /// `from_csv(csv_str, "qty INT, label STRING, price DOUBLE")`
     /// emits a per-field `split_part` synthesis wrapped in a NULL guard so
     /// a NULL input yields a NULL struct (not a struct-of-NULLs).
@@ -15439,24 +15210,6 @@ mod tests {
             sql.contains("price := try_cast(nullif(split_part(csv_str, ',', 3), '') AS DOUBLE)"),
             "got: {sql}"
         );
-    }
-
-    /// DDL parsed into a flat `StructType` for τ's projection
-    /// schema inference. Nested composite types are rejected (Spark's own
-    /// `from_csv` accepts only flat primitives).
-    #[test]
-    fn from_csv_ddl_resolves_to_flat_struct_type() {
-        let st = from_csv_ddl_to_struct("qty INT, label STRING, price DOUBLE").unwrap();
-        assert_eq!(st.fields.len(), 3);
-        assert_eq!(st.fields[0].name, "qty");
-        assert_eq!(st.fields[0].data_type, DataType::Integer);
-        assert_eq!(st.fields[1].name, "label");
-        assert_eq!(st.fields[1].data_type, DataType::String);
-        assert_eq!(st.fields[2].name, "price");
-        assert_eq!(st.fields[2].data_type, DataType::Double);
-        // Nested composite types → None (Spark's from_csv rejects them).
-        assert!(from_csv_ddl_to_struct("a STRUCT<b:INT>").is_none());
-        assert!(from_csv_ddl_to_struct("a ARRAY<INT>").is_none());
     }
 
     /// Spark's `from_csv(csv_str, schema_ddl, options_map)`
@@ -15615,21 +15368,6 @@ mod tests {
             sql.contains(" UNION ALL "),
             "expected UNION ALL combinator, got: {sql}"
         );
-    }
-
-    /// `parse_number_format` recognizes digit templates.
-    #[test]
-    fn parse_number_format_digit_template() {
-        assert_eq!(parse_number_format("999.99"), Some((5, 2)));
-        assert_eq!(parse_number_format("9999"), Some((4, 0)));
-        assert_eq!(parse_number_format("0.00"), Some((3, 2)));
-        // Grouping separator `,` is accepted in the integer part
-        // (contributes no digit slot). Corpus witness: `parse-003`.
-        assert_eq!(parse_number_format("9,999.99"), Some((6, 2)));
-        // Sign / currency / other markers → None (τ boundary).
-        assert_eq!(parse_number_format("S999.99"), None);
-        // Empty / all-zero-precision → None.
-        assert_eq!(parse_number_format(""), None);
     }
 
     /// `to_number(col, '9,999.99')` on non-parseable input emits a

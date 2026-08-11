@@ -1,6 +1,6 @@
 # τ architecture simplification and code-reduction plan
 
-**Status:** In progress — Phase 3 complete; Phase 4 not started
+**Status:** In progress — Phase 4 bounded prototype complete
 
 **Recorded:** 2026-08-07
 
@@ -373,6 +373,35 @@ from replacing the synthetic representation.
 
 ## Phase 4 — create one live function-spec registry
 
+### Analysis result (2026-08-11)
+
+Proceed only with the bounded vertical prototype documented in
+[`phase-4-live-function-registry-analysis-2026-08.md`](phase-4-live-function-registry-analysis-2026-08.md).
+The existing aggregate table proves that repeated ordinary rules can benefit
+from a live registry, but most scalar emission remains irreducible
+Spark-parity code. Do not begin a wholesale migration: first amend ADR-009,
+neutralize the inference-to-emission parser dependency, migrate the aggregate
+subset plus the representative scalar cohort, and require a net production-LOC
+reduction with no second authority for migrated names. Arity and alias fields
+are explicitly deferred until their current behavior can be single-homed.
+
+### Prototype result (2026-08-11)
+
+- ADR-009 now permits an interpreted registry for repeated function facts
+  while retaining hand-written structural and special emission.
+- One sorted 73-row registry owns 59 aggregates, the six representative
+  scalars, and all eight structured generator spellings. Catalog exposure,
+  kind, ordinary type/nullability, and simple emission consume those rows.
+- Extension and session targets are closed enums with live DuckDB existence
+  tests. The empty deferred `extension_targets()` hook and INV6 stub are gone.
+- The inference-to-emission literal-parser edge moved to a neutral module.
+- Measured pre-test Rust in the seven function-owned files fell from 10,188 to
+  10,128 lines (−60). The remaining 204-name legacy catalog is migration state,
+  disjoint from the registry and eligible only for future net-negative slices.
+- Format, strict Clippy, and workspace unit tests pass. The DataFrame corpus
+  has 422 passes and the same seven deferred failures; SQL has 426 passes and
+  two intentional skips. No previously-green case regressed.
+
 ### Current duplication
 
 Function knowledge is independently encoded in `SUPPORTED_FUNCTIONS`, scalar
@@ -390,11 +419,12 @@ Literal/schema parsers also currently point the wrong direction:
 
 ### Target invariant
 
-One τ-owned registry is read in production by catalog exposure, arity and kind
+One τ-owned registry is read in production by catalog exposure and kind
 classification, ordinary return-type/nullability inference, ordinary emission,
-and extension-target validation. Complex Spark semantics remain hand-written,
-but the registry names their exhaustive special handler. No declarative row is
-allowed to exist solely for tests.
+and generator lowering. Complex Spark semantics remain hand-written, but the
+registry names their exhaustive special handler. Closed target enums connect
+emission to runtime existence checks. No declarative row exists solely for
+tests.
 
 A likely closed representation is:
 
@@ -426,8 +456,8 @@ a new dynamic dispatch layer.
    design if a second hand-written path remains authoritative.
 5. Migrate simple families incrementally. Keep complex cases in exhaustive
    `SpecialFunction` handlers until repetition demonstrates a smaller rule.
-6. Generate the extension-target set from `EmitRule::Extension` and make its
-   invariant live.
+6. Centralize all emitted extension targets, including operator-owned targets,
+   in one closed enum and make its existence invariant live.
 7. Delete shadowed runtime macros only after Phase 1's direct-SQL validation.
 8. Add exact-set consistency tests so a cataloged function cannot lack a live
    route and a public live route cannot disappear from the catalog unnoticed.

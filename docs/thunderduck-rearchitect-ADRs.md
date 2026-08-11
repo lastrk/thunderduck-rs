@@ -276,6 +276,12 @@ Production dispatch uses the **compiled approach**: a build-time procedural macr
 
 **Anti-pattern: declarative row data structures without a live interpreter.** Rows that no runtime dispatch consults are dead data; they inflate INV3's coverage denominator with false coverage and drift silently from the `match`-based dispatch. Full Approach B (rich declarative table + interpreter) is a legitimate alternative *if* both land together; half-declarative is worse than either fully hand-written or fully interpreted.
 
+**Amendment (2026-08-11) — interpreted registry for function identity and repeated rules.** The measured τ implementation invalidated the original size assumption behind wholly hand-written function dispatch: callable identity, aggregate classification, ordinary type/nullability rules, catalog exposure, and simple emission targets had grown into independent name rosters and had already drifted. τ therefore uses one const, interpreted `FunctionSpec` registry for those repeated facts. Every row is consumed in production; a migrated spelling has no parallel catalog, classifier, inference, nullability, or simple-emission authority.
+
+The registry remains deliberately smaller than a general emission language. Native calls, closed DuckDB renames, mandatory-extension targets, session-function targets, and closed special-handler discriminants are data. Spark-specific expression bodies remain ordinary exhaustive Rust `match` code selected by those discriminants. The registry uses closed enums and one row per observable Spark spelling; it has no callbacks, trait objects, proc macro, `build.rs` generation, or test-only fields. Arity stays out until validation can be single-homed without changing Spark error precedence.
+
+Adoption is conditional on simplification: each migration slice must delete its old authorities and reduce pre-test production Rust. If a row needs a second meta-language or does not produce a net reduction, the function stays in hand-written special dispatch. This amendment supersedes ADR-009's compiled-dispatch preference for the function-name surface only; structural AST emission remains hand-written node dispatch.
+
 ---
 
 ## ADR-010 — Extension functions are a minimal gap-filler for Spark/DuckDB divergence, implemented in the C++ extension project

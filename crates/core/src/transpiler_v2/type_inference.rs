@@ -3,6 +3,7 @@
 //! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
 //! from `crate::types`).
 
+use super::function_registry::{self, NullRule, TypeRule};
 use super::name_fold::eq_fold;
 use super::schema::{Attribute, ResolvedSchema};
 use crate::types::{DataType, StructField, StructType};
@@ -195,53 +196,11 @@ impl TypeInferenceEngine {
     ///
     /// The input name is normalized here so direct callers may use any case.
     pub fn aggregate_return_type(name: &str, arg_type: &DataType) -> DataType {
-        use DataType::*;
-        // Names without a spec row echo the argument's type — byte-identical
-        // to the old default match arm.
-        let Some(spec) = agg_spec_lower(&name.to_lowercase()) else {
+        let lower = name.to_ascii_lowercase();
+        let Some(spec) = function_registry::aggregate_spec(&lower) else {
             return arg_type.clone();
         };
-        match spec.ret {
-            AggRet::Long => Long,
-            AggRet::Double => Double,
-            AggRet::Integer => Integer,
-            AggRet::Byte => Byte,
-            AggRet::Boolean => Boolean,
-            AggRet::ArgType => arg_type.clone(),
-            AggRet::ArrayOfArg => Array(Box::new(arg_type.clone()), false),
-
-            // SUM family: integer types → Long, float → Double, decimal → wider.
-            // `try_sum` mirrors `sum`.
-            AggRet::SumLike => match arg_type {
-                Byte | Short | Integer | Long => Long,
-                Float => Double,
-                Double => Double,
-                Decimal { precision, scale } => {
-                    let p = (*precision as u16 + 10).min(38) as u8;
-                    Decimal {
-                        precision: p,
-                        scale: *scale,
-                    }
-                }
-                _ => arg_type.clone(),
-            },
-
-            // AVG family: integer types → Double, decimal → wider.
-            // `try_avg` mirrors `avg`.
-            AggRet::AvgLike => match arg_type {
-                Byte | Short | Integer | Long => Double,
-                Float | Double => Double,
-                Decimal { precision, scale } => {
-                    let p = (*precision as u16 + 4).min(38) as u8;
-                    let s = (*scale + 4).min(18).min(p);
-                    Decimal {
-                        precision: p,
-                        scale: s,
-                    }
-                }
-                _ => arg_type.clone(),
-            },
-        }
+        Self::registered_return_type(spec.result, &[(arg_type.clone(), true)])
     }
 
     /// Is this aggregate function always non-nullable?
@@ -267,7 +226,8 @@ impl TypeInferenceEngine {
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),
             "aggregate_is_non_nullable_lower requires pre-lowercased input; got `{name_lower}`",
         );
-        agg_spec_lower(name_lower).is_some_and(|s| s.null == AggNull::NonNullable)
+        function_registry::aggregate_spec(name_lower)
+            .is_some_and(|spec| spec.nullability == NullRule::Never)
     }
 
     /// Aggregate functions that always return NULL for an empty group.
@@ -293,7 +253,8 @@ impl TypeInferenceEngine {
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),
             "aggregate_is_always_nullable_lower requires pre-lowercased input; got `{name_lower}`",
         );
-        agg_spec_lower(name_lower).is_some_and(|s| s.null == AggNull::AlwaysNullable)
+        function_registry::aggregate_spec(name_lower)
+            .is_some_and(|spec| spec.nullability == NullRule::Always)
     }
 
     /// Return type of a window function given the optional argument type.
@@ -429,12 +390,17 @@ impl TypeInferenceEngine {
     /// arms that only need the first argument read `arg_types.first()`; arms
     /// that need nothing at all (hash / grouping) ignore `arg_types`/`args`.
     ///
-    /// **τ seed:** returns `DataType::Unresolved` for anything the
-    /// aggregate roster does not handle.
     /// Unsupported functions return `DataType::Unresolved` so the boundary
     /// guard can reject them instead of mis-typing the projection.
     pub fn function_return_type(name: &str, args: &[(DataType, bool)]) -> DataType {
         use DataType::*;
+        let name_lower = name.to_ascii_lowercase();
+        let registered_rule = function_registry::aggregate_spec(&name_lower)
+            .map(|spec| spec.result)
+            .or_else(|| function_registry::scalar_spec(&name_lower).map(|spec| spec.result));
+        if let Some(rule) = registered_rule {
+            return Self::registered_return_type(rule, args);
+        }
         // Type-only view: every arm whose return type depends on argument
         // TYPES alone reads this slice unchanged. The array / map arms below
         // also read `args` directly for per-argument nullability
@@ -447,14 +413,9 @@ impl TypeInferenceEngine {
         // The most common per-arm reduction: the first argument's type, or
         // the arm-specific `default` when the call has no arguments.
         let first_arg_or = |default: DataType| first_arg_type.cloned().unwrap_or(default);
-        let name_lower = name.to_lowercase();
         match name_lower.as_str() {
-            "hash" | "murmur3" => Integer,
+            "murmur3" => Integer,
             "xxhash64" => Long,
-
-            // Grouping indicators.
-            "grouping" => Byte,
-            "grouping_id" => Long,
 
             // Spark's `coalesce(a, b, c, ...)` (and aliases `nvl` / `ifnull`)
             // plus `greatest` / `least` return the least-common (widening)
@@ -485,20 +446,14 @@ impl TypeInferenceEngine {
             // default (`Unresolved`).
             "aggregate" | "reduce" | "list_reduce" if arg_types.len() >= 2 => arg_types[1].clone(),
 
-            // Delegate to aggregate_return_type for known aggregates (the
-            // `delegate` column of `AGG_SPECS`).
-            n if agg_spec_lower(n).is_some_and(|s| s.delegate) => {
-                Self::aggregate_return_type(n, first_arg_type.unwrap_or(&Unresolved))
-            }
-
             // Most string functions return String; length family returns
             // Integer; regexp / like family returns Boolean.
-            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "btrim"
+            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim"
             | "substr" | "substring" | "left" | "right" | "lpad" | "rpad" | "replace"
             | "regexp_replace" | "regexp_extract" | "translate" | "initcap" | "space" | "repeat"
             | "overlay" | "format_string" | "format_number" | "base64" | "unbase64"
             | "url_encode" | "url_decode" | "encode" | "decode" | "soundex" | "sentences"
-            | "split_part" | "substring_index" => String,
+            | "split_part" => String,
             // `regexp_extract_all(str, pattern[, group])` returns Array<String>.
             // Spark 4.x.
             "regexp_extract_all" => Array(Box::new(String), true),
@@ -510,13 +465,6 @@ impl TypeInferenceEngine {
             | "eqnullsafe" => Boolean,
             "split" => DataType::Array(Box::new(String), false),
             "sha" | "sha1" | "sha2" | "md5" => String,
-            // Spark's `crc32(binary)` returns BIGINT (unsigned CRC widened
-            // to Long). Emission side lives in the `spark_crc32` session
-            // macro (registered by `DuckDbSession::spawn` — bit-exact
-            // `java.util.zip.CRC32` emulation with a 256-entry lookup
-            // table); dispatch arm at `emission.rs` remaps `crc32` →
-            // `spark_crc32`.
-            "crc32" => Long,
             // Spark's `elt(idx, s1, s2, ...)` returns the type of the
             // picked argument. Return String as the common shape; nullability
             // follows the default rules.
@@ -537,7 +485,7 @@ impl TypeInferenceEngine {
             // which reads the scale literal; coalesce / nvl / ifnull /
             // greatest / least are typed once by the widening arm above —
             // never here.)
-            "abs" | "nullif" => first_arg_or(Unresolved),
+            "nullif" => first_arg_or(Unresolved),
             "ceil" | "ceiling" | "floor" => {
                 Self::ceil_floor_type(first_arg_type.unwrap_or(&Unresolved), None)
             }
@@ -815,9 +763,6 @@ impl TypeInferenceEngine {
             | "array_insert" => Self::rewrap_array(first_arg_type, Some(true)),
             // `array_compact` removes NULL elements → containsNull=false.
             "array_compact" => Self::rewrap_array(first_arg_type, Some(false)),
-            // `array_remove` preserves the input's containsNull flag.
-            "array_remove" => Self::rewrap_array(first_arg_type, None),
-
             // (`element_at` rides the explode arm above — same Array/Map
             // reduction.)
             // `map_keys(Map<K, V>) → Array<K>`. Spark stamps
@@ -879,12 +824,6 @@ impl TypeInferenceEngine {
             // object). Emission remaps to DuckDB's native `json_keys`, which
             // already returns `VARCHAR[]`.
             "json_object_keys" => Array(Box::new(String), true),
-            // `array_agg` is routed through the aggregate delegation list
-            // above (unified with `collect_list`/`collect_set`), so it never
-            // falls through here. Removed the scalar arm to eliminate the
-            // divergent behavior where `array_agg(Array<T>)` incorrectly
-            // returned `Array<T>` instead of `Array<Array<T>>` (Spark: an
-            // aggregate over `Array<T>` yields `Array<Array<T>>`).
             // `histogram_numeric(col, nb) → Array<Struct{x: Double
             // (nullable), y: Double (nullable)}>` (containsNull=true) per
             // Spark 4's HistogramNumeric schema. The inner struct fields
@@ -932,6 +871,46 @@ impl TypeInferenceEngine {
         }
     }
 
+    fn registered_return_type(rule: TypeRule, args: &[(DataType, bool)]) -> DataType {
+        use DataType::*;
+        let first = args.first().map(|(data_type, _)| data_type);
+        match rule {
+            TypeRule::ArrayOfArgument => {
+                Array(Box::new(first.cloned().unwrap_or(Unresolved)), false)
+            }
+            TypeRule::Average => match first {
+                Some(Byte | Short | Integer | Long | Float | Double) => Double,
+                Some(Decimal { precision, scale }) => {
+                    let precision = (*precision as u16 + 4).min(38) as u8;
+                    Decimal {
+                        precision,
+                        scale: (*scale + 4).min(18).min(precision),
+                    }
+                }
+                Some(other) => other.clone(),
+                None => Unresolved,
+            },
+            TypeRule::Boolean => Boolean,
+            TypeRule::Byte => Byte,
+            TypeRule::Double => Double,
+            TypeRule::FirstArgument => first.cloned().unwrap_or(Unresolved),
+            TypeRule::Integer => Integer,
+            TypeRule::Long => Long,
+            TypeRule::PreserveArray => Self::rewrap_array(first, None),
+            TypeRule::String => String,
+            TypeRule::Sum => match first {
+                Some(Byte | Short | Integer | Long) => Long,
+                Some(Float | Double) => Double,
+                Some(Decimal { precision, scale }) => Decimal {
+                    precision: (*precision as u16 + 10).min(38) as u8,
+                    scale: *scale,
+                },
+                Some(other) => other.clone(),
+                None => Unresolved,
+            },
+        }
+    }
+
     /// Rewrap an `Array<T>` argument type with the same element type and a
     /// per-function `containsNull` stamp: `Some(b)` forces the flag to `b`,
     /// `None` preserves the input array's flag. Non-array (or absent) inputs
@@ -973,225 +952,6 @@ impl TypeInferenceEngine {
             (precision as u8, scale as u8)
         }
     }
-}
-
-/// Return-type rule of an aggregate function (the `ret` column of
-/// [`AGG_SPECS`]). Fixed-type variants map directly to a `DataType`;
-/// `SumLike` / `AvgLike` carry Spark's integer-widening / decimal-widening
-/// bodies in [`TypeInferenceEngine::aggregate_return_type`]; `ArgType`
-/// echoes the argument's type — which is also the behavior of any name
-/// absent from the table, so `ArgType` rows are byte-identical to the old
-/// default match arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AggRet {
-    /// Fixed `Long` (COUNT family, `grouping_id`, approx-distinct family).
-    Long,
-    /// Fixed `Double` (stddev/variance, corr/covar/regr, percentile family).
-    Double,
-    /// Fixed `Integer` (scalar-wrapper size functions seen as aggregates).
-    Integer,
-    /// Fixed `Byte` (`grouping`).
-    Byte,
-    /// Fixed `Boolean` (bool_and/bool_or + Spark aliases).
-    Boolean,
-    /// Same type as the argument (min/max/first/last, bit aggregates, ...).
-    ArgType,
-    /// SUM family: integer types → Long, float → Double, decimal → wider.
-    SumLike,
-    /// AVG family: integer types → Double, decimal → wider.
-    AvgLike,
-    /// `Array(arg_type, containsNull = false)` (collect_list/collect_set).
-    ArrayOfArg,
-}
-
-/// Nullability class of an aggregate function (the `null` column of
-/// [`AGG_SPECS`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AggNull {
-    /// Always non-nullable (COUNT family, grouping, collect family).
-    NonNullable,
-    /// Returns NULL for an empty group (SUM/AVG/MIN/MAX, statistics, ...).
-    AlwaysNullable,
-    /// In neither nullability predicate (scalar-wrapper size functions).
-    Neither,
-}
-
-/// One row of the aggregate spec table — the single source of truth that
-/// replaced five parallel hand-maintained lists (`aggregate_return_type`
-/// match arms, the two nullability predicates, `function_return_type`'s
-/// aggregate-delegation arm, and the `AGGREGATE_NAMES` classifier const).
-///
-/// Roster membership is observable behavior: keep classifier, delegation, and
-/// nullability flags aligned with the parser and emitter contracts.
-struct AggSpec {
-    /// Lowercase canonical function name.
-    name: &'static str,
-    /// Return-type rule (see [`AggRet`]).
-    ret: AggRet,
-    /// Nullability class (see [`AggNull`]).
-    null: AggNull,
-    /// In the SparkSQL classifier roster:
-    /// `parser_v2::v2_lowering::is_aggregate_function_name` and emission's
-    /// `is_aggregate_name` treat this name as an aggregate.
-    classifier: bool,
-    /// `function_return_type` delegates this name to
-    /// [`TypeInferenceEngine::aggregate_return_type`].
-    delegate: bool,
-}
-
-/// Shorthand row constructor keeping [`AGG_SPECS`] readable.
-const fn agg(
-    name: &'static str,
-    ret: AggRet,
-    null: AggNull,
-    classifier: bool,
-    delegate: bool,
-) -> AggSpec {
-    AggSpec {
-        name,
-        ret,
-        null,
-        classifier,
-        delegate,
-    }
-}
-
-/// The flat aggregate spec table. INV10-compliant — lives under the
-/// `transpiler_v2` tree that τ's front-ends are allowed to consume.
-///
-/// Column order: `(name, ret, null, classifier, delegate)`.
-/// `rustfmt::skip` keeps the one-row-per-line tabular layout readable.
-#[rustfmt::skip]
-const AGG_SPECS: &[AggSpec] = &[
-    // COUNT family (non-nullable).
-    agg("count", AggRet::Long, AggNull::NonNullable, true, true),
-    agg("count_distinct", AggRet::Long, AggNull::NonNullable, true, true),
-    agg("count_if", AggRet::Long, AggNull::NonNullable, true, true),
-    // GROUPING / GROUPING_ID (non-nullable; `function_return_type` resolves
-    // them via dedicated arms rather than aggregate delegation).
-    agg("grouping", AggRet::Byte, AggNull::NonNullable, true, false),
-    agg("grouping_id", AggRet::Long, AggNull::NonNullable, true, false),
-    // SUM family (always-nullable). `try_sum` mirrors `sum` — τ's analyzer
-    agg("sum", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
-    agg("sum_distinct", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
-    agg("try_sum", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
-    // AVG family. `try_avg` mirrors `avg`.
-    agg("avg", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
-    agg("mean", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
-    agg("try_avg", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
-    // MIN / MAX / first / last / any_value — same type as argument.
-    agg("min", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("max", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("first", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("last", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("first_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("last_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("any_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    // STDDEV / VARIANCE / SKEWNESS / KURTOSIS → Double.
-    // Drift (verbatim): `std` is NOT in the classifier roster.
-    agg("stddev", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("stddev_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("std", AggRet::Double, AggNull::AlwaysNullable, false, true),
-    agg("stddev_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("variance", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("var_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("var_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("skewness", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("kurtosis", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    // Correlation / covariance / regression family → Double.
-    agg("corr", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("covar_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("covar_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_slope", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_r2", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_intercept", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_avgx", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_avgy", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_sxx", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_sxy", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("regr_syy", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    // `regr_count` is always nullable and otherwise falls through to its
-    // argument type; it is not a classifier or delegation entry.
-    agg("regr_count", AggRet::ArgType, AggNull::AlwaysNullable, false, false),
-    // Percentile / median → Double.
-    agg("percentile", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("percentile_approx", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("approx_percentile", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    agg("median", AggRet::Double, AggNull::AlwaysNullable, true, true),
-    // `mode` falls through to its argument type.
-    agg("mode", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    // `max_by(x, y)` / `min_by(x, y)` — the value of `x` at the row where
-    // `y` is max/min. Return type = the type of the FIRST arg (`x`), which
-    // is exactly what `AggRet::ArgType` resolves to via the aggregate
-    // delegation arm's `first_arg_type`. Always-nullable (empty group, an
-    // all-NULL `y` column, or a NULL `x` at the extreme `y` row all yield
-    // NULL, matching DuckDB's `arg_max_null`/`arg_min_null` which this pair
-    // renders to — see `render_aggregate`).
-    agg("max_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("min_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    // `nth_value` is handled by `window_return_type` and is always nullable.
-    agg("nth_value", AggRet::ArgType, AggNull::AlwaysNullable, false, false),
-    // collect_list / collect_set / array_agg → Array (non-nullable).
-    // `array_agg` is a Spark 4.x alias of `collect_list`; it is not a
-    // classifier entry because the SQL front-end handles it separately.
-    agg("collect_list", AggRet::ArrayOfArg, AggNull::NonNullable, true, true),
-    agg("collect_set", AggRet::ArrayOfArg, AggNull::NonNullable, true, true),
-    agg("array_agg", AggRet::ArrayOfArg, AggNull::NonNullable, false, true),
-    // approx_count_distinct → Long; these names are not classifier entries.
-    agg("approx_count_distinct", AggRet::Long, AggNull::NonNullable, false, true),
-    agg("count_approx_distinct", AggRet::Long, AggNull::NonNullable, false, true),
-    // Bit aggregates → same type as arg.
-    agg("bit_and", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("bit_or", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    agg("bit_xor", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
-    // Bool aggregates → Boolean.
-    // `any` / `some` / `all` are Spark aliases of `bool_or` /
-    // `bool_or` / `bool_and` — registering them in the classifier roster lets
-    // the SparkSQL parser classify bare-aggregate fragments (`F.expr("any(x)")`)
-    // as aggregates so they route to `lower_aggregate_select`, and lets
-    // emission's `is_aggregate_name` route them to `render_aggregate` where
-    // the name-remap already lives.
-    agg("bool_and", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    agg("every", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    agg("bool_or", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    agg("any", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    agg("some", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    agg("all", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
-    // Scalar-wrapper size functions when they appear as aggregates — a
-    // return-type arm only (no nullability class, no classifier/delegation).
-    agg("size", AggRet::Integer, AggNull::Neither, false, false),
-    agg("cardinality", AggRet::Integer, AggNull::Neither, false, false),
-    agg("map_size", AggRet::Integer, AggNull::Neither, false, false),
-    agg("array_size", AggRet::Integer, AggNull::Neither, false, false),
-];
-
-/// Look up the spec row for an already-lowercased aggregate name.
-fn agg_spec_lower(name_lower: &str) -> Option<&'static AggSpec> {
-    AGG_SPECS.iter().find(|s| s.name == name_lower)
-}
-
-/// Case-insensitive membership test against the classifier roster (the
-/// `classifier` column of [`AGG_SPECS`]. Used by the SparkSQL front-end
-/// (`parser_v2::v2_lowering::is_aggregate_function_name`) and by emission's
-/// `is_aggregate_name` to decide whether a bare function name is an
-/// aggregate. Table names are all-lowercase ASCII, so case-insensitive byte
-/// comparison matches without allocating a lowercased `String`.
-///
-/// N5 note: `is_aggregate_function_name`'s `function_call_has_aggregate`
-/// call site runs over the raw pre-lowering `sqlparser` AST (as-written
-/// user casing, not yet N5-canonicalized), so this genuinely stays
-/// case-insensitive — it is not a redundant N5 site.
-pub(crate) fn is_aggregate_classifier_name(name: &str) -> bool {
-    AGG_SPECS
-        .iter()
-        .any(|s| s.classifier && s.name.eq_ignore_ascii_case(name))
-}
-
-/// Classifier-roster names (test-only iterator for the symmetric-omission
-/// mechanical checks in this module and `expression.rs`).
-#[cfg(test)]
-pub(crate) fn aggregate_classifier_names() -> impl Iterator<Item = &'static str> {
-    AGG_SPECS.iter().filter(|s| s.classifier).map(|s| s.name)
 }
 
 /// Spark 4.1.1 `Nondeterministic`-expression names relevant to sort-key
@@ -1503,11 +1263,11 @@ mod tests {
         assert_eq!(agg_rt("avg", &DataType::Long), DataType::Double);
     }
 
-    /// Every aggregate classifier name belongs to exactly one of
+    /// Every aggregate registry name belongs to exactly one of
     /// `aggregate_is_non_nullable` or `aggregate_is_always_nullable`.
     #[test]
     fn every_aggregate_return_type_name_appears_in_a_nullability_predicate() {
-        for name in aggregate_classifier_names() {
+        for name in function_registry::aggregate_names() {
             let non_null = TypeInferenceEngine::aggregate_is_non_nullable(name);
             let always_null = TypeInferenceEngine::aggregate_is_always_nullable(name);
             assert!(
@@ -1515,28 +1275,6 @@ mod tests {
                 "aggregate `{name}` must appear in exactly one of \
                  aggregate_is_non_nullable ({non_null}) XOR \
                  aggregate_is_always_nullable ({always_null})",
-            );
-        }
-    }
-
-    /// AGG_SPECS single-table invariants: every row name is unique (no
-    /// shadowed lookups) and all-lowercase ASCII (the `_lower` predicates
-    /// and `eq_ignore_ascii_case` classifier lookups rely on it).
-    #[test]
-    fn agg_specs_names_are_unique_and_lowercase() {
-        let mut seen = std::collections::HashSet::new();
-        for spec in AGG_SPECS {
-            assert!(
-                seen.insert(spec.name),
-                "duplicate AGG_SPECS row for `{}`",
-                spec.name,
-            );
-            assert!(
-                spec.name
-                    .chars()
-                    .all(|c| !c.is_ascii_uppercase() && !c.is_whitespace()),
-                "AGG_SPECS name `{}` must be lowercase ASCII with no whitespace",
-                spec.name,
             );
         }
     }
@@ -1583,41 +1321,39 @@ mod tests {
         );
     }
 
-    /// `try_sum` and `try_avg` belong to the aggregate classifier roster so
-    /// `is_aggregate_function_name` recognizes them as aggregate functions.
+    /// `try_sum` and `try_avg` are aggregate registry entries.
     #[test]
     fn aggregate_names_contains_try_sum_and_try_avg() {
         assert!(
-            is_aggregate_classifier_name("try_sum"),
-            "classifier roster must contain try_sum (checklist §1.4)",
+            function_registry::is_aggregate("try_sum"),
+            "registry must classify try_sum as an aggregate (checklist §1.4)",
         );
         assert!(
-            is_aggregate_classifier_name("try_avg"),
-            "classifier roster must contain try_avg (checklist §1.4)",
+            function_registry::is_aggregate("try_avg"),
+            "registry must classify try_avg as an aggregate (checklist §1.4)",
         );
     }
 
-    /// `try_divide` is a scalar function — it must NOT be in the classifier
-    /// roster.
+    /// `try_divide` is scalar, not aggregate.
     #[test]
     fn aggregate_names_does_not_contain_try_divide() {
         assert!(
-            !is_aggregate_classifier_name("try_divide"),
-            "classifier roster must NOT contain try_divide (scalar per checklist §4.1)",
+            !function_registry::is_aggregate("try_divide"),
+            "registry must not classify try_divide as aggregate (checklist §4.1)",
         );
     }
 
-    /// No name appears in BOTH the aggregate-classifier roster and the
+    /// No name appears in BOTH the aggregate registry and the
     /// nondeterministic roster — the two are disjoint predicate domains, and
     /// a name in both would make `contains_aggregate_call` /
     /// `contains_nondeterministic_call` racy about which fallback trigger
     /// fires first for a given Sort key.
     #[test]
-    fn aggregate_classifier_and_nondeterministic_rosters_are_disjoint() {
-        for name in aggregate_classifier_names() {
+    fn aggregate_registry_and_nondeterministic_roster_are_disjoint() {
+        for name in function_registry::aggregate_names() {
             assert!(
                 !is_nondeterministic_fn_name(name),
-                "`{name}` is in both the aggregate-classifier roster and the \
+                "`{name}` is in both the aggregate registry and the \
                  nondeterministic roster",
             );
         }
@@ -1672,7 +1408,7 @@ mod tests {
         }
     }
 
-    /// Both `try_sum` and `try_avg` must be in the always-nullable roster
+    /// Both `try_sum` and `try_avg` must use the always-nullable rule
     /// (empty groups return NULL, and `try_*` variants surface arithmetic
     /// overflows as NULL in place of errors).
     #[test]
@@ -2253,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn max_by_returns_first_arg_type_via_aggregate_delegation() {
+    fn max_by_registry_rule_returns_first_arg_type() {
         // Return type = type of `x` (the value column), not `y` (the
         // ordering column) — mirrors DuckDB's `arg_max_null(x, y)`.
         assert_eq!(
@@ -2263,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn min_by_returns_first_arg_type_via_aggregate_delegation() {
+    fn min_by_registry_rule_returns_first_arg_type() {
         assert_eq!(
             frt("min_by", &[DataType::String, DataType::Integer]),
             DataType::String
@@ -2277,11 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn array_agg_returns_array_of_elem_via_aggregate_delegation() {
-        // `array_agg` is unified with `collect_list`/`collect_set` in the
-        // aggregate delegation list — the scalar arm was removed to avoid
-        // the divergent case where `array_agg(Array<T>)` incorrectly
-        // stayed at `Array<T>` instead of widening to `Array<Array<T>>`.
+    fn array_agg_returns_array_of_elem_from_registry_rule() {
         assert_eq!(
             frt("array_agg", &[DataType::String]),
             DataType::Array(Box::new(DataType::String), false)

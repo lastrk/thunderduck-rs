@@ -34,9 +34,9 @@ spec:
         - name: fmt-clippy-test
           image: rust:1.97.1-bookworm
           run: |
-export CARGO_HOME="$HOME/.cargo-cache"
-export PATH="$CARGO_HOME/bin:$PATH"
-rustup component add rustfmt clippy
+            export CARGO_HOME="$HOME/.cargo-cache"
+            export PATH="$CARGO_HOME/bin:$PATH"
+            rustup component add rustfmt clippy
             cargo fmt --all -- --check
             # `--locked` keeps CI on the committed Cargo.lock. Without it a
             # checkout re-resolves the graph and can pull a dependency whose

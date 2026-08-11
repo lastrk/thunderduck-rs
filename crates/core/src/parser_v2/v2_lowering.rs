@@ -38,15 +38,16 @@ use crate::transpiler_v2::generator::Generator;
 use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
 use crate::transpiler_v2::EmissionError;
+use crate::transpiler_v2::Qualifier;
 use crate::types::DataType;
 
-/// Immutable CTE scope: lowercased CTE name → its already-lowered body.
+/// Immutable CTE scope: folded CTE qualifier → its already-lowered body.
 ///
 /// Threaded through the query-body lowering chain so that a `FROM <cte>`
 /// reference inlines the CTE body (ADR-004 — no new `CommonOp`) instead of a
 /// catalog `TableScan`. Bodies are lowered once, eagerly, in `cte_tables`
 /// order (each seeing its predecessors), and cloned per reference.
-type CteScope = HashMap<String, CommonAst>;
+type CteScope = HashMap<Qualifier, CommonAst>;
 
 /// Lower a parsed sqlparser [`Statement`] into a [`CommonAst`].
 pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
@@ -987,7 +988,7 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
                         column_names,
                     })
                 };
-                local_scope.insert(cte.alias.name.value.to_lowercase(), body);
+                local_scope.insert(Qualifier::single(cte.alias.name.value).case_folded(), body);
             }
             &local_scope
         }
@@ -1049,11 +1050,11 @@ fn lower_recursive_with(
         .into_iter()
         .next()
         .expect("cte_tables is non-empty (len checked above)");
-    // Preserve declared-case in the AST node (used by emission + analyzer
-    // BaseTypes injection); CteScope key is lowercased (matching non-recursive
-    // CTE convention).
+    // The AST retains the existing folded string representation; the scope
+    // key preserves the alias as one identifier part.
     let declared_name = cte.alias.name.value;
     let cte_name_lower = declared_name.to_lowercase();
+    let cte_scope_key = Qualifier::single(&declared_name).case_folded();
     let column_names: Vec<String> = cte
         .alias
         .columns
@@ -1115,11 +1116,9 @@ fn lower_recursive_with(
         recursive_term: Box::new(recursive_term),
     });
 
-    // Register in scope — FROM <name> resolves to this node (cloned per ref,
-    // mirroring non-recursive CTE registration). Uses lowercase key, matching
-    // the non-recursive CTE convention.
+    // Register in scope so FROM <name> resolves to this node.
     let mut scope = cte_scope.clone();
-    scope.insert(cte_name_lower, node);
+    scope.insert(cte_scope_key, node);
     Ok(scope)
 }
 
@@ -1307,11 +1306,8 @@ fn lower_lateral_views(
 }
 
 fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
-    // Capture DISTINCT before building the projection plan; the plain
-    // `SELECT DISTINCT` lowers to a `Deduplicate` wrapping the final Project
-    // (empty `on_columns` = dedupe the whole output row). `SELECT ALL` is the
-    // default (keep duplicates) → no wrap. `DISTINCT ON (...)` is a Postgres
-    // extension Spark SQL does not accept → Thunderduck-boundary reject.
+    // Plain DISTINCT wraps the final Project in `Distinct`; ALL adds no node.
+    // Spark rejects PostgreSQL's DISTINCT ON extension.
     let dedupe = match select.distinct.take() {
         None | Some(Distinct::All) => false,
         Some(Distinct::Distinct) => true,
@@ -1362,12 +1358,11 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
     };
 
     // Plain `SELECT DISTINCT` dedupes the final projection. Wrapping here (below
-    // `lower_query`'s `wrap_with_sort_limit`) yields `Sort(Deduplicate(Project))`
+    // `lower_query`'s `wrap_with_sort_limit`) yields `Sort(Distinct(Project))`
     // for `SELECT DISTINCT ... ORDER BY ...` — dedupe first, then order.
     let plan = if dedupe {
-        CommonAst::new(CommonOp::Deduplicate {
+        CommonAst::new(CommonOp::Distinct {
             input: Box::new(plan),
-            on_columns: vec![],
         })
     } else {
         plan
@@ -1631,8 +1626,6 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
                 using_columns: vec![],
                 natural: false,
                 lateral,
-                left_plan_ids: vec![],
-                right_plan_ids: vec![],
             })
         };
     }
@@ -1713,8 +1706,6 @@ fn lower_table_with_joins(
             using_columns,
             natural,
             lateral,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
     }
     Ok(plan)
@@ -1770,13 +1761,15 @@ fn lower_table_factor(
                     }
                 }
 
-                let table = object_name_to_string(&name);
+                let table = object_name_to_qualifier(&name);
                 // A single-part name matching a CTE in scope inlines the CTE
                 // body (Spark: a CTE shadows a catalog table of the same name).
                 // The reference's own alias wins over the CTE name so qualified
                 // refs bind — `FROM e emp` → alias "emp" (cte-003).
-                if let Some(body) = cte_scope.get(&table.to_lowercase()) {
-                    let alias = alias.map(|a| a.name.value).unwrap_or(table);
+                if let Some(body) = cte_scope.get(&table.case_folded()) {
+                    let alias = alias.map(|a| a.name.value).unwrap_or_else(|| {
+                        table.parts().last().expect("non-empty qualifier").clone()
+                    });
                     Ok(CommonAst::new(CommonOp::AliasedRelation {
                         input: Box::new(body.clone()),
                         alias,
@@ -2141,12 +2134,12 @@ fn function_arg_to_expr(
     match unnamed_or_named_expr(arg) {
         Ok(e) => lower_expr(e, cte_scope),
         Err(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
-            Ok(Expression::Star(StarExpression { qualifier: None }))
+            Ok(Expression::Star(StarExpression::Unqualified))
         }
         Err(FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(name))) => {
-            Ok(Expression::Star(StarExpression {
-                qualifier: Some(object_name_to_string(&name)),
-            }))
+            Ok(Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(object_name_parts(&name)),
+            )))
         }
         Err(other) => bail_boundary_proto!(
             format!("sql::function_arg::{other:?}"),
@@ -2222,14 +2215,22 @@ fn lower_select_item(item: SelectItem, cte_scope: &CteScope) -> Result<Expressio
                 alias: alias.value,
             }))
         }
-        SelectItem::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
+        SelectItem::Wildcard(_) => Ok(Expression::Star(StarExpression::Unqualified)),
         SelectItem::QualifiedWildcard(kind, _) => {
             use sqlparser::ast::SelectItemQualifiedWildcardKind;
-            let q = match &kind {
-                SelectItemQualifiedWildcardKind::ObjectName(n) => object_name_to_string(n),
-                SelectItemQualifiedWildcardKind::Expr(e) => e.to_string(),
+            let parts = match &kind {
+                SelectItemQualifiedWildcardKind::ObjectName(n) => object_name_parts(n),
+                SelectItemQualifiedWildcardKind::Expr(Expr::Identifier(i)) => {
+                    vec![i.value.clone()]
+                }
+                SelectItemQualifiedWildcardKind::Expr(Expr::CompoundIdentifier(parts)) => {
+                    parts.iter().map(|part| part.value.clone()).collect()
+                }
+                SelectItemQualifiedWildcardKind::Expr(e) => vec![e.to_string()],
             };
-            Ok(Expression::Star(StarExpression { qualifier: Some(q) }))
+            Ok(Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(parts),
+            )))
         }
     }
 }
@@ -2515,28 +2516,11 @@ fn is_distinct(left: Expression, right: Expression, negated: bool) -> Expression
 fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match expr {
         Expr::Identifier(ident) => Ok(UnresolvedColumn::bare(ident.value)),
-        Expr::CompoundIdentifier(parts) => {
-            // Lower a dotted reference as first-part qualifier / dotted
-            // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
-            // shape the analyzer's nested-struct resolution (analyzer.rs
-            // `resolve_column`'s tier (d), via `struct_qualifier_info` /
-            // `build_struct_extract_chain`) is written for. A 3-part
-            // struct path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
-            // "address", name:"geo.lat"}` so the analyzer can walk the struct;
-            // 2-part refs `t.c` are byte-identical to before (parts[0] qualifier,
-            // parts[1] name). Corpus witness: cx-004.
-            let values: Vec<String> = parts.iter().map(|i| i.value.clone()).collect();
-            let (qualifier, name) = match values.len() {
-                0 => (None, String::new()),
-                1 => (None, values.into_iter().next().unwrap_or_default()),
-                _ => (Some(values[0].clone()), values[1..].join(".")),
-            };
-            Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-                name,
-                qualifier,
-                plan_id: None,
-            }))
-        }
+        Expr::CompoundIdentifier(parts) => Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+            name_parts: parts.into_iter().map(|i| i.value).collect(),
+            plan_id: None,
+            is_metadata_column: false,
+        })),
         Expr::Value(vw) => lower_value(vw),
         Expr::BinaryOp { left, op, right } => {
             // Spark's `a DIV b` integer-division operator lowers to a truncating
@@ -2854,7 +2838,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             "sql::expr::similar_to",
             "SIMILAR TO (anchored SQL-standard regex) has no Spark equivalent"
         ),
-        Expr::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
+        Expr::Wildcard(_) => Ok(Expression::Star(StarExpression::Unqualified)),
         // Spark's `EXTRACT(<field> FROM <expr>)` and `DATE_PART(<field>, <expr>)`
         // parse to `Expr::Extract`. Lower to a FunctionCall of
         // `date_part('<field>', <expr>)` — DuckDB accepts this form for all
@@ -3130,9 +3114,11 @@ fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Express
     }
     match body {
         Expression::UnresolvedColumn(u)
-            if u.qualifier.is_none() && params.iter().any(|p| p == &u.name) =>
+            if u.name_parts.len() == 1 && params.iter().any(|p| p == &u.name_parts[0]) =>
         {
-            Expression::LambdaVariable(LambdaVariableExpression { name: u.name })
+            Expression::LambdaVariable(LambdaVariableExpression {
+                name: u.name_parts.into_iter().next().unwrap_or_default(),
+            })
         }
         Expression::Lambda(inner) => {
             // Inner lambda's params shadow ours: drop them from the active set
@@ -4393,6 +4379,14 @@ fn expr_to_i64(e: Expr) -> Result<i64, EmissionError> {
 }
 
 fn object_name_to_string(name: &ObjectName) -> String {
+    object_name_to_qualifier(name).display_name()
+}
+
+fn object_name_to_qualifier(name: &ObjectName) -> Qualifier {
+    Qualifier::from_parts(object_name_parts(name))
+}
+
+fn object_name_parts(name: &ObjectName) -> Vec<String> {
     name.0
         .iter()
         .map(|part| match part {
@@ -4403,8 +4397,7 @@ fn object_name_to_string(name: &ObjectName) -> String {
             // never silently drop information.
             other => other.to_string(),
         })
-        .collect::<Vec<_>>()
-        .join(".")
+        .collect()
 }
 
 fn value_to_escape_char(v: Value) -> Option<char> {
@@ -4731,7 +4724,7 @@ mod tests {
             !call
                 .args
                 .iter()
-                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name == "MONTH")),
+                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name_parts == ["MONTH"])),
             "unit must NOT lower to an UnresolvedColumn(MONTH)"
         );
     }
@@ -4756,7 +4749,7 @@ mod tests {
             !call
                 .args
                 .iter()
-                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name == "DAY")),
+                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name_parts == ["DAY"])),
             "unit must NOT lower to an UnresolvedColumn(DAY)"
         );
     }
@@ -4802,11 +4795,35 @@ mod tests {
                 assert!(matches!(projections[0], Expression::Star(_)));
                 assert!(matches!(
                     input.op,
-                    CommonOp::TableScan { ref table, .. } if table == "t"
+                    CommonOp::TableScan { ref table, .. }
+                        if table == &Qualifier::single("t")
                 ));
             }
             _ => panic!("expected Project over TableScan"),
         }
+    }
+
+    #[test]
+    fn table_scan_preserves_multipart_and_quoted_dot_boundaries() {
+        fn table(sql: &str) -> Qualifier {
+            let plan = parse(sql).expect("parse table query");
+            let CommonOp::Project { input, .. } = plan.op else {
+                panic!("expected Project");
+            };
+            let CommonOp::TableScan { table } = input.op else {
+                panic!("expected TableScan");
+            };
+            table
+        }
+
+        assert_eq!(
+            table("SELECT * FROM catalog.orders").parts(),
+            ["catalog", "orders"]
+        );
+        assert_eq!(
+            table("SELECT * FROM `catalog.orders`").parts(),
+            ["catalog.orders"]
+        );
     }
 
     #[test]
@@ -4978,7 +4995,8 @@ mod tests {
         match plan.op {
             CommonOp::Project { input, .. } => {
                 assert!(
-                    matches!(input.op, CommonOp::TableScan { ref table, .. } if table == "emp"),
+                    matches!(input.op, CommonOp::TableScan { ref table, .. }
+                        if table == &Qualifier::single("emp")),
                     "expected TableScan, got {:?}",
                     input.op
                 );
@@ -5037,33 +5055,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_select_distinct_wraps_project_in_deduplicate() {
+    fn parse_select_distinct_wraps_project_in_distinct() {
         let plan = parse("SELECT DISTINCT a, b FROM t").expect("should parse");
         match plan.op {
-            CommonOp::Deduplicate { input, on_columns } => {
-                assert!(on_columns.is_empty(), "plain DISTINCT dedupes all columns");
+            CommonOp::Distinct { input } => {
                 assert!(
                     matches!(input.op, CommonOp::Project { .. }),
-                    "Deduplicate must wrap the Project"
+                    "Distinct must wrap the Project"
                 );
             }
-            _ => panic!("expected Deduplicate over Project"),
+            _ => panic!("expected Distinct over Project"),
         }
     }
 
     #[test]
-    fn parse_select_distinct_with_order_by_sorts_deduplicate() {
+    fn parse_select_distinct_with_order_by_sorts_distinct() {
         let plan = parse("SELECT DISTINCT a FROM t ORDER BY a").expect("should parse");
-        // Dedupe first, then order: Sort(Deduplicate(Project)).
+        // Dedupe first, then order: Sort(Distinct(Project)).
         match plan.op {
             CommonOp::Sort { input, .. } => match input.op {
-                CommonOp::Deduplicate { input, on_columns } => {
-                    assert!(on_columns.is_empty());
+                CommonOp::Distinct { input } => {
                     assert!(matches!(input.op, CommonOp::Project { .. }));
                 }
-                _ => panic!("expected Deduplicate under Sort"),
+                _ => panic!("expected Distinct under Sort"),
             },
-            _ => panic!("expected Sort over Deduplicate"),
+            _ => panic!("expected Sort over Distinct"),
         }
     }
 
@@ -5516,7 +5532,7 @@ mod tests {
             CommonOp::Aggregate { grouping, .. } => {
                 assert_eq!(grouping.len(), 1);
                 match &grouping[0] {
-                    Expression::UnresolvedColumn(u) => assert_eq!(u.name, "dept_id"),
+                    Expression::UnresolvedColumn(u) => assert_eq!(u.name_parts, ["dept_id"]),
                     other => panic!("expected UnresolvedColumn(dept_id), got {other:?}"),
                 }
             }
@@ -5870,6 +5886,21 @@ mod tests {
     }
 
     #[test]
+    fn cte_scope_does_not_flatten_quoted_dot_aliases() {
+        let quoted = parse("WITH `a.b` AS (SELECT id FROM t) SELECT * FROM `a.b`")
+            .expect("quoted CTE reference");
+        let body = expect_aliased(project_input(quoted), "a.b");
+        assert!(matches!(body.op, CommonOp::Project { .. }));
+
+        let multipart = parse("WITH `a.b` AS (SELECT id FROM t) SELECT * FROM a.b")
+            .expect("multipart table reference");
+        let CommonOp::TableScan { table } = project_input(multipart).op else {
+            panic!("multipart name must not resolve to the one-part CTE alias");
+        };
+        assert_eq!(table.parts(), ["a", "b"]);
+    }
+
+    #[test]
     fn parse_cte_explicit_columns_wraps_in_todf() {
         // `t(k, v)` — the explicit column list becomes a positional ToDf rename
         // beneath the AliasedRelation.
@@ -6032,7 +6063,8 @@ mod tests {
         assert!(
             matches!(
                 scan.op,
-                CommonOp::TableScan { ref table } if table == "emp"
+                CommonOp::TableScan { ref table }
+                    if table == &Qualifier::single("emp")
             ),
             "expected TableScan {{ table: \"emp\" }} under the \
              AliasedRelation, got {:?}",
@@ -6049,7 +6081,8 @@ mod tests {
         assert!(
             matches!(
                 input.op,
-                CommonOp::TableScan { ref table } if table == "emp"
+                CommonOp::TableScan { ref table }
+                    if table == &Qualifier::single("emp")
             ),
             "expected bare TableScan, got {:?}",
             input.op
@@ -6100,7 +6133,7 @@ mod tests {
                 );
                 // Recursive term: Filter over Project over TableScan("seq").
                 // Drill into Filter → Project → input to find the self-ref.
-                fn find_table_scan(ast: &CommonAst) -> Option<&str> {
+                fn find_table_scan(ast: &CommonAst) -> Option<&Qualifier> {
                     if let CommonOp::TableScan { table, .. } = &ast.op {
                         return Some(table);
                     }
@@ -6111,11 +6144,9 @@ mod tests {
                     }
                     None
                 }
-                assert_eq!(
-                    find_table_scan(recursive_term),
-                    Some("seq"),
-                    "recursive term must contain a TableScan(seq) self-reference"
-                );
+                let table = find_table_scan(recursive_term)
+                    .expect("recursive term must contain a TableScan(seq) self-reference");
+                assert_eq!(table.parts(), ["seq"]);
             }
             other => panic!("expected RecursiveCte, got {other:?}"),
         }
@@ -6175,7 +6206,8 @@ mod tests {
                     CommonOp::AliasedRelation { input, alias } => {
                         assert_eq!(alias, "c");
                         assert!(
-                            matches!(&input.op, CommonOp::TableScan { table, .. } if table == "chain"),
+                            matches!(&input.op, CommonOp::TableScan { table, .. }
+                                if table == &Qualifier::single("chain")),
                             "expected TableScan(chain) under AliasedRelation, got {:?}",
                             input.op
                         );
@@ -6898,9 +6930,12 @@ mod tests {
         }
 
         let bt = BaseTypes::from_entries(
-            [("emp".to_owned(), emp()), ("dept".to_owned(), dept())]
-                .into_iter()
-                .collect(),
+            [
+                (Qualifier::single("emp"), emp()),
+                (Qualifier::single("dept"), dept()),
+            ]
+            .into_iter()
+            .collect(),
         );
 
         let natural_plan = parse("SELECT * FROM emp NATURAL JOIN dept").expect("parse natural");
@@ -6954,7 +6989,7 @@ mod tests {
         // the trim characters second.
         assert!(matches!(
             fc.args[0],
-            Expression::UnresolvedColumn(ref c) if c.name == "name"
+            Expression::UnresolvedColumn(ref c) if c.name_parts == ["name"]
         ));
     }
 
@@ -7121,7 +7156,7 @@ mod tests {
                 assert_eq!(grouping, PivotGrouping::Implicit);
                 // Pivot column is the FOR column.
                 assert!(
-                    matches!(pivot_column, Expression::UnresolvedColumn(ref u) if u.name == "active")
+                    matches!(pivot_column, Expression::UnresolvedColumn(ref u) if u.name_parts == ["active"])
                 );
                 // Both values are Alias-wrapped (true AS act / false AS inact).
                 assert_eq!(pivot_values.len(), 2);
@@ -7604,12 +7639,11 @@ mod tests {
     }
 
     #[test]
-    fn lower_three_part_path_keeps_first_as_qualifier_and_dotted_remainder() {
+    fn lower_three_part_path_preserves_each_name_part() {
         let plan = parse("SELECT address.geo.lat FROM emp").expect("should parse+lower");
         match first_projection(plan) {
             Expression::UnresolvedColumn(c) => {
-                assert_eq!(c.qualifier.as_deref(), Some("address"));
-                assert_eq!(c.name, "geo.lat");
+                assert_eq!(c.name_parts, ["address", "geo", "lat"]);
             }
             other => panic!("expected UnresolvedColumn, got {other:?}"),
         }
@@ -7628,7 +7662,7 @@ mod tests {
                     Expression::Binary(b) => {
                         assert_eq!(b.op, BinaryOp::Eq);
                         assert!(
-                            matches!(b.left.as_ref(), Expression::UnresolvedColumn(c) if c.name == "x"),
+                            matches!(b.left.as_ref(), Expression::UnresolvedColumn(c) if c.name_parts == ["x"]),
                             "left of Eq should be the CASE operand `x`, got {:?}",
                             b.left
                         );
@@ -7740,7 +7774,7 @@ mod tests {
                             "predicate is `dept_id = 10`"
                         );
                         assert!(
-                            matches!(then, Expression::UnresolvedColumn(c) if c.name == "salary"),
+                            matches!(then, Expression::UnresolvedColumn(c) if c.name_parts == ["salary"]),
                             "THEN branch is the wrapped `salary` argument"
                         );
                     }
@@ -7766,7 +7800,7 @@ mod tests {
                     Expression::CaseWhen(cw) => {
                         let (_, then) = &cw.branches[0];
                         assert!(
-                            matches!(then, Expression::UnresolvedColumn(c) if c.name == "id"),
+                            matches!(then, Expression::UnresolvedColumn(c) if c.name_parts == ["id"]),
                             "THEN branch is the wrapped `id` argument"
                         );
                     }

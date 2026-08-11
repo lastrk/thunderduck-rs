@@ -40,4 +40,5 @@ Full details: [extension-loading.md](../adrs/runtime/extension-loading.md) (see 
 
 - **Protobuf**: `tonic` + `prost`; protos compiled at build time from `protos/`.
 - **Arrow**: zero-copy IPC streaming — `arrow` crate shares the same dependency tree as `duckdb-rs` so no version mismatch is possible.
+- **Column regexes**: `java_regex` mirrors JVM `Pattern` for Spark-compatible `colRegex` expansion without starting a JVM.
 - **Async runtime**: `tokio` multi-thread scheduler for gRPC; session work runs on a dedicated OS thread (see [architecture.md](architecture.md) — DuckDB threading model).

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use super::ast::{CommonAst, CommonOp, PivotGrouping};
 use super::expression::{Expression, SubqueryPlan};
+use super::identifier::Qualifier;
 use crate::types::StructType;
 
 /// A per-path overlay recording the resolved schemas of every empty-schema
@@ -26,7 +27,7 @@ use crate::types::StructType;
 /// schema inline). See [`Self::build_from_plan`] for the short-circuit.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BaseTypes {
-    entries: HashMap<String, StructType>,
+    entries: HashMap<Qualifier, StructType>,
 }
 
 impl BaseTypes {
@@ -57,7 +58,11 @@ impl BaseTypes {
             if entries.contains_key(&table) {
                 continue;
             }
-            if let Some(schema) = catalog_lookup(&table) {
+            let lookup_name = match table.parts() {
+                [part] => part.clone(),
+                _ => table.display_name(),
+            };
+            if let Some(schema) = catalog_lookup(&lookup_name) {
                 entries.insert(table, schema);
             }
         }
@@ -69,14 +74,14 @@ impl BaseTypes {
     /// have already collected the plan's empty-scan tables via
     /// [`empty_scan_tables`] and resolved each schema through an async
     /// catalog — avoids [`Self::build_from_plan`]'s second plan walk.
-    pub fn from_entries(entries: HashMap<String, StructType>) -> Self {
+    pub fn from_entries(entries: HashMap<Qualifier, StructType>) -> Self {
         Self { entries }
     }
 
     /// Look up the resolved schema for `table`. Returns `None` when the
     /// overlay has no entry (either because the plan had no empty scan for
     /// this table or because the catalog closure returned `None`).
-    pub fn lookup(&self, table: &str) -> Option<&StructType> {
+    pub fn lookup(&self, table: &Qualifier) -> Option<&StructType> {
         self.entries.get(table)
     }
 
@@ -90,9 +95,9 @@ impl BaseTypes {
     /// If `table` already exists it is replaced (shadowing semantics — a CTE
     /// correctly shadows a catalog table of the same name per Spark). The
     /// receiver is `&self` + `Clone` — no mutation, no aliasing.
-    pub fn with_entry(&self, table: &str, schema: StructType) -> Self {
+    pub fn with_entry(&self, table: &Qualifier, schema: StructType) -> Self {
         let mut entries = self.entries.clone();
-        entries.insert(table.to_owned(), schema);
+        entries.insert(table.clone(), schema);
         Self { entries }
     }
 }
@@ -106,14 +111,14 @@ impl BaseTypes {
 /// This is intentional — the overlay populates once per unique table, and
 /// unpopulated tables carry no analyzer info, so a false positive costs at
 /// most one closure invocation per unique table name.
-pub fn empty_scan_tables(plan: &CommonAst) -> Vec<String> {
+pub fn empty_scan_tables(plan: &CommonAst) -> Vec<Qualifier> {
     let mut out = Vec::new();
     collect_empty_scan_tables(plan, &mut out);
     out
 }
 
 /// Walk `plan` and push every `TableScan.table` name into `out`.
-fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
+fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<Qualifier>) {
     // Seam D: collect tables referenced inside this node's subquery-bearing
     // expressions (their inner plans are `Unanalyzed` at collection time) —
     // a table referenced *only* inside a subquery (e.g. `dept` in
@@ -237,7 +242,9 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
         | CommonOp::FreqItems { .. }
         | CommonOp::Crosstab { .. }
         | CommonOp::Deduplicate { .. }
+        | CommonOp::Distinct { .. }
         | CommonOp::AliasedRelation { .. }
+        | CommonOp::PlanBoundary { .. }
         | CommonOp::ToDf { .. }
         | CommonOp::WithColumnsRenamed { .. }
         | CommonOp::DropColumns { .. }
@@ -257,7 +264,7 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
 /// arms below. A future subquery-bearing variant added to `children()` as
 /// opaque must be added here too — its subquery-only tables would otherwise
 /// silently miss base-type pre-fetch.
-fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
+fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<Qualifier>) {
     match e {
         Expression::ScalarSubquery(s) => collect_subquery_plan_tables(&s.subquery, out),
         Expression::InSubquery(i) => {
@@ -274,7 +281,7 @@ fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
 /// Collect empty-scan tables from a subquery's inner plan. At base-types
 /// collection time the plan is always `Unanalyzed`; an `Analyzed` plan (would
 /// only appear if collection ran post-analysis) needs no further pre-fetch.
-fn collect_subquery_plan_tables(plan: &SubqueryPlan, out: &mut Vec<String>) {
+fn collect_subquery_plan_tables(plan: &SubqueryPlan, out: &mut Vec<Qualifier>) {
     match plan {
         SubqueryPlan::Unanalyzed(inner) => collect_empty_scan_tables(inner, out),
         SubqueryPlan::Analyzed(_) => {}
@@ -292,7 +299,7 @@ mod tests {
 
     fn table_scan(name: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
-            table: name.to_owned(),
+            table: Qualifier::single(name),
         })
     }
 
@@ -310,14 +317,41 @@ mod tests {
     fn base_types_empty_lookup_returns_none() {
         let bt = BaseTypes::empty();
         assert!(bt.is_empty());
-        assert!(bt.lookup("orders").is_none());
+        assert!(bt.lookup(&Qualifier::single("orders")).is_none());
     }
 
     #[test]
     fn empty_scan_tables_collects_bare_table_scan() {
         assert_eq!(
             empty_scan_tables(&table_scan("orders")),
-            vec!["orders".to_owned()]
+            vec![Qualifier::single("orders")]
+        );
+    }
+
+    #[test]
+    fn empty_scan_tables_preserves_multipart_boundaries_in_catalog_keys() {
+        let multipart = CommonAst::new(CommonOp::TableScan {
+            table: Qualifier::from_parts(vec!["catalog".into(), "orders".into()]),
+        });
+        let literal_dot = CommonAst::new(CommonOp::TableScan {
+            table: Qualifier::single("catalog.orders"),
+        });
+        let plan = CommonAst::new(CommonOp::Join {
+            left: Box::new(multipart),
+            right: Box::new(literal_dot),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+        });
+
+        assert_eq!(
+            empty_scan_tables(&plan),
+            [
+                Qualifier::from_parts(vec!["catalog".into(), "orders".into()]),
+                Qualifier::single("catalog.orders"),
+            ]
         );
     }
 
@@ -382,10 +416,8 @@ mod tests {
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
-        assert_eq!(empty_scan_tables(&plan), vec!["orders".to_owned()]);
+        assert_eq!(empty_scan_tables(&plan), vec![Qualifier::single("orders")]);
     }
 
     #[test]
@@ -416,8 +448,6 @@ mod tests {
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
         let bt = BaseTypes::build_from_plan(&plan, |_name| {
@@ -426,14 +456,13 @@ mod tests {
         });
         assert_eq!(calls.get(), 1);
         assert!(!bt.is_empty());
-        assert_eq!(bt.lookup("orders"), Some(&schema));
+        assert_eq!(bt.lookup(&Qualifier::single("orders")), Some(&schema));
     }
 
     #[test]
     fn base_types_lookup_case_sensitive_matches_struct_type_semantics() {
-        // BaseTypes uses HashMap<String, StructType> — case-sensitive by
-        // construction. Callers that need case-insensitive matching must
-        // canonicalize before insertion.
+        // BaseTypes keys are structured and case-sensitive. Callers that need
+        // case-insensitive matching must canonicalize before insertion.
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
         let plan = table_scan("Orders");
         let bt = BaseTypes::build_from_plan(&plan, |name| {
@@ -443,8 +472,23 @@ mod tests {
                 None
             }
         });
-        assert_eq!(bt.lookup("Orders"), Some(&schema));
-        assert!(bt.lookup("orders").is_none());
+        assert_eq!(bt.lookup(&Qualifier::single("Orders")), Some(&schema));
+        assert!(bt.lookup(&Qualifier::single("orders")).is_none());
+    }
+
+    #[test]
+    fn build_from_plan_preserves_quoted_dot_catalog_key() {
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: Qualifier::single("a.b"),
+        });
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let bt =
+            BaseTypes::build_from_plan(&plan, |name| (name == "a.b").then_some(schema.clone()));
+
+        assert_eq!(bt.lookup(&Qualifier::single("a.b")), Some(&schema));
+        assert!(bt
+            .lookup(&Qualifier::from_parts(vec!["a".into(), "b".into()]))
+            .is_none());
     }
 
     #[test]
@@ -461,9 +505,12 @@ mod tests {
             }),
         });
         let tables = empty_scan_tables(&plan);
-        assert!(tables.contains(&"emp".to_owned()), "outer table collected");
         assert!(
-            tables.contains(&"dept".to_owned()),
+            tables.contains(&Qualifier::single("emp")),
+            "outer table collected"
+        );
+        assert!(
+            tables.contains(&Qualifier::single("dept")),
             "subquery-only table collected (Seam D)"
         );
     }
@@ -479,6 +526,6 @@ mod tests {
                 subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
             })],
         });
-        assert_eq!(empty_scan_tables(&plan), vec!["dept".to_owned()]);
+        assert_eq!(empty_scan_tables(&plan), vec![Qualifier::single("dept")]);
     }
 }

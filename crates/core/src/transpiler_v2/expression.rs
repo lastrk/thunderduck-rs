@@ -8,6 +8,7 @@
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
 use super::generator::Generator;
+use super::identifier::Qualifier;
 use super::name_fold::eq_fold;
 use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
@@ -229,7 +230,7 @@ pub fn decimal_value_precision_scale(s: &str) -> (u8, u8) {
 #[derive(Debug, Clone)]
 pub struct ColumnReference {
     pub name: String,
-    pub qualifier: Option<String>,
+    pub qualifier: Option<Qualifier>,
     pub data_type: DataType,
     pub nullable: bool,
     /// The [`super::schema::ExprId`] of the [`super::schema::Attribute`] this
@@ -294,48 +295,65 @@ impl PartialEq for ColumnReference {
 }
 
 /// An unresolved (pre-analysis) column reference.
-///
-/// `plan_id` is first-class per §2.3 — it identifies the proto DataFrame /
-/// plan node the reference belongs to. τ's analyzer uses this field as a
-/// resolution hint on join-side disambiguation. SparkSQL entries set
-/// SQL front-end references use `plan_id = None`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedColumn {
-    pub name: String,
-    pub qualifier: Option<String>,
+    /// Spark's parsed attribute-name parts, in source order. A quoted `b.c`
+    /// part after `a.` stays one part, while unquoted `a.b.c` has three.
+    pub name_parts: Vec<String>,
+    /// Connect DataFrame node target; SparkSQL references use `None`.
     pub plan_id: Option<i64>,
+    /// Whether Connect requested a metadata column rather than a data column.
+    pub is_metadata_column: bool,
 }
 
+pub(super) use super::identifier::display_identifier_parts as display_name_parts;
+
 impl UnresolvedColumn {
-    /// A bare pre-analysis name (qualifier/plan_id `None`) — the shape both
-    /// front-ends emit for an undotted identifier. NOT for dotted references:
-    /// `v2_lowering`'s `Expr::CompoundIdentifier` arm keeps its own literal,
-    /// since routing it here would drop the leading part instead of binding it
-    /// as the qualifier.
+    /// A bare pre-analysis name with no Connect metadata.
     pub fn bare(name: impl Into<String>) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.into(),
-            qualifier: None,
+            name_parts: vec![name.into()],
             plan_id: None,
+            is_metadata_column: false,
         })
+    }
+
+    /// Return the final parsed name part, if this reference is non-empty.
+    pub fn last_name_part(&self) -> Option<&str> {
+        self.name_parts.last().map(String::as_str)
+    }
+
+    /// Return the legacy name view derived from the parsed parts.
+    pub fn resolution_name(&self) -> std::borrow::Cow<'_, str> {
+        match self.name_parts.as_slice() {
+            [] => std::borrow::Cow::Borrowed(""),
+            [name] | [_, name] => std::borrow::Cow::Borrowed(name),
+            [_, tail @ ..] => std::borrow::Cow::Owned(
+                tail.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+        }
+    }
+
+    pub fn resolution_qualifier(&self) -> Option<&str> {
+        (self.name_parts.len() > 1).then(|| self.name_parts[0].as_str())
+    }
+
+    pub fn display_name(&self) -> String {
+        display_name_parts(&self.name_parts)
     }
 }
 
-/// Pattern-driven column expander (Spark `df.colRegex("`.*_id`")`).
-///
-/// Produced by the Spark Connect converter for `ExprType::UnresolvedRegex`.
-/// The analyzer's `Project` pre-pass expands this variant into N
-/// `UnresolvedColumn` references — one per input-schema field whose name
-/// matches [`Self::pattern`], preserving schema order. This variant MUST NOT
-/// reach emission; the defensive arm in `render_expr` returns
-/// `UnsupportedExpression` if it does.
+/// Pattern-driven column expansion from Spark's backtick regex syntax.
+/// The analyzer expands matches directly to resolved attribute references.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedRegexExpression {
-    /// The regex pattern, backticks already stripped by the converter.
+    /// The regex pattern, without its surrounding backticks.
     pub pattern: String,
-    /// Optional Spark Connect plan_id — propagated to every synthesized
-    /// [`UnresolvedColumn`] the analyzer produces.
-    pub plan_id: Option<i64>,
+    /// Optional relation qualifier preceding the backtick pattern.
+    pub qualifier: Option<Qualifier>,
 }
 
 /// Binary expression: left OP right.
@@ -396,10 +414,15 @@ pub struct AliasExpression {
     pub alias: String,
 }
 
-/// Star expression (`*` or `alias.*`).
+/// The three valid Spark star forms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StarExpression {
-    pub qualifier: Option<String>,
+pub enum StarExpression {
+    /// Ordinary `*`.
+    Unqualified,
+    /// Relation or struct target from `target.*`.
+    Qualified(Qualifier),
+    /// `df["*"]`, resolved against the exact Connect relation node.
+    DataFrame(i64),
 }
 
 /// The two states an embedded subquery's inner plan can be in.
@@ -686,9 +709,10 @@ impl Expression {
         match self {
             Expression::Literal(l) => l.data_type.clone(),
             Expression::ColumnReference(c) => c.data_type.clone(),
-            Expression::UnresolvedColumn(u) => {
-                TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
-            }
+            Expression::UnresolvedColumn(u) => match u.name_parts.as_slice() {
+                [name] => TypeInferenceEngine::column_type(name, schema),
+                _ => DataType::Unresolved,
+            },
             // Analyzer's Project pre-pass expands this variant before any
             // downstream inference; a defensive Unresolved is returned in the
             // unreachable case that it escapes.
@@ -770,11 +794,10 @@ impl Expression {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
             Expression::ColumnReference(c) => c.nullable,
-            Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(
-                &u.name,
-                u.qualifier.as_deref(),
-                schema,
-            ),
+            Expression::UnresolvedColumn(u) => match u.name_parts.as_slice() {
+                [name] => TypeInferenceEngine::column_nullable(name, schema),
+                _ => true,
+            },
             // Analyzer's Project pre-pass expands this variant before any
             // downstream inference; conservatively nullable in the unreachable
             // escape case.
@@ -898,8 +921,7 @@ impl Expression {
         for slot in self.children_mut() {
             // Cheap placeholder to take ownership of the child; overwritten
             // immediately (or the whole node is dropped on error).
-            let child =
-                std::mem::replace(slot, Expression::Star(StarExpression { qualifier: None }));
+            let child = std::mem::replace(slot, Expression::Star(StarExpression::Unqualified));
             *slot = f(child)?;
         }
         Ok(self)
@@ -915,12 +937,10 @@ impl Expression {
     /// `Interval` (both already carry their own final type, never derived by
     /// a walker).
     ///
-    /// This is the shared CORE only. Some walkers are opaque to strictly
-    /// more variants for reasons specific to that walk — the two resolution
-    /// walkers use [`Expression::is_resolve_opaque`] (core +
-    /// `UnresolvedRegex`); `opaque_to_subtree_promotion` ORs on `Window`
-    /// plus the subquery variants at the site, with a comment explaining
-    /// the delta. Never hand-copy the whole roster.
+    /// This is the shared CORE only. Some walkers add variants for reasons
+    /// specific to that walk: [`Expression::is_resolve_opaque`] also includes
+    /// `UnresolvedRegex`, while `opaque_to_subtree_promotion` adds `Window`
+    /// and subqueries at its call site. Never hand-copy the whole roster.
     pub(crate) fn is_opaque_unit(&self) -> bool {
         matches!(
             self,
@@ -931,12 +951,9 @@ impl Expression {
         )
     }
 
-    /// The opacity set of the two RESOLUTION walkers (`resolve_and_stamp`,
-    /// `substitute_lateral_aliases`): the shared core plus `UnresolvedRegex`,
-    /// which both pass through opaquely (`expand_regex_projections`
-    /// rewrites it before it reaches either walker; residuals surface via
-    /// emission's defensive arm). One authority for the pair so the extra
-    /// cannot drift between them.
+    /// Resolution opacity shared with lateral-alias substitution. Top-level
+    /// regexes expand before these walkers; `resolve_and_stamp` rejects any
+    /// residual nested regex before consulting this predicate.
     pub(crate) fn is_resolve_opaque(&self) -> bool {
         self.is_opaque_unit() || matches!(self, Expression::UnresolvedRegex(_))
     }
@@ -1431,6 +1448,20 @@ impl Expression {
                 .field_by_name(name)
                 .map(|f| f.data_type.clone())
                 .unwrap_or(DataType::Unresolved),
+            (DataType::Array(elem, contains_null), Some(name)) => {
+                if let DataType::Struct(st) = elem.as_ref() {
+                    return st
+                        .field_by_name(name)
+                        .map(|field| {
+                            DataType::Array(
+                                Box::new(field.data_type.clone()),
+                                *contains_null || field.nullable,
+                            )
+                        })
+                        .unwrap_or(DataType::Unresolved);
+                }
+                (**elem).clone()
+            }
             (DataType::Array(elem, _), _) => (**elem).clone(),
             (DataType::Map { value, .. }, _) => (**value).clone(),
             _ => DataType::Unresolved,
@@ -1458,6 +1489,11 @@ impl Expression {
             // Spark's rule intentionally does NOT OR-in `child.nullable`, so a
             // nullable array column still yields the above (the array-is-NULL
             // row is handled by the null-safe eval, not the schema flag).
+            (DataType::Array(elem, _), Some(_)) if matches!(elem.as_ref(), DataType::Struct(_)) => {
+                // Top-level nullability comes only from the array;
+                // element/field nullability lives in `ArrayType.containsNull`.
+                base_nullable
+            }
             (DataType::Array(_, contains_null), _) => {
                 match Self::const_int_index(ev.extraction.as_ref()) {
                     Some(i) => match Self::create_array_elements(ev.child.as_ref()) {
@@ -2004,6 +2040,30 @@ mod tests {
             extraction: Box::new(str_lit("a")),
         });
         assert_eq!(ev.data_type(&ResolvedSchema::empty()), DataType::Integer);
+        assert!(ev.nullable(&ResolvedSchema::empty()));
+    }
+
+    #[test]
+    fn array_struct_field_top_level_nullability_follows_array_expression() {
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "items",
+            DataType::Array(
+                Box::new(DataType::Struct(StructType::new(vec![
+                    StructField::nullable("value", DataType::Long),
+                ]))),
+                true,
+            ),
+        )]));
+        let ev = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(UnresolvedColumn::bare("items")),
+            extraction: Box::new(str_lit("value")),
+        });
+
+        assert!(!ev.nullable(&schema));
+        assert_eq!(
+            ev.data_type(&schema),
+            DataType::Array(Box::new(DataType::Long), true)
+        );
     }
 
     #[test]
@@ -2230,9 +2290,9 @@ mod tests {
     #[test]
     fn unresolved_column_carries_plan_id_field() {
         let u = UnresolvedColumn {
-            name: "id".to_owned(),
-            qualifier: None,
+            name_parts: vec!["id".to_owned()],
             plan_id: Some(42),
+            is_metadata_column: false,
         };
         assert_eq!(u.plan_id, Some(42));
     }
@@ -2241,12 +2301,12 @@ mod tests {
     fn unresolved_regex_variant_construction() {
         let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: ".*_id".to_owned(),
-            plan_id: Some(7),
+            qualifier: Some(Qualifier::single("t")),
         });
         match &expr {
             Expression::UnresolvedRegex(r) => {
                 assert_eq!(r.pattern, ".*_id");
-                assert_eq!(r.plan_id, Some(7));
+                assert_eq!(r.qualifier, Some(Qualifier::single("t")));
             }
             _ => panic!("expected UnresolvedRegex variant"),
         }
@@ -2257,7 +2317,7 @@ mod tests {
         let s = ResolvedSchema::empty();
         let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: ".*".to_owned(),
-            plan_id: None,
+            qualifier: None,
         });
         assert_eq!(expr.data_type(&s), DataType::Unresolved);
         assert!(expr.nullable(&s));
@@ -2267,9 +2327,9 @@ mod tests {
     fn unresolved_column_plan_id_none_default() {
         // SparkSQL front-end references have no plan id.
         let u = UnresolvedColumn {
-            name: "id".to_owned(),
-            qualifier: None,
+            name_parts: vec!["id".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         };
         assert!(u.plan_id.is_none());
     }

@@ -1,6 +1,6 @@
 # Architecture Reference
 
-> **Scope: τ (the only production path per ADR-022).** This document is the condensed reference for the current transpiler. The authoritative design is [`docs/thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
+> **Scope: τ (the only production path per ADR-022).** This document is the condensed reference for the current transpiler. The authoritative design is [`docs/thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
 
 ## SQL Generation Architecture Principles
 
@@ -67,12 +67,16 @@ module.
 | **Converter** | `V2RelationConverter` | Spark Connect protobuf Relation → `CommonAst` |
 | **Converter** | `V2ExpressionConverter` | Spark Connect protobuf Expression → τ `Expression` |
 | **Parser** | `SparkSqlParserV2` | sqlparser-rs based Spark SQL parser (raw SQL path) → `CommonAst` |
-| **IR** | `CommonAst` / `CommonOp` (enum) | Shared IR — same tree fed by both front-ends |
+| **IR** | `CommonAst` / `CommonOp` (enum) | Shared operator tree plus optional Connect node ID; SparkSQL IDs are `None` |
 | **Expression** | τ `Expression` (enum) | τ's Spark-parity expression types with `data_type()` / `nullable()` |
-| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, resolved_schema: ResolvedSchema }` — each `Attribute` carries name/type/nullability plus a stable `ExprId` and source-qualifier lineage (ADR-024); `StructType` is produced only at the `mod.rs` wire boundary |
+| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, plan_id, resolved_schema }` — each `Attribute` carries name/type/nullability, stable `ExprId`, origin lineage, and its current Catalyst qualifier; hidden USING outputs live in relation scope (ADR-024); `StructType` is produced only at the `mod.rs` wire boundary |
 | **Emission** | `dispatch_op()` / `render_expr()` | Traverses `TypedAst`, produces DuckDB SQL |
 | **Runtime** | `DuckDbSession` | Owns `duckdb::Connection` on its dedicated OS thread |
 | **Types** | `TypeInferenceEngine` | Resolves expression types following Spark semantics |
+
+Missing-column recovery preserves Catalyst operator identity: SQL `Distinct`
+is separate from Dataset `Deduplicate`, and recovered child attributes do not
+change frozen deduplication keys or `NaDrop` predicates.
 
 ## Emission entry points
 
@@ -137,6 +141,21 @@ Both paths converge on the shared `CommonAst` before emission:
 Both paths flow through τ's analyzer for full type awareness before emission.
 
 **Implication**: type-inference and emission fixes affect both raw SQL and DataFrame queries.
+
+## Spark Connect plan IDs (ADR-026)
+
+A Connect `plan_id` locates a logical-plan node; it is not attribute lineage.
+`CommonAst` and `TypedAst` retain each node's optional ID; tagged cosmetic
+relations use a SQL-transparent `PlanBoundary`. Connect attributes retain their
+plan and metadata tags, while stars use distinct unqualified, qualified, and
+DataFrame-targeted states; true regexes carry no plan ID. `PlanIdResolver`
+searches the roots owned by each analyzer rule top-down, stops at the matching
+node, and filters candidates through ancestor `ExprId` outputs. See ADR-026 for
+depth, star, `Union`, and error rules. Projection-list DataFrame stars and true
+regexes expand normally; either form nested inside another expression validates
+its plan ID or regex first, then returns an explicit Thunderduck boundary rather
+than degrading to SQL `*`. Plan-tagged columns inside opaque lambda bodies
+likewise validate plan lookup before returning an explicit boundary.
 
 ## Spark Parity Requirements
 

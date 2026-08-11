@@ -46,13 +46,15 @@ use super::ast::{
 use super::base_types::BaseTypes;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
-    materialize_binary_coercions, AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
-    CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
-    LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
+    display_name_parts, materialize_binary_coercions, AliasExpression, BinaryExpression, BinaryOp,
+    CaseWhenExpression, CastExpression, ColumnReference, Expression, ExtractValueExpression,
+    FunctionCall, Literal, LiteralValue, SortOrder, StarExpression, SubqueryPlan, UnaryExpression,
+    UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
 };
 use super::generator::{Generator, GeneratorKind};
+use super::identifier::Qualifier;
 use super::name_fold::{eq_fold, fold_key};
-use super::schema::{Attribute, ResolvedSchema};
+use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
 };
@@ -69,12 +71,13 @@ pub(super) const DEFAULT_SUMMARY_STATS: &[&str] =
 /// τ's resolved schema type alias.
 pub type Schema = ResolvedSchema;
 
-/// A typed plan node: an operator plus its resolved output schema and the
-/// alias scope that output exposes.
+/// A typed plan node with resolved output facts and optional Connect identity.
 #[derive(Debug, Clone)]
 pub struct TypedAst {
     /// The typed operator this node represents.
     pub op: TypedOp,
+    /// Spark Connect's external identifier for this exact relation node.
+    pub plan_id: Option<i64>,
     /// The schema of the relation produced by this node — every field has
     /// a resolved (non-`Unresolved`) [`DataType`] and a known `nullable` flag.
     pub resolved_schema: ResolvedSchema,
@@ -85,12 +88,13 @@ pub struct TypedAst {
     pub scope: RelScope,
 }
 
-/// Equality deliberately ignores `scope`: it is derived data, fully
-/// determined by `(op, resolved_schema)`, and existing analyzer tests
-/// assert equality over the semantic pair only.
+/// Equality deliberately ignores `scope`, which is derived from the other
+/// fields.
 impl PartialEq for TypedAst {
     fn eq(&self, other: &Self) -> bool {
-        self.op == other.op && self.resolved_schema == other.resolved_schema
+        self.op == other.op
+            && self.plan_id == other.plan_id
+            && self.resolved_schema == other.resolved_schema
     }
 }
 
@@ -104,15 +108,15 @@ impl TypedAst {
         let scope = RelScope::of(&op, &resolved_schema);
         Self {
             op,
+            plan_id: None,
             resolved_schema,
             scope,
         }
     }
 }
 
-/// The schema/scope-PASSTHROUGH operator class: position/count-preserving
-/// unary operators through which alias bindings (bottom-up, [`RelScope::of`])
-/// flow unchanged.
+/// Position/count-preserving unary operators through which alias bindings
+/// (bottom-up, [`RelScope::of`]) flow unchanged.
 /// The single authority for that classification — the scope walk matches on
 /// this pattern, so adding a variant here updates it in lockstep, and the
 /// match is exhaustive so a NEW `TypedOp` variant is a compile error until
@@ -120,137 +124,103 @@ impl TypedAst {
 macro_rules! scope_passthrough {
     ($input:ident) => {
         TypedOp::Filter { input: $input, .. }
+            | TypedOp::PlanBoundary { input: $input }
             | TypedOp::Sort { input: $input, .. }
             | TypedOp::Limit { input: $input, .. }
             | TypedOp::Sample { input: $input, .. }
             | TypedOp::SampleBy { input: $input, .. }
             | TypedOp::Deduplicate { input: $input, .. }
-            | TypedOp::NaFill { input: $input, .. }
+            | TypedOp::Distinct { input: $input }
             | TypedOp::NaDrop { input: $input, .. }
-            | TypedOp::NaReplace { input: $input, .. }
     };
 }
 
-/// The alias scope a relation's OUTPUT exposes: which qualifiers (table
-/// names, user aliases, generator qualifiers) bind to which contiguous
-/// field ranges of the node's `resolved_schema`, plus the plan_id →
-/// join-side bindings used for DataFrame `plan_id` disambiguation.
+/// Unary operators through which Spark retries missing Sort/Filter attributes.
+/// SQL `Distinct` is scope-transparent but deliberately absent here.
+macro_rules! missing_column_passthrough {
+    ($input:ident) => {
+        TypedOp::Filter { input: $input, .. }
+            | TypedOp::PlanBoundary { input: $input }
+            | TypedOp::Sort { input: $input, .. }
+            | TypedOp::Limit { input: $input, .. }
+            | TypedOp::Sample { input: $input, .. }
+            | TypedOp::SampleBy { input: $input, .. }
+            | TypedOp::Deduplicate { input: $input, .. }
+            | TypedOp::NaDrop { input: $input, .. }
+    };
+}
+
+/// Resolution metadata exposed by a relation output.
 ///
 /// Ranges are relative to THIS node's schema (base 0); consumers offset when
 /// composing (a join's right side shifts by the left side's field count).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
-    pub aliases: Vec<(String, std::ops::Range<usize>)>,
-    /// `(plan_id, field-range)` bindings, outermost join first —
-    /// [`RelScope::lookup_plan_id`] uses first match, so the nearest
-    /// enclosing join's range wins. Plan-id references are bound bare and
-    /// carry the resolved attribute identity for emission-side binding.
-    pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>)>,
-    /// plan_ids bound on BOTH the left AND right side of the SAME join —
-    /// the un-realiased self-join `df.join(df, ...)` reusing the identical
-    /// underlying relation on both sides without a fresh alias. Any
-    /// reference to one of these plan_ids is genuinely ambiguous (Spark
-    /// itself cannot tell which side is meant), so
-    /// [`RelScope::plan_id_is_ambiguous`] is checked BEFORE
-    /// [`RelScope::lookup_plan_id`]'s first-match. Distinct from a plan_id
-    /// repeated at multiple NESTING levels on the SAME side (outermost-wins,
-    /// see `plan_ids` above) — that case never lands here.
-    ambiguous_plan_ids: Vec<i64>,
+    pub aliases: Vec<(Qualifier, std::ops::Range<usize>)>,
+    /// Qualified-only USING/NATURAL outputs retained by Spark metadata.
+    hidden_using_donors: Vec<Attribute>,
 }
 
 impl RelScope {
-    /// ALL field ranges bound to `q`, case-insensitively, in tree order.
-    /// Distinguishes 0 / 1 / 2+ matches — [`RelScope::lookup`] collapses 2+
-    /// into `None` for the legacy name-only fallback; callers that must
-    /// raise `AmbiguousColumn` on 2+ (tier e/f in `resolve_column`) use this
-    /// instead.
-    fn lookup_all(&self, q: &str) -> Vec<std::ops::Range<usize>> {
+    fn lookup_ranges(&self, q: &Qualifier) -> Vec<std::ops::Range<usize>> {
         self.aliases
             .iter()
-            .filter(|(name, _)| eq_fold(name, q))
+            .filter(|(name, _)| name.matches_suffix(q))
             .map(|(_, range)| range.clone())
             .collect()
     }
 
-    /// The field range `q` binds to, iff EXACTLY ONE binding matches `q`
-    /// case-insensitively. A duplicate name — e.g. a self-join `emp e1 JOIN
-    /// emp e2` referenced by the bare table name `emp` — is ambiguous by
-    /// construction; return `None` so the caller falls back to the legacy
-    /// name-only resolution instead of picking an arbitrary side.
-    fn lookup(&self, q: &str) -> Option<std::ops::Range<usize>> {
-        let matches = self.lookup_all(q);
-        match matches.len() {
-            1 => Some(matches.into_iter().next().expect("len checked")),
-            _ => None,
+    fn sparsified(&self) -> Self {
+        Self {
+            aliases: Vec::new(),
+            hidden_using_donors: self.hidden_using_donors.clone(),
         }
     }
 
-    /// The field range a plan_id maps to. When a plan_id appears in multiple
-    /// ancestor joins (nested join trees), the OUTERMOST entry wins —
-    /// [`RelScope::of`] pushes parent entries before child entries, so the
-    /// first match wins at the parent operator's resolution point.
-    fn lookup_plan_id(&self, pid: i64) -> Option<std::ops::Range<usize>> {
-        self.plan_ids
-            .iter()
-            .find(|(id, _)| *id == pid)
-            .map(|(_, range)| range.clone())
+    fn hidden_only(&self) -> Self {
+        Self {
+            hidden_using_donors: self.hidden_using_donors.clone(),
+            ..Self::default()
+        }
     }
 
-    /// `true` iff `pid` is bound on both sides of the SAME join (see
-    /// `ambiguous_plan_ids` doc) — checked BEFORE [`RelScope::lookup_plan_id`]
-    /// so callers raise `AmbiguousColumn` instead of silently binding the
-    /// left side.
-    fn plan_id_is_ambiguous(&self, pid: i64) -> bool {
-        self.ambiguous_plan_ids.contains(&pid)
-    }
-
-    /// Derive the scope a just-built operator exposes. Shallow: children are
-    /// already stamped, so this reads their `scope` fields and offsets
-    /// ranges — it never re-walks a subtree.
+    /// Derive the scope exposed by a just-built operator.
     ///
-    /// Binding rules:
+    /// Key rules:
     /// - `TableScan{table}`: bind `table` to the full range.
     /// - `AliasedRelation{alias}`: bind `alias` to the full range; the child's
     ///   scope is dropped — emission re-scopes everything under it to `alias`.
-    /// - `Join` with non-empty `using_columns`: EMPTY. USING output reorders
-    ///   and dedups columns, so no contiguous-range invariant holds — USING
-    ///   joins keep resolving via the legacy name-only path.
+    /// - `Join` with `using_columns`: no coarse ranges; hidden donors remain
+    ///   available only for boundary detection.
     /// - `Join{LeftSemi | LeftAnti}`: left side only — the right side
     ///   contributes no columns to the output schema.
-    /// - Any other `Join`: own plan_id entries FIRST (outermost-wins), then
-    ///   the left child's scope at base 0 and the right child's offset by
-    ///   `left.resolved_schema.len()`.
+    /// - Any other `Join`: merge alias ranges from both sides.
     /// - Schema-verbatim passthroughs (`Filter` / `Sort` / `Limit` / `Sample`
-    ///   / `SampleBy` / `Deduplicate` / `NaFill` / `NaDrop` / `NaReplace`):
-    ///   the child's scope verbatim — these clone the input schema
-    ///   field-for-field (position/count preserved), so the contiguous-range
-    ///   invariant holds through them.
+    ///   / `SampleBy` / `Deduplicate` / `Distinct` / `NaDrop`): the child's
+    ///   scope verbatim.
+    /// - `NaFill` / `NaReplace`: drop coarse aliases; per-attribute lineage
+    ///   distinguishes transformed and untouched slots.
     /// - `Generate`: preserve the input scope and bind its optional qualifier
     ///   to the appended generated columns.
-    /// - Everything else (`Project` / `Aggregate` / `SetOp` / `WithColumns` /
-    ///   `Values` / `LocalRelation` / `TableFunction` / `Pivot` / ...):
-    ///   EMPTY — these operators retype or reshuffle columns, so no alias
-    ///   binding from further down is valid against the CURRENT schema.
+    /// - Project-like operators preserve hidden donors; aggregates, set ops,
+    ///   and relation aliases clear them.
+    /// - Operators that retype or reshuffle columns expose no coarse ranges.
     fn of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> Self {
         match op {
             TypedOp::TableScan { table } => Self {
                 aliases: vec![(table.clone(), 0..resolved_schema.len())],
-                plan_ids: Vec::new(),
-                ambiguous_plan_ids: Vec::new(),
+                hidden_using_donors: Vec::new(),
             },
             TypedOp::AliasedRelation { alias, .. } => Self {
-                aliases: vec![(alias.clone(), 0..resolved_schema.len())],
-                plan_ids: Vec::new(),
-                ambiguous_plan_ids: Vec::new(),
+                aliases: vec![(Qualifier::single(alias.clone()), 0..resolved_schema.len())],
+                hidden_using_donors: Vec::new(),
             },
             TypedOp::Join {
                 using_columns,
                 left,
                 right,
                 join_type,
-                left_plan_ids,
-                right_plan_ids,
                 ..
             } => {
                 // The USING gate stays HERE, not inside `merge_join_scopes`:
@@ -259,15 +229,26 @@ impl RelScope {
                 // USING join's *condition* still resolves against the plain
                 // merged schema via `for_join_condition`.
                 if !using_columns.is_empty() {
-                    return Self::default();
+                    return Self {
+                        hidden_using_donors: using_join_hidden_donors(
+                            left,
+                            right,
+                            *join_type,
+                            using_columns,
+                        ),
+                        ..Self::default()
+                    };
                 }
                 let right_side = match join_type {
                     JoinType::LeftSemi | JoinType::LeftAnti => RightSide::Drop,
                     _ => RightSide::Keep,
                 };
-                merge_join_scopes(left, right, left_plan_ids, right_plan_ids, right_side)
+                merge_join_scopes(left, right, right_side)
             }
             scope_passthrough!(input) => input.scope.clone(),
+            TypedOp::NaFill { input, .. } | TypedOp::NaReplace { input, .. } => {
+                input.scope.sparsified()
+            }
             TypedOp::Generate {
                 input,
                 qualifier: Some(qualifier),
@@ -275,9 +256,10 @@ impl RelScope {
             } => {
                 let mut scope = input.scope.clone();
                 let start = input.resolved_schema.len();
-                scope
-                    .aliases
-                    .push((qualifier.clone(), start..start + generator.aliases.len()));
+                scope.aliases.push((
+                    Qualifier::single(qualifier.clone()),
+                    start..start + generator.aliases.len(),
+                ));
                 scope
             }
             TypedOp::Generate {
@@ -285,22 +267,22 @@ impl RelScope {
                 qualifier: None,
                 ..
             } => input.scope.clone(),
+            TypedOp::Project { input, .. }
+            | TypedOp::WithColumns { input, .. }
+            | TypedOp::DropColumns { input, .. }
+            | TypedOp::WithColumnsRenamed { input, .. } => input.scope.hidden_only(),
             // Everything below retypes or reshuffles columns: no alias
             // binding from further down is valid against the CURRENT schema.
             // Deliberately exhaustive (no `_`) so a new TypedOp variant
             // forces an explicit scope classification here (the compiler
             // enforces the update).
-            TypedOp::Project { .. }
-            | TypedOp::Aggregate { .. }
+            TypedOp::Aggregate { .. }
             | TypedOp::SetOp { .. }
             | TypedOp::SingleRow
             | TypedOp::Values { .. }
             | TypedOp::LocalRelation { .. }
             | TypedOp::FileScan { .. }
             | TypedOp::TableFunction { .. }
-            | TypedOp::WithColumns { .. }
-            | TypedOp::DropColumns { .. }
-            | TypedOp::WithColumnsRenamed { .. }
             | TypedOp::Describe { .. }
             | TypedOp::Summary { .. }
             | TypedOp::FreqItems { .. }
@@ -314,68 +296,64 @@ impl RelScope {
 /// Whether a join's RIGHT side contributes columns to the merged range space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RightSide {
-    /// Bind the right side's own plan_ids and offset-merge its child scope.
+    /// Offset-merge the right child's scope.
     Keep,
-    /// `LeftSemi` / `LeftAnti` output: the right side contributes no columns,
-    /// so nothing from it binds — and a plan_id on both sides is NOT
-    /// ambiguous, since only the left occurrence is reachable.
+    /// `LeftSemi` / `LeftAnti` output omits the right child's scope.
     Drop,
+}
+
+fn using_join_hidden_donors(
+    left: &TypedAst,
+    right: &TypedAst,
+    join_type: JoinType,
+    using_columns: &[String],
+) -> Vec<Attribute> {
+    let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+    let mut donors = left.scope.hidden_using_donors.clone();
+    if keep_right {
+        donors.extend(right.scope.hidden_using_donors.iter().cloned());
+    }
+
+    let mut add_keys = |schema: &ResolvedSchema, nullable: bool| {
+        for name in using_columns {
+            let Some(field) = schema.field_by_name(name) else {
+                continue;
+            };
+            if donors.iter().any(|donor| donor.expr_id == field.expr_id) {
+                continue;
+            }
+            let mut donor = field.clone();
+            donor.nullable |= nullable;
+            donors.push(donor);
+        }
+    };
+
+    match join_type {
+        JoinType::Inner | JoinType::Left => {
+            add_keys(&right.resolved_schema, join_type == JoinType::Left)
+        }
+        JoinType::Right => add_keys(&left.resolved_schema, true),
+        JoinType::Full => {
+            add_keys(&left.resolved_schema, true);
+            add_keys(&right.resolved_schema, true);
+        }
+        JoinType::Cross | JoinType::LeftSemi | JoinType::LeftAnti => {}
+    }
+    donors
 }
 
 /// Offset-merge two already-stamped child scopes into the single range space a
 /// `left ⋈ right` schema exposes — the one home of the join
 /// scope-composition rules, shared by [`RelScope::of`]'s Join arm and
 /// [`ResolveContext::for_join_condition`].
-///
-/// Push ORDER is contractual, not incidental: `lookup` / `lookup_plan_id` take
-/// the first match, so this join's OWN plan_id entries must precede the
-/// children's (nearest enclosing join wins) and left must precede right.
-fn merge_join_scopes(
-    left: &TypedAst,
-    right: &TypedAst,
-    left_plan_ids: &[i64],
-    right_plan_ids: &[i64],
-    right_side: RightSide,
-) -> RelScope {
+fn merge_join_scopes(left: &TypedAst, right: &TypedAst, right_side: RightSide) -> RelScope {
     let keep_right = right_side == RightSide::Keep;
     let left_len = left.resolved_schema.len();
-    let left_range = 0..left_len;
-    let right_range = left_len..left_len + right.resolved_schema.len();
     let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
 
-    // A plan_id present on both sides of an unaliased self-join is ambiguous.
-    let own_ambiguous: Vec<i64> = if keep_right {
-        left_plan_ids
-            .iter()
-            .filter(|pid| right_plan_ids.contains(pid))
-            .copied()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut plan_ids = Vec::new();
-    for &pid in left_plan_ids {
-        plan_ids.push((pid, left_range.clone()));
-    }
-    if keep_right {
-        for &pid in right_plan_ids {
-            plan_ids.push((pid, right_range.clone()));
-        }
-    }
-    plan_ids.extend(left.scope.plan_ids.iter().cloned());
-    let mut ambiguous_plan_ids = own_ambiguous;
-    ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
     let mut aliases = left.scope.aliases.clone();
+    let mut hidden_using_donors = left.scope.hidden_using_donors.clone();
     if keep_right {
-        plan_ids.extend(
-            right
-                .scope
-                .plan_ids
-                .iter()
-                .map(|(pid, r)| (*pid, offset(r))),
-        );
-        ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
         aliases.extend(
             right
                 .scope
@@ -383,11 +361,27 @@ fn merge_join_scopes(
                 .iter()
                 .map(|(name, r)| (name.clone(), offset(r))),
         );
+        hidden_using_donors.extend(right.scope.hidden_using_donors.iter().cloned());
     }
     RelScope {
         aliases,
-        plan_ids,
-        ambiguous_plan_ids,
+        hidden_using_donors,
+    }
+}
+
+/// Original inputs and operator-owned outputs used during missing-column recovery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingColumnRecovery {
+    pub(super) input_ids: Vec<ExprId>,
+    pub(super) outputs: Vec<Expression>,
+}
+
+impl MissingColumnRecovery {
+    fn new(input: &ResolvedSchema) -> Self {
+        Self {
+            input_ids: input.fields.iter().map(|field| field.expr_id).collect(),
+            outputs: Vec::new(),
+        }
     }
 }
 
@@ -467,10 +461,6 @@ pub enum TypedOp {
         using_columns: Vec<String>,
         /// Whether this is a LATERAL join (correlated derived-table join).
         lateral: bool,
-        /// Plan-ids appearing anywhere under the left side.
-        left_plan_ids: Vec<i64>,
-        /// Plan-ids appearing anywhere under the right side.
-        right_plan_ids: Vec<i64>,
     },
     /// A set operation (UNION / INTERSECT / EXCEPT).
     SetOp {
@@ -496,8 +486,8 @@ pub enum TypedOp {
     /// A named table scan. Aliases live on an enclosing `AliasedRelation`
     /// (see [`CommonOp::TableScan`]).
     TableScan {
-        /// The table name.
-        table: String,
+        /// Parsed table name.
+        table: Qualifier,
     },
     /// An in-line `VALUES` relation.
     Values {
@@ -544,6 +534,8 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// One `(column_name, expression)` per proto Alias, order preserved.
         assignments: Vec<(String, Expression)>,
+        /// Temporary outputs added by Spark's missing-attribute rule.
+        recovery: MissingColumnRecovery,
     },
     /// `df.drop(col1, ...)`. Analyzer computes the output schema as input
     /// schema minus the named columns.
@@ -552,6 +544,8 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// The names to drop.
         drop_names: Vec<String>,
+        /// Temporary outputs added by Spark's missing-attribute rule.
+        recovery: MissingColumnRecovery,
     },
     /// `df.alias(name)`. Schema-transparent; alias retained for scope.
     AliasedRelation {
@@ -559,6 +553,11 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// The alias name.
         alias: String,
+    },
+    /// A retained Spark Connect plan boundary with no SQL semantics.
+    PlanBoundary {
+        /// The relation below the boundary.
+        input: Box<TypedAst>,
     },
     /// `df.withColumnsRenamed({old: new, ...})` and `df.toDF(...)`. The
     /// analyzer computes the renamed output schema at construction (walking
@@ -568,6 +567,8 @@ pub enum TypedOp {
     WithColumnsRenamed {
         /// The input relation.
         input: Box<TypedAst>,
+        /// Temporary outputs added by Spark's missing-attribute rule.
+        recovery: MissingColumnRecovery,
     },
     /// `df.describe(...)`. Analyzer materialises `cols` (empty ⇒ all input
     /// columns in schema order) and stamps the output schema as `summary`
@@ -615,10 +616,15 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// Optional subset of columns.
         on_columns: Vec<String>,
+        /// Original public attributes whose identities freeze deduplication keys.
+        recovery: MissingColumnRecovery,
     },
-    /// `df.na.fill`. Schema-transparent (nullability MAY tighten but we
-    /// leave it as-is; emission uses COALESCE which preserves the arg's
-    /// declared nullability).
+    /// SQL `SELECT DISTINCT`. Missing-column recovery stops at this node.
+    Distinct {
+        /// The input relation.
+        input: Box<TypedAst>,
+    },
+    /// `df.na.fill`. Preserves names and positions; filled outputs are aliases.
     NaFill {
         /// The input relation.
         input: Box<TypedAst>,
@@ -626,6 +632,8 @@ pub enum TypedOp {
         cols: Vec<String>,
         /// Fill values.
         values: Vec<Expression>,
+        /// Temporary outputs added by Spark's missing-attribute rule.
+        recovery: MissingColumnRecovery,
     },
     /// `df.na.drop`. Schema-transparent.
     NaDrop {
@@ -635,8 +643,10 @@ pub enum TypedOp {
         cols: Vec<String>,
         /// Optional min non-nulls.
         min_non_nulls: Option<i32>,
+        /// Original public attributes whose identities freeze the null predicate.
+        recovery: MissingColumnRecovery,
     },
-    /// `df.na.replace`. Schema-transparent.
+    /// `df.na.replace`. Preserves names and positions; replaced outputs are aliases.
     NaReplace {
         /// The input relation.
         input: Box<TypedAst>,
@@ -644,6 +654,8 @@ pub enum TypedOp {
         cols: Vec<String>,
         /// (old, new) pairs.
         replacements: Vec<(Expression, Expression)>,
+        /// Temporary outputs added by Spark's missing-attribute rule.
+        recovery: MissingColumnRecovery,
     },
     /// `df.unpivot(...)` / `df.melt(...)`. Wide → long. The analyzer
     /// expands empty `values` to "all non-id columns" and stamps the output
@@ -729,6 +741,49 @@ pub enum TypedOp {
     },
 }
 
+impl TypedOp {
+    fn children(&self) -> Vec<&TypedAst> {
+        match self {
+            Self::Join { left, right, .. }
+            | Self::RecursiveCte {
+                anchor: left,
+                recursive_term: right,
+                ..
+            } => vec![left, right],
+            Self::SetOp { children, .. } => children.iter().collect(),
+            Self::Project { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Sort { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Aggregate { input, .. }
+            | Self::WithColumns { input, .. }
+            | Self::DropColumns { input, .. }
+            | Self::AliasedRelation { input, .. }
+            | Self::PlanBoundary { input }
+            | Self::WithColumnsRenamed { input, .. }
+            | Self::Describe { input, .. }
+            | Self::Summary { input, .. }
+            | Self::FreqItems { input, .. }
+            | Self::Deduplicate { input, .. }
+            | Self::Distinct { input }
+            | Self::NaFill { input, .. }
+            | Self::NaDrop { input, .. }
+            | Self::NaReplace { input, .. }
+            | Self::Unpivot { input, .. }
+            | Self::Sample { input, .. }
+            | Self::SampleBy { input, .. }
+            | Self::Generate { input, .. }
+            | Self::Pivot { input, .. } => vec![input],
+            Self::SingleRow
+            | Self::TableScan { .. }
+            | Self::Values { .. }
+            | Self::LocalRelation { .. }
+            | Self::FileScan { .. }
+            | Self::TableFunction { .. } => Vec::new(),
+        }
+    }
+}
+
 /// Errors surfaced by the τ analyzer. They are classified per ADR-022:
 ///
 /// - **Spark-emulated** — errors reference Spark would also raise. The client
@@ -773,12 +828,9 @@ pub enum AnalyzerError {
         candidates: Vec<String>,
     },
 
-    /// A plan_id-tagged reference binds the SAME join-side plan_id on BOTH sides
-    /// of one join (the un-realiased self-join `df.join(df, …)`). Spark cannot
-    /// tell which side is meant. Distinct Spark class from `AmbiguousColumn`
-    /// (bare-name ambiguity): AMBIGUOUS_COLUMN_REFERENCE (42702) vs
-    /// AMBIGUOUS_REFERENCE (42704).
-    #[error("[SPARK-EMULATED] column `{name}` is ambiguous — the same DataFrame is joined on both sides")]
+    /// A plan_id-tagged reference has competing candidates. Distinct Spark
+    /// class from bare-name [`Self::AmbiguousColumn`] ambiguity.
+    #[error("[SPARK-EMULATED] column `{name}` has ambiguous plan-id candidates")]
     AmbiguousColumnReference {
         /// The ambiguous column name.
         name: String,
@@ -1019,16 +1071,20 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
             .iter()
             .all(|row| row.iter().all(expression_is_fully_resolved)),
         TypedOp::TableFunction { args, .. } => args.iter().all(expression_is_fully_resolved),
-        TypedOp::WithColumns { input, assignments } => {
+        TypedOp::WithColumns {
+            input, assignments, ..
+        } => {
             has_resolved_schema(input)
                 && assignments
                     .iter()
                     .all(|(_, e)| expression_is_fully_resolved(e))
         }
         TypedOp::Limit { input, .. }
+        | TypedOp::PlanBoundary { input }
         | TypedOp::DropColumns { input, .. }
         | TypedOp::AliasedRelation { input, .. }
         | TypedOp::WithColumnsRenamed { input, .. }
+        | TypedOp::Distinct { input }
         | TypedOp::Deduplicate { input, .. }
         | TypedOp::NaFill { input, .. }
         | TypedOp::NaDrop { input, .. }
@@ -1112,7 +1168,7 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
 /// Analyze `input`, clone its resolved schema, and wrap it in a caller-built
 /// [`TypedOp`] variant. The output schema is a straight passthrough — used by
 /// operators that neither add, drop, nor retype columns (Filter, Sort, Limit,
-/// Deduplicate, Sample, SampleBy, NaDrop, NaReplace). `AliasedRelation`
+/// Deduplicate, Distinct, Sample, SampleBy, NaDrop). `AliasedRelation`
 /// resets lineage to its own alias and is built separately.
 ///
 /// The `build_op` closure receives the typed input by value so it can move it
@@ -1130,13 +1186,17 @@ fn passthrough_schema_arm(
     Ok(TypedAst::new(op, resolved_schema))
 }
 
-/// Seed every output attribute with the same source-qualifier set.
-fn seed_source_quals(schema: ResolvedSchema, quals: BTreeSet<String>) -> ResolvedSchema {
+/// Set one leaf or alias qualifier across a schema.
+fn qualify_schema(schema: ResolvedSchema, qualifier: Qualifier) -> ResolvedSchema {
+    let source_quals: BTreeSet<Qualifier> = [qualifier.clone()].into_iter().collect();
     ResolvedSchema::new(
         schema
             .fields
             .into_iter()
-            .map(|f| f.with_quals(quals.clone()))
+            .map(|f| {
+                f.with_quals(source_quals.clone())
+                    .with_qualifier(qualifier.clone())
+            })
             .collect(),
     )
 }
@@ -1146,25 +1206,33 @@ fn analyze_node(
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    match ast.op {
+    let CommonAst { op, plan_id } = ast;
+    let mut typed = analyze_op(op, base_types, outer)?;
+    typed.plan_id = plan_id;
+    Ok(typed)
+}
+
+fn analyze_op(
+    op: CommonOp,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<TypedAst, AnalyzerError> {
+    match op {
         CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
 
         CommonOp::TableScan { table } => {
-            // resolve: seed schema from base_types.
             let schema =
                 base_types
                     .lookup(&table)
                     .cloned()
                     .ok_or_else(|| AnalyzerError::UnknownTable {
-                        name: table.clone(),
+                        name: table.display_name(),
                     })?;
-            // A table scan mints fresh ids and seeds every column with the
-            // table qualifier. An enclosing alias replaces that lineage.
-            let mut quals = BTreeSet::new();
-            quals.insert(table.clone());
             Ok(TypedAst::new(
-                TypedOp::TableScan { table },
-                seed_source_quals(ResolvedSchema::minted(schema), quals),
+                TypedOp::TableScan {
+                    table: table.clone(),
+                },
+                qualify_schema(ResolvedSchema::minted(schema), table),
             ))
         }
 
@@ -1239,22 +1307,24 @@ fn analyze_node(
             let typed_input = analyze_node(*input, base_types, outer)?;
             // Expand regex projections before resolution.
             let projections = expand_regex_projections(projections, &typed_input.resolved_schema)?;
-            if projections.iter().any(contains_generator) {
+            let projections = expand_relation_stars(projections, &typed_input)?;
+            if projections
+                .iter()
+                .any(|projection| contains_generator(&projection.expression))
+            {
                 return analyze_generator_project(typed_input, projections, base_types, outer);
             }
+            let (projections, output_overrides) = split_expanded_projections(projections);
             // Inline earlier SELECT-list aliases for Spark's lateral-column
             // alias behavior before ordinary resolution.
             let projections =
                 expand_lateral_column_aliases(projections, &typed_input.resolved_schema)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
-            // Give each computed output a name, matching Spark's
-            // `UnresolvedAlias` → `Alias` resolution.
-            let projections = projections
-                .into_iter()
-                .map(|e| resolve_and_stamp(e, &ctx).map(ensure_named))
-                .collect::<Result<Vec<_>, _>>()?;
+            let (projections, output_overrides) =
+                resolve_named_expressions(projections, output_overrides, &ctx)?;
             // Compute output schema — expand Star; take alias name if present.
-            let output_schema = project_output_schema(&projections, &typed_input)?;
+            let output_schema =
+                project_output_schema(&projections, &output_overrides, &typed_input)?;
             Ok(TypedAst::new(
                 TypedOp::Project {
                     input: Box::new(typed_input),
@@ -1265,14 +1335,19 @@ fn analyze_node(
         }
 
         CommonOp::Filter { input, condition } => {
-            passthrough_schema_arm(*input, base_types, outer, |ti| {
-                let ctx = ResolveContext::of_input(&ti, base_types, outer);
-                let condition = resolve_boolean_predicate(condition, &ctx, "filter-condition")?;
-                Ok(TypedOp::Filter {
-                    input: Box::new(ti),
+            let mut typed_input = analyze_node(*input, base_types, outer)?;
+            let original_schema = typed_input.resolved_schema.clone();
+            let condition =
+                analyze_filter_condition(condition, &mut typed_input, base_types, outer)?;
+            let extended_schema = typed_input.resolved_schema.clone();
+            let filter = TypedAst::new(
+                TypedOp::Filter {
+                    input: Box::new(typed_input),
                     condition,
-                })
-            })
+                },
+                extended_schema,
+            );
+            Ok(trim_hidden_outputs(filter, original_schema))
         }
 
         CommonOp::Sort {
@@ -1294,28 +1369,7 @@ fn analyze_node(
                 },
                 extended_schema.clone(),
             );
-            if extended_schema.len() == original_schema.len() {
-                Ok(sort)
-            } else {
-                // Hidden keys are promoted into this derived Sort and trimmed
-                // here. ORDER BY and LIMIT/OFFSET must stay inside: hoisting
-                // would rebind duplicate names (ord-014). Preserving row order
-                // through the trim is a DuckDB execution property, and the
-                // differential harness sorts rows; the q078/ord-014 emission
-                // shape tests are therefore the regression guard.
-                let trim_projections: Vec<Expression> = original_schema
-                    .fields
-                    .iter()
-                    .map(|f| Expression::ColumnReference(ColumnReference::from_attr(f)))
-                    .collect();
-                Ok(TypedAst::new(
-                    TypedOp::Project {
-                        input: Box::new(sort),
-                        projections: trim_projections,
-                    },
-                    original_schema,
-                ))
-            }
+            Ok(trim_hidden_outputs(sort, original_schema))
         }
 
         CommonOp::Limit {
@@ -1345,10 +1399,9 @@ fn analyze_node(
             // `grouping` is NOT wrapped — it is an internal GROUP BY key
             // list, not an output list (its restated copy inside
             // `aggregates`, if any, gets wrapped there instead).
-            let aggregates: Vec<Expression> = resolve_expr_list(aggregates, &ctx)?
-                .into_iter()
-                .map(ensure_named)
-                .collect();
+            let aggregate_count = aggregates.len();
+            let (aggregates, aggregate_overrides) =
+                resolve_named_expressions(aggregates, vec![None; aggregate_count], &ctx)?;
             // HAVING resolves against the aggregate INPUT schema (aggregate
             // exprs + grouping keys bind to input columns), with the same
             // boolean-type guard as Filter.
@@ -1358,7 +1411,12 @@ fn analyze_node(
             // The aggregate list is the complete output list.
             let mut output_fields: Vec<Attribute> = aggregates
                 .iter()
-                .map(|e| output_attribute(e, &typed_input.resolved_schema))
+                .zip(&aggregate_overrides)
+                .map(|(expression, output_override)| {
+                    output_override.clone().unwrap_or_else(|| {
+                        output_attribute(expression, &typed_input.resolved_schema)
+                    })
+                })
                 .collect();
             // Spark's Expand node (ROLLUP / CUBE / GROUPING SETS) inserts
             // NULL into every grouping-column position for super-aggregate
@@ -1409,23 +1467,56 @@ fn analyze_node(
             cols,
             min_non_nulls,
         } => passthrough_schema_arm(*input, base_types, outer, |ti| {
+            validate_named_columns(&cols, &ti.resolved_schema)?;
+            let recovery = MissingColumnRecovery::new(&ti.resolved_schema);
             Ok(TypedOp::NaDrop {
                 input: Box::new(ti),
                 cols,
                 min_non_nulls,
+                recovery,
             })
         }),
         CommonOp::NaReplace {
             input,
             cols,
             replacements,
-        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
-            Ok(TypedOp::NaReplace {
-                input: Box::new(ti),
-                cols,
-                replacements,
-            })
-        }),
+        } => {
+            let typed_input = analyze_node(*input, base_types, outer)?;
+            let output_fields = typed_input
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|field| {
+                    if na_replace_applies_to(
+                        &cols,
+                        &replacements,
+                        &typed_input.resolved_schema,
+                        field,
+                    ) {
+                        Attribute::minted(
+                            field.name.clone(),
+                            field.data_type.clone(),
+                            na_replace_output_nullable(
+                                &replacements,
+                                &typed_input.resolved_schema,
+                                field,
+                            ),
+                        )
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect();
+            Ok(TypedAst::new(
+                TypedOp::NaReplace {
+                    recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
+                    input: Box::new(typed_input),
+                    cols,
+                    replacements,
+                },
+                ResolvedSchema::new(output_fields),
+            ))
+        }
 
         CommonOp::Unpivot {
             input,
@@ -1481,12 +1572,20 @@ fn analyze_node(
 
         CommonOp::Deduplicate { input, on_columns } => {
             passthrough_schema_arm(*input, base_types, outer, |ti| {
+                validate_named_columns(&on_columns, &ti.resolved_schema)?;
+                let recovery = MissingColumnRecovery::new(&ti.resolved_schema);
                 Ok(TypedOp::Deduplicate {
                     input: Box::new(ti),
                     on_columns,
+                    recovery,
                 })
             })
         }
+        CommonOp::Distinct { input } => passthrough_schema_arm(*input, base_types, outer, |ti| {
+            Ok(TypedOp::Distinct {
+                input: Box::new(ti),
+            })
+        }),
 
         CommonOp::Sample {
             input,
@@ -1526,11 +1625,10 @@ fn analyze_node(
 
         CommonOp::AliasedRelation { input, alias } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
-            // An alias is a fresh lineage origin: every output column is
-            // attributable to the alias alone.
-            let mut quals = BTreeSet::new();
-            quals.insert(alias.clone());
-            let resolved_schema = seed_source_quals(typed_input.resolved_schema.clone(), quals);
+            let resolved_schema = qualify_schema(
+                typed_input.resolved_schema.clone(),
+                Qualifier::single(&alias),
+            );
             Ok(TypedAst::new(
                 TypedOp::AliasedRelation {
                     input: Box::new(typed_input),
@@ -1540,30 +1638,32 @@ fn analyze_node(
             ))
         }
 
+        CommonOp::PlanBoundary { input } => {
+            passthrough_schema_arm(*input, base_types, outer, |input| {
+                Ok(TypedOp::PlanBoundary {
+                    input: Box::new(input),
+                })
+            })
+        }
+
         CommonOp::WithColumnsRenamed { input, renames } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
-            let rename_map: HashMap<String, String> = renames
-                .iter()
-                .map(|(old, new)| (fold_key(old), new.clone()))
-                .collect();
-            let mut output_fields: Vec<Attribute> =
-                Vec::with_capacity(typed_input.resolved_schema.fields.len());
-            for f in &typed_input.resolved_schema.fields {
-                let new_name = rename_map.get(&fold_key(&f.name)).cloned();
-                // Rename is a pure name mutation on the SAME logical column —
-                // clone-with-new-name keeps the id.
-                let mut nf = f.clone();
-                if let Some(n) = new_name {
-                    nf.name = n;
-                    // A rename clears only the renamed slot's inherited
-                    // lineage; its identity remains unchanged.
-                    nf.source_quals.clear();
+            let mut output_fields = typed_input.resolved_schema.fields.clone();
+            for (old_name, new_name) in renames {
+                for field in &mut output_fields {
+                    if eq_fold(&field.name, &old_name) {
+                        *field = Attribute::minted(
+                            new_name.clone(),
+                            field.data_type.clone(),
+                            field.nullable,
+                        );
+                    }
                 }
-                output_fields.push(nf);
             }
             let output_schema = ResolvedSchema::new(output_fields);
             Ok(TypedAst::new(
                 TypedOp::WithColumnsRenamed {
+                    recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
                     input: Box::new(typed_input),
                 },
                 output_schema,
@@ -1584,6 +1684,7 @@ fn analyze_node(
             let output_schema = ResolvedSchema::new(output_fields);
             Ok(TypedAst::new(
                 TypedOp::DropColumns {
+                    recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
                     input: Box::new(typed_input),
                     drop_names,
                 },
@@ -1621,8 +1722,6 @@ fn analyze_node(
             using_columns,
             natural,
             lateral,
-            left_plan_ids,
-            right_plan_ids,
         } => analyze_join(
             *left,
             *right,
@@ -1631,8 +1730,6 @@ fn analyze_node(
             using_columns,
             natural,
             lateral,
-            left_plan_ids,
-            right_plan_ids,
             base_types,
             outer,
         ),
@@ -1673,15 +1770,21 @@ enum ClassifiedGeneratorProjection {
 
 fn analyze_generator_project(
     typed_input: TypedAst,
-    projections: Vec<Expression>,
+    projections: Vec<ExpandedProjection>,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     let mut generator = None;
     let mut items = Vec::with_capacity(projections.len());
     for projection in projections {
-        match classify_generator_projection(projection)? {
+        match classify_generator_projection(projection.expression)? {
             ClassifiedGeneratorProjection::Generator(found) => {
+                if projection.output_attribute.is_some() {
+                    return Err(AnalyzerError::Internal {
+                        reason: "a generator cannot carry a DataFrame-star output override"
+                            .to_owned(),
+                    });
+                }
                 if generator.replace(found).is_some() {
                     return Err(AnalyzerError::SparkEmulated {
                         class: "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
@@ -1698,7 +1801,10 @@ fn analyze_generator_project(
                             .to_owned(),
                     });
                 }
-                items.push(Some(expression));
+                items.push(Some(ExpandedProjection {
+                    expression,
+                    output_attribute: projection.output_attribute,
+                }));
             }
         }
     }
@@ -1712,21 +1818,19 @@ fn analyze_generator_project(
     let mut expanded = Vec::with_capacity(items.len() + generated.len().saturating_sub(1));
     for item in items {
         match item {
-            Some(expression) => expanded.push(expression),
-            None => expanded.extend(
-                generated
-                    .iter()
-                    .map(|attr| Expression::ColumnReference(ColumnReference::from_attr(attr))),
-            ),
+            Some(projection) => expanded.push(projection),
+            None => expanded.extend(generated.iter().map(|attr| ExpandedProjection {
+                expression: Expression::ColumnReference(ColumnReference::from_attr(attr)),
+                output_attribute: None,
+            })),
         }
     }
+    let (expanded, output_overrides) = split_expanded_projections(expanded);
     let expanded = expand_lateral_column_aliases(expanded, &typed_generate.resolved_schema)?;
     let ctx = ResolveContext::of_input(&typed_generate, base_types, outer);
-    let projections = expanded
-        .into_iter()
-        .map(|expression| resolve_and_stamp(expression, &ctx).map(ensure_named))
-        .collect::<Result<Vec<_>, _>>()?;
-    let output_schema = project_output_schema(&projections, &typed_generate)?;
+    let (projections, output_overrides) =
+        resolve_named_expressions(expanded, output_overrides, &ctx)?;
+    let output_schema = project_output_schema(&projections, &output_overrides, &typed_generate)?;
     Ok(TypedAst::new(
         TypedOp::Project {
             input: Box::new(typed_generate),
@@ -1781,7 +1885,13 @@ fn finish_generate(
         .into_iter()
         .map(|arg| resolve_and_stamp(arg, &ctx))
         .collect::<Result<Vec<_>, _>>()?;
-    let generated_schema = generator_output(&mut generator, &typed_input.resolved_schema)?;
+    let mut generated_schema = generator_output(&mut generator, &typed_input.resolved_schema)?;
+    if let Some(qualifier) = &qualifier {
+        let qualifier = Qualifier::single(qualifier);
+        for field in &mut generated_schema.fields {
+            field.qualifier = Some(qualifier.clone());
+        }
+    }
     let resolved_schema = ResolvedSchema::merge(&typed_input.resolved_schema, &generated_schema);
     Ok(TypedAst::new(
         TypedOp::Generate {
@@ -2022,6 +2132,7 @@ fn analyze_with_columns(
     let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::WithColumns {
+            recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
             input: Box::new(typed_input),
             assignments: resolved_assignments,
         },
@@ -2153,32 +2264,136 @@ fn analyze_na_fill(
             col_type,
         )
     };
-    // NaFill mutates nullability only — same logical columns throughout,
-    // so clone (COPY) every field and adjust `nullable` in place.
     let mut output_fields: Vec<Attribute> =
         Vec::with_capacity(typed_input.resolved_schema.fields.len());
     for f in &typed_input.resolved_schema.fields {
         let fill_expr = filled(&f.name, &f.data_type);
-        let mut nf = f.clone();
-        if let Some(v) = fill_expr {
-            // If fill value is non-null (typical case), the output
-            // column becomes non-nullable.
-            let fill_nullable = v.nullable(&typed_input.resolved_schema);
-            if !fill_nullable {
-                nf.nullable = false;
-            }
-        }
+        let nf = if let Some(v) = fill_expr {
+            let fill_nullable =
+                na_value_cast_nullable(v, &typed_input.resolved_schema, &f.data_type, false);
+            Attribute::minted(
+                f.name.clone(),
+                f.data_type.clone(),
+                (f.nullable || matches!(f.data_type, DataType::Float | DataType::Double))
+                    && fill_nullable,
+            )
+        } else {
+            f.clone()
+        };
         output_fields.push(nf);
     }
     let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::NaFill {
+            recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
             input: Box::new(typed_input),
             cols,
             values,
         },
         output_schema,
     ))
+}
+
+/// Whether Spark's `replace0` aliases `field` for this replacement request.
+pub(super) fn na_replace_applies_to(
+    cols: &[String],
+    replacements: &[(Expression, Expression)],
+    schema: &ResolvedSchema,
+    field: &Attribute,
+) -> bool {
+    let Some((old, _)) = replacements.first() else {
+        return false;
+    };
+    let selected = cols.is_empty() || cols.iter().any(|col| eq_fold(col, &field.name));
+    selected && na_fill_compatible(&field.data_type, &old.data_type(schema))
+}
+
+fn na_replace_output_nullable(
+    replacements: &[(Expression, Expression)],
+    schema: &ResolvedSchema,
+    field: &Attribute,
+) -> bool {
+    let numeric_map = na_replace_normalizes_numeric_values(replacements, schema);
+    field.nullable
+        || replacements
+            .iter()
+            .any(|(_, new)| na_value_cast_nullable(new, schema, &field.data_type, numeric_map))
+}
+
+/// Whether Spark's `replace0` converts every numeric key and target to `Double`.
+pub(super) fn na_replace_normalizes_numeric_values(
+    replacements: &[(Expression, Expression)],
+    schema: &ResolvedSchema,
+) -> bool {
+    replacements
+        .first()
+        .is_some_and(|(old, _)| old.data_type(schema).is_numeric())
+}
+
+fn na_value_cast_nullable(
+    value: &Expression,
+    schema: &ResolvedSchema,
+    target: &DataType,
+    normalize_numeric: bool,
+) -> bool {
+    let source = if normalize_numeric {
+        DataType::Double
+    } else {
+        value.data_type(schema)
+    };
+    value.nullable(schema) || na_cast_force_nullable(&source, target)
+}
+
+/// Spark `Cast.forceNullable` for scalar literal types accepted by NA APIs.
+fn na_cast_force_nullable(source: &DataType, target: &DataType) -> bool {
+    if source == target || matches!(source, DataType::Null) {
+        return false;
+    }
+    match (source, target) {
+        (DataType::String, DataType::Binary | DataType::String) => return false,
+        (DataType::String, _) => return true,
+        (_, DataType::String) => return false,
+        (
+            DataType::Timestamp | DataType::TimestampNtz,
+            DataType::Byte | DataType::Short | DataType::Integer,
+        ) => return true,
+        (DataType::Float | DataType::Double, DataType::Timestamp) => return true,
+        (DataType::Timestamp | DataType::TimestampNtz, DataType::Date) => return false,
+        (_, DataType::Date) => return true,
+        (DataType::Date, DataType::Timestamp | DataType::TimestampNtz) => return false,
+        (DataType::Date, _) => return true,
+        (_, DataType::Interval) => return true,
+        _ => {}
+    }
+    if matches!(
+        target,
+        DataType::Byte | DataType::Short | DataType::Integer | DataType::Long
+    ) && matches!(
+        source,
+        DataType::Float | DataType::Double | DataType::Decimal { .. }
+    ) {
+        return true;
+    }
+    let DataType::Decimal { precision, scale } = target else {
+        return false;
+    };
+    let target_integral = precision - scale;
+    match source {
+        DataType::Byte => target_integral < 3,
+        DataType::Short => target_integral < 5,
+        DataType::Integer => target_integral < 10,
+        DataType::Long => target_integral < 20,
+        DataType::Float | DataType::Double => true,
+        DataType::Decimal {
+            precision: source_precision,
+            scale: source_scale,
+        } => {
+            let source_integral = source_precision - source_scale;
+            target_integral <= source_integral
+                && (target_integral < source_integral || scale < source_scale)
+        }
+        _ => false,
+    }
 }
 
 fn analyze_to_df(
@@ -2199,23 +2414,20 @@ fn analyze_to_df(
             ),
         });
     }
-    // Rename is a pure name mutation on the SAME logical column —
-    // clone-with-new-name keeps the id (same as WithColumnsRenamed).
     let mut output_fields: Vec<Attribute> = Vec::with_capacity(input_fields.len());
     for (f, new_name) in input_fields.iter().zip(column_names.iter()) {
-        let mut nf = f.clone();
-        nf.name = new_name.clone();
-        // Renaming clears inherited lineage for every slot. The ids remain
-        // attached to their logical columns; an outer alias can seed new
-        // lineage afterward.
-        nf.source_quals.clear();
-        output_fields.push(nf);
+        output_fields.push(Attribute::minted(
+            new_name.clone(),
+            f.data_type.clone(),
+            f.nullable,
+        ));
     }
     // Convert to WithColumnsRenamed for emission simplicity — the renamed
     // resolved_schema built above IS the rename; no pair list is carried.
     let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::WithColumnsRenamed {
+            recovery: MissingColumnRecovery::new(&typed_input.resolved_schema),
             input: Box::new(typed_input),
         },
         output_schema,
@@ -2231,8 +2443,6 @@ fn analyze_join(
     using_columns: Vec<String>,
     natural: bool,
     lateral: bool,
-    left_plan_ids: Vec<i64>,
-    right_plan_ids: Vec<i64>,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
@@ -2341,21 +2551,14 @@ fn analyze_join(
     // condition here, or in projections/filters/sort keys above —
     // that resolves to more than one field raises `AmbiguousColumn`.
     //
-    // `Expression.Attribute.plan_id` is Spark's mechanism to disambiguate
-    // `emp.dept_id == dept.dept_id` — the two refs share a name but carry
-    // different plan_ids. `ResolveContext::for_join_condition` binds the
-    // join's OWN `left_plan_ids`/`right_plan_ids` into its scope (the same
-    // plan_id arm in `resolve_column` that resolves above-join refs), so a
-    // plan_id-tagged unqualified reference reaching `resolve_and_stamp`
-    // resolves to the correct side directly — no pre-processing needed.
+    // Join conditions search both child trees, including for SEMI/ANTI joins;
+    // `PlanIdResolver` applies Spark's ambiguity and depth rules directly.
     let condition = match condition {
         Some(c) => {
             let ctx = ResolveContext::for_join_condition(
                 &combined_input_schema,
                 &typed_left,
                 &typed_right,
-                &left_plan_ids,
-                &right_plan_ids,
                 base_types,
                 outer,
             );
@@ -2381,14 +2584,11 @@ fn analyze_join(
     // USING-column donor rules (Spark-parity):
     //   INNER / LEFT / SEMI / ANTI → left side (unchanged).
     //   RIGHT                       → right side (right is dominant).
-    //   FULL                        → left side by name, but with
-    //                                 nullable = left.nullable AND
-    //                                 right.nullable (COALESCE
-    //                                 semantics: non-null iff either
-    //                                 side is non-null).
+    //   FULL                        → fresh COALESCE output with
+    //                                 nullable = left.nullable AND right.nullable.
     //   CROSS                       → USING never applies.
-    // A USING key remains referenceable through either side's qualifier;
-    // merge both donors' lineage onto the selected value/id.
+    // Preserve both donors as origin lineage; hidden side-qualified outputs
+    // remain an explicit boundary.
     let build_using_prefix = |using: &[String]| -> Vec<Attribute> {
         let mut fields = Vec::with_capacity(using.len());
         for n in using {
@@ -2396,13 +2596,11 @@ fn analyze_join(
             let right_field = derived_right_schema.field_by_name(n);
             let donor = match (join_type, left_field, right_field) {
                 (JoinType::Right, _, Some(rf)) => rf.clone(),
-                (JoinType::Full, Some(lf), Some(rf)) => {
-                    // Non-null iff EITHER side is non-null. Keep the LEFT
-                    // side's id — it is the donor of record for FULL/USING.
-                    let mut coalesced = lf.clone();
-                    coalesced.nullable = lf.nullable && rf.nullable;
-                    coalesced
-                }
+                (JoinType::Full, Some(lf), Some(rf)) => Attribute::minted(
+                    lf.name.clone(),
+                    lf.data_type.clone(),
+                    lf.nullable && rf.nullable,
+                ),
                 (_, Some(lf), _) => lf.clone(),
                 (_, None, Some(rf)) => rf.clone(),
                 _ => continue,
@@ -2449,8 +2647,6 @@ fn analyze_join(
             condition,
             using_columns,
             lateral,
-            left_plan_ids,
-            right_plan_ids,
         },
         output_schema,
     ))
@@ -2479,9 +2675,7 @@ fn analyze_recursive_cte(
     // (a) Analyze anchor.
     let typed_anchor = analyze_node(anchor, base_types, outer)?;
 
-    // (b) Rename anchor schema by column_names (positional). Renaming is a
-    // pure name mutation on the SAME logical column — clone-with-new-name
-    // keeps the anchor's ids (same COPY pattern as WithColumnsRenamed).
+    // (b) Apply the recursive CTE's output names positionally.
     let cte_schema = if column_names.is_empty() {
         typed_anchor.resolved_schema.clone()
     } else {
@@ -2544,10 +2738,11 @@ fn analyze_recursive_cte(
             .map(|f| StructField::new(f.name.clone(), f.data_type.clone(), true))
             .collect(),
     );
-    let mut augmented = base_types.with_entry(&name, self_ref_schema.clone());
-    for source_case_name in self_ref_table_names(&recursive_term, &name) {
-        if source_case_name != name {
-            augmented = augmented.with_entry(&source_case_name, self_ref_schema.clone());
+    let cte_qualifier = Qualifier::single(&name);
+    let mut augmented = base_types.with_entry(&cte_qualifier, self_ref_schema.clone());
+    for source_name in self_ref_table_names(&recursive_term, &cte_qualifier) {
+        if source_name != cte_qualifier {
+            augmented = augmented.with_entry(&source_name, self_ref_schema.clone());
         }
     }
 
@@ -2602,23 +2797,21 @@ fn analyze_recursive_cte(
     ))
 }
 
-/// Collect source-case `TableScan.table` names in `ast` that case-insensitively
-/// match `cte_name_lower`. Used by `analyze_recursive_cte` to ensure the
-/// injected `BaseTypes` entry covers every casing of the self-reference.
-fn self_ref_table_names(ast: &CommonAst, cte_name_lower: &str) -> Vec<String> {
+/// Collect case-insensitive self-reference names without flattening parts.
+fn self_ref_table_names(ast: &CommonAst, cte_name: &Qualifier) -> Vec<Qualifier> {
     let mut out = Vec::new();
-    collect_self_ref_names(ast, cte_name_lower, &mut out);
+    collect_self_ref_names(ast, cte_name, &mut out);
     out
 }
 
-fn collect_self_ref_names(ast: &CommonAst, cte_name_lower: &str, out: &mut Vec<String>) {
+fn collect_self_ref_names(ast: &CommonAst, cte_name: &Qualifier, out: &mut Vec<Qualifier>) {
     if let CommonOp::TableScan { table, .. } = &ast.op {
-        if fold_key(table) == cte_name_lower && !out.contains(table) {
+        if table.eq_case_folded(cte_name) && !out.contains(table) {
             out.push(table.clone());
         }
     }
     for child in ast.op.children() {
-        collect_self_ref_names(child, cte_name_lower, out);
+        collect_self_ref_names(child, cte_name, out);
     }
 }
 
@@ -2757,14 +2950,7 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
         let mut widened_type: Option<DataType> = None;
         let mut widened_nullable = false;
         let mut any_child_missing = false;
-        // Identity: the FIRST child to carry this name donates its id —
-        // this is the "same logical column" the widened schema is
-        // standing in for at this name.
-        let mut base_attr: Option<Attribute> = None;
-        // Item 3 (F3/O1 NIT): whether the FIRST child (not just the
-        // donating one) carries this name — see the qualifier-clearing
-        // note below.
-        let first_child_has_name = children[0].resolved_schema.field_by_name(name).is_some();
+        let first_attr = children[0].resolved_schema.field_by_name(name);
         for child in children {
             if let Some(fk) = child.resolved_schema.field_by_name(name) {
                 widened_type = Some(match widened_type {
@@ -2772,9 +2958,6 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
                     None => fk.data_type.clone(),
                 });
                 widened_nullable = widened_nullable || fk.nullable;
-                if base_attr.is_none() {
-                    base_attr = Some(fk.clone());
-                }
             } else {
                 any_child_missing = true;
             }
@@ -2788,32 +2971,10 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
         // unconditionally nullable — the other child pads
         // with NULL. Stronger than the OR rule.
         let nullable = widened_nullable || any_child_missing;
-        let mut attr = base_attr.expect("name came from some child, so base_attr is Some");
-        attr.name = name.clone();
-        attr.data_type = ty;
-        attr.nullable = nullable;
-        if !first_child_has_name {
-            // `allowMissingColumns` unionByName (Spark's `ResolveUnion`):
-            // when a name is missing from the FIRST child, Spark pads the
-            // FIRST child with a null-literal-aliased column for it — the
-            // union output column has no donor-qualifier addressability,
-            // so e.g. `a.unionByName(b.alias("b"), allowMissingColumns=True)`
-            // REJECTS `b.z` even though bare `z` resolves (live-Spark-
-            // probed, 4.1.1, 2026-07-14). Without this, `base_attr` above
-            // is a `.clone()` of the donating (non-first) child's
-            // `Attribute`, inheriting ITS qualifiers — making `b.z`
-            // resolvable in τ, strictly more permissive than Spark. Clear
-            // the qualifiers so this widened attribute is addressable only
-            // by its bare name, matching Spark's first-child-null-alias
-            // pad slot. The retained expr_id is the DONOR (non-first)
-            // child's — not the first child's, and not a fresh mint;
-            // Spark's pad path mints a fresh null-alias exprId, so the
-            // donor-id retention is a recorded benign divergence (ADR-024
-            // tier-3e amendment). Only qualifier addressability is
-            // dropped. Names present in the first child are untouched
-            // (F3 pinned first-child qualifiers over unions as faithful).
-            attr = attr.with_quals(BTreeSet::new());
-        }
+        let attr = match first_attr {
+            Some(first) => widened_output_attribute(first, name, ty, nullable),
+            None => Attribute::minted(name.clone(), ty, nullable),
+        };
         widened_fields.push(attr);
     }
     Ok(ResolvedSchema::new(widened_fields))
@@ -2870,30 +3031,32 @@ fn widen_by_position(
                 .all(|child| child.resolved_schema.fields[col_idx].nullable),
             SetOpKind::Except => first_field.nullable,
         };
-        // Identity: child 0's id at this position — the widened schema's
-        // column at index `col_idx` stands in for child 0's own column.
-        let mut attr = first_field.clone();
-        attr.data_type = widened_type;
-        attr.nullable = widened_nullable;
-        widened_fields.push(attr);
+        widened_fields.push(widened_output_attribute(
+            first_field,
+            &first_field.name,
+            widened_type,
+            widened_nullable,
+        ));
     }
     Ok(ResolvedSchema::new(widened_fields))
 }
 
-/// Expand every top-level [`Expression::UnresolvedRegex`] projection into N
-/// [`Expression::UnresolvedColumn`] refs — one per `input_schema` field whose
-/// name matches the pattern. Non-regex projections pass through unchanged in
-/// place. Schema order is preserved.
-///
-/// Errors:
-///
-/// * Invalid regex → [`AnalyzerError::Other`] (Spark-emulated — Spark rejects
-///   the same input with `PatternSyntaxException`).
-/// * Zero matches → [`AnalyzerError::UnknownColumn`] with the pattern as the
-///   column name (mirrors Spark's `AnalysisException: cannot resolve regex`).
-///
-/// Called by `analyze_node`'s `CommonOp::Project` arm BEFORE
-/// [`resolve_and_stamp`] so downstream analysis never sees `UnresolvedRegex`.
+fn widened_output_attribute(
+    first: &Attribute,
+    name: &str,
+    data_type: DataType,
+    nullable: bool,
+) -> Attribute {
+    if first.data_type == data_type {
+        let mut output = first.clone();
+        output.name = name.to_owned();
+        output.nullable = nullable;
+        output
+    } else {
+        Attribute::minted(name.to_owned(), data_type, nullable)
+    }
+}
+
 fn expand_regex_projections(
     projections: Vec<Expression>,
     input_schema: &ResolvedSchema,
@@ -2904,31 +3067,396 @@ fn expand_regex_projections(
             out.push(projection);
             continue;
         };
-        let compiled = regex::Regex::new(&regex.pattern).map_err(|error| AnalyzerError::Other {
-            reason: format!("invalid regex `{}`: {error}", regex.pattern),
-        })?;
-        let start = out.len();
+        let compiled = compile_unresolved_regex(&regex.pattern)?;
         out.extend(
             input_schema
                 .fields
                 .iter()
-                .filter(|field| compiled.is_match(&field.name))
-                .map(|field| {
-                    Expression::UnresolvedColumn(UnresolvedColumn {
-                        name: field.name.clone(),
-                        qualifier: None,
-                        plan_id: regex.plan_id,
-                    })
-                }),
+                .filter(|field| {
+                    compiled.matches(&field.name)
+                        && regex
+                            .qualifier
+                            .as_ref()
+                            .is_none_or(|qualifier| regex_qualifier_matches(field, qualifier))
+                })
+                .map(|field| Expression::ColumnReference(ColumnReference::from_attr(field))),
         );
-        if out.len() == start {
-            return Err(AnalyzerError::UnknownColumn {
-                name: regex.pattern,
-                qualifier: None,
-            });
-        }
     }
     Ok(out)
+}
+
+fn compile_unresolved_regex(pattern: &str) -> Result<java_regex::Regex, AnalyzerError> {
+    java_regex::Regex::new(&format!("(?i){pattern}")).map_err(|error| AnalyzerError::Other {
+        reason: format!("invalid regex `{pattern}`: {error}"),
+    })
+}
+
+fn regex_qualifier_matches(attribute: &Attribute, captured: &Qualifier) -> bool {
+    let [raw] = captured.parts() else {
+        return false;
+    };
+    attribute
+        .qualifier
+        .as_ref()
+        .and_then(|qualifier| qualifier.parts().last())
+        .is_some_and(|current| eq_fold(current, raw))
+}
+
+fn relation_star_fields<'a>(
+    input: &'a TypedAst,
+    qualifier: &Qualifier,
+) -> Option<Vec<&'a Attribute>> {
+    let ranges = input.scope.lookup_ranges(qualifier);
+    let fields: Vec<_> = input
+        .resolved_schema
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(index, field)| {
+            ranges.iter().any(|range| range.contains(index))
+                || field
+                    .qualifier
+                    .as_ref()
+                    .is_some_and(|current| current.matches_suffix(qualifier))
+        })
+        .map(|(_, field)| field)
+        .collect();
+    (!fields.is_empty()).then_some(fields)
+}
+
+fn star_requires_hidden_using_key(input: &TypedAst, qualifier: &Qualifier) -> bool {
+    input.scope.hidden_using_donors.iter().any(|field| {
+        field
+            .qualifier
+            .as_ref()
+            .is_some_and(|current| current.matches_suffix(qualifier))
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlanIdResolver<'a> {
+    roots: [Option<&'a TypedAst>; 2],
+}
+
+struct PlanLookup<T> {
+    candidate: Option<T>,
+    matched: bool,
+}
+
+impl<T> PlanLookup<T> {
+    fn empty() -> Self {
+        Self {
+            candidate: None,
+            matched: false,
+        }
+    }
+}
+
+struct PlanColumnCandidate {
+    target: Attribute,
+    nested: Vec<String>,
+    depth: usize,
+}
+
+impl<'a> PlanIdResolver<'a> {
+    fn single(root: &'a TypedAst) -> Self {
+        Self {
+            roots: [Some(root), None],
+        }
+    }
+
+    fn pair(left: &'a TypedAst, right: &'a TypedAst) -> Self {
+        Self {
+            roots: [Some(left), Some(right)],
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            roots: [None, None],
+        }
+    }
+
+    fn roots(&self) -> impl Iterator<Item = &'a TypedAst> + '_ {
+        self.roots.iter().flatten().copied()
+    }
+
+    fn lookup_column(
+        &self,
+        plan_id: i64,
+        unresolved: &UnresolvedColumn,
+    ) -> Result<PlanLookup<PlanColumnCandidate>, AnalyzerError> {
+        let mut lookup = PlanLookup::empty();
+        for root in self.roots() {
+            let root_lookup = Self::lookup_column_in(root, plan_id, unresolved, 0)?;
+            lookup.matched |= root_lookup.matched;
+            if let Some(candidate) = root_lookup.candidate {
+                lookup.candidate = merge_plan_column_candidate(
+                    lookup.candidate,
+                    candidate,
+                    &unresolved.display_name(),
+                )?;
+            }
+        }
+        if !lookup.matched {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                reason: format!(
+                    "Cannot resolve DataFrame column {} for plan id {plan_id}",
+                    unresolved.display_name()
+                ),
+            });
+        }
+        Ok(lookup)
+    }
+
+    fn lookup_column_in(
+        node: &TypedAst,
+        plan_id: i64,
+        unresolved: &UnresolvedColumn,
+        depth: usize,
+    ) -> Result<PlanLookup<PlanColumnCandidate>, AnalyzerError> {
+        if node.plan_id == Some(plan_id) {
+            let candidate =
+                bind_plan_name_parts(&unresolved.name_parts, &node.resolved_schema.fields)?.map(
+                    |path| PlanColumnCandidate {
+                        target: path.root.clone(),
+                        nested: path.nested,
+                        depth,
+                    },
+                );
+            return Ok(PlanLookup {
+                candidate,
+                matched: true,
+            });
+        }
+        if matches!(
+            &node.op,
+            TypedOp::SetOp {
+                kind: SetOpKind::Union,
+                ..
+            }
+        ) {
+            return Ok(PlanLookup::empty());
+        }
+
+        let mut lookup = PlanLookup::empty();
+        for child in node.op.children() {
+            let child_lookup = Self::lookup_column_in(child, plan_id, unresolved, depth + 1)?;
+            lookup.matched |= child_lookup.matched;
+            if let Some(candidate) = child_lookup.candidate {
+                lookup.candidate = merge_plan_column_candidate(
+                    lookup.candidate,
+                    candidate,
+                    &unresolved.display_name(),
+                )?;
+            }
+        }
+        if lookup.candidate.as_ref().is_some_and(|candidate| {
+            !node
+                .resolved_schema
+                .fields
+                .iter()
+                .any(|field| field.expr_id == candidate.target.expr_id)
+        }) {
+            lookup.candidate = None;
+        }
+        Ok(lookup)
+    }
+
+    fn has_column_match(&self, plan_id: i64) -> bool {
+        fn visit(node: &TypedAst, plan_id: i64) -> bool {
+            node.plan_id == Some(plan_id)
+                || (!matches!(
+                    &node.op,
+                    TypedOp::SetOp {
+                        kind: SetOpKind::Union,
+                        ..
+                    }
+                ) && node
+                    .op
+                    .children()
+                    .into_iter()
+                    .any(|child| visit(child, plan_id)))
+        }
+        self.roots().any(|root| visit(root, plan_id))
+    }
+
+    fn resolve_star(&self, plan_id: i64) -> Result<Vec<Attribute>, AnalyzerError> {
+        let mut found: Option<(Vec<Attribute>, &TypedAst)> = None;
+        for root in self.roots() {
+            let Some(target) = Self::lookup_star_in(root, plan_id)? else {
+                continue;
+            };
+            if found.is_some() {
+                return Err(AnalyzerError::AmbiguousColumnReference {
+                    name: "*".to_owned(),
+                });
+            }
+            found = Some((target, root));
+        }
+        let Some((target, root)) = found else {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                reason: format!("Cannot resolve DataFrame star for plan id {plan_id}"),
+            });
+        };
+        target
+            .into_iter()
+            .map(|mut attribute| {
+                let mut current = root
+                    .resolved_schema
+                    .fields
+                    .iter()
+                    .filter(|field| field.expr_id == attribute.expr_id)
+                    .peekable();
+                if current.peek().is_none() {
+                    return Err(AnalyzerError::UnsupportedRule {
+                        rule: "dataframe-star-over-using-join".to_owned(),
+                        reason: "exact expansion requires hidden join-side key outputs".to_owned(),
+                    });
+                }
+                attribute.nullable = current.any(|field| field.nullable);
+                Ok(attribute)
+            })
+            .collect()
+    }
+
+    fn lookup_star_in(
+        node: &TypedAst,
+        plan_id: i64,
+    ) -> Result<Option<Vec<Attribute>>, AnalyzerError> {
+        let mut target = if node.plan_id == Some(plan_id) {
+            Some(node.resolved_schema.fields.clone())
+        } else {
+            let mut found = None;
+            for child in node.op.children() {
+                if let Some(candidate) = Self::lookup_star_in(child, plan_id)? {
+                    if found.is_some() {
+                        return Err(AnalyzerError::AmbiguousColumnReference {
+                            name: "*".to_owned(),
+                        });
+                    }
+                    found = Some(candidate);
+                }
+            }
+            found
+        };
+        if target.as_ref().is_some_and(|attributes| {
+            !attributes.iter().all(|attribute| {
+                node.resolved_schema
+                    .fields
+                    .iter()
+                    .chain(&node.scope.hidden_using_donors)
+                    .any(|field| field.expr_id == attribute.expr_id)
+            })
+        }) {
+            target = None;
+        }
+        Ok(target)
+    }
+}
+
+fn merge_plan_column_candidate(
+    current: Option<PlanColumnCandidate>,
+    candidate: PlanColumnCandidate,
+    name: &str,
+) -> Result<Option<PlanColumnCandidate>, AnalyzerError> {
+    match current {
+        None => Ok(Some(candidate)),
+        Some(found) if found.depth == 0 && candidate.depth != 0 => Ok(Some(found)),
+        Some(found) if found.depth != 0 && candidate.depth == 0 => Ok(Some(candidate)),
+        Some(_) => Err(AnalyzerError::AmbiguousColumnReference {
+            name: name.to_owned(),
+        }),
+    }
+}
+
+struct ExpandedProjection {
+    expression: Expression,
+    /// DataFrame-star expansion binds physically by ExprId, but its output
+    /// keeps the target node's attribute qualifier. Ordinary projections
+    /// derive their output from the input schema and leave this empty.
+    output_attribute: Option<Attribute>,
+}
+
+fn split_expanded_projections(
+    projections: Vec<ExpandedProjection>,
+) -> (Vec<Expression>, Vec<Option<Attribute>>) {
+    projections
+        .into_iter()
+        .map(|projection| (projection.expression, projection.output_attribute))
+        .unzip()
+}
+
+fn resolve_named_expressions(
+    projections: Vec<Expression>,
+    output_overrides: Vec<Option<Attribute>>,
+    ctx: &ResolveContext<'_>,
+) -> Result<(Vec<Expression>, Vec<Option<Attribute>>), AnalyzerError> {
+    projections
+        .into_iter()
+        .zip(output_overrides)
+        .map(
+            |(projection, output_override)| match (projection, output_override) {
+                (Expression::UnresolvedColumn(unresolved), None) => {
+                    let resolved = resolve_column(unresolved, ctx)?;
+                    Ok((ensure_named(resolved.expression), resolved.output_attribute))
+                }
+                (projection, output_override) => Ok((
+                    ensure_named(resolve_and_stamp(projection, ctx)?),
+                    output_override,
+                )),
+            },
+        )
+        .collect::<Result<Vec<_>, AnalyzerError>>()
+        .map(|resolved| resolved.into_iter().unzip())
+}
+
+fn expand_relation_stars(
+    projections: Vec<Expression>,
+    input: &TypedAst,
+) -> Result<Vec<ExpandedProjection>, AnalyzerError> {
+    let mut expanded = Vec::with_capacity(projections.len());
+    for projection in projections {
+        match &projection {
+            Expression::Star(StarExpression::Qualified(qualifier)) => {
+                if star_requires_hidden_using_key(input, qualifier) {
+                    return Err(AnalyzerError::UnsupportedRule {
+                        rule: "qualified-star-over-using-join".to_owned(),
+                        reason: "exact expansion requires hidden join-side key outputs".to_owned(),
+                    });
+                }
+                if let Some(fields) = relation_star_fields(input, qualifier) {
+                    expanded.extend(fields.into_iter().map(|field| ExpandedProjection {
+                        expression: Expression::ColumnReference(ColumnReference::from_attr(field)),
+                        output_attribute: None,
+                    }));
+                    continue;
+                }
+            }
+            Expression::Star(StarExpression::DataFrame(plan_id)) => {
+                expanded.extend(
+                    PlanIdResolver::single(input)
+                        .resolve_star(*plan_id)?
+                        .into_iter()
+                        .map(|attribute| ExpandedProjection {
+                            expression: Expression::ColumnReference(ColumnReference::from_attr(
+                                &attribute,
+                            )),
+                            output_attribute: Some(attribute),
+                        }),
+                );
+                continue;
+            }
+            _ => {}
+        }
+        expanded.push(ExpandedProjection {
+            expression: projection,
+            output_attribute: None,
+        });
+    }
+    Ok(expanded)
 }
 
 // `SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp`: Spark
@@ -3029,25 +3557,9 @@ fn expand_lateral_column_aliases(
     Ok(out)
 }
 
-/// Recursively rewrite every unqualified `UnresolvedColumn` in `expr` that
-/// case-insensitively matches exactly one entry in `table` to that entry's
-/// (already-inlined) expression, cloned. Zero matches leave the column
-/// reference unchanged (ordinary resolution handles it — typo or genuine
-/// forward-reference alike). Recurses via `Expression::map_children`, the
-/// SAME fallible-fold primitive `resolve_and_stamp` itself uses, walking
-/// into `FunctionCall` args, `CaseWhen` branches, etc.
-///
-/// Opaque per [`Expression::is_opaque_unit`], plus `UnresolvedRegex` — a
-/// documented pass-through matching
-/// `resolve_and_stamp`'s own extra arm — all pass through unchanged. A
-/// lambda's own bound parameter must never be mistaken for an outer lateral
-/// alias reference (e.g. `SELECT 1 AS x, transform(arr, x -> x + 1) FROM t` —
-/// the lambda's `x` is its own bound variable, not the outer alias).
-/// `InSubquery`/`ExistsSubquery`/`ScalarSubquery` are not custom-cased here;
-/// `expression_children!` already yields no children for the two
-/// Exists/Scalar forms and only the outer probe expression for `InSubquery`,
-/// so the default `map_children` arm below reproduces the same opacity
-/// `resolve_and_stamp` gets from its explicit arm.
+/// Inline an unqualified, untagged, non-metadata lateral alias when exactly
+/// one prior alias matches case-insensitively. Opaque expression units,
+/// including lambda bodies and subquery plans, remain untouched.
 fn substitute_lateral_aliases(
     expr: Expression,
     table: &LateralAliasTable,
@@ -3056,8 +3568,12 @@ fn substitute_lateral_aliases(
         return Ok(expr);
     }
     match expr {
-        Expression::UnresolvedColumn(ref u) if u.qualifier.is_none() => {
-            let name = u.name.clone();
+        Expression::UnresolvedColumn(ref u)
+            if u.plan_id.is_none()
+                && !u.is_metadata_column
+                && u.resolution_qualifier().is_none() =>
+        {
+            let name = u.resolution_name();
             match table.lookup(&name)? {
                 Some(replacement) => Ok(replacement.clone()),
                 None => Ok(expr),
@@ -3127,21 +3643,23 @@ fn analyze_table_function(
 }
 
 fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
+    match &expr {
+        Expression::Star(StarExpression::DataFrame(plan_id)) => {
+            return reject_nested_dataframe_star(*plan_id, ctx);
+        }
+        Expression::UnresolvedRegex(regex) => return reject_nested_regex(regex),
+        Expression::Lambda(lambda) => validate_opaque_connect_expressions(&lambda.body, ctx)?,
+        _ => {}
+    }
     // Opaque expressions are not traversed by resolution.
     if expr.is_resolve_opaque() {
         return Ok(expr);
     }
     match expr {
-        Expression::UnresolvedColumn(u) => resolve_column(u, ctx),
-        // Front-ends emit `UnresolvedColumn`; a `ColumnReference` reaching
-        // resolution is therefore always already stamped by one of the
-        // analyzer's own construction sites (`resolve_column` and friends) —
-        // there is no bare/"already resolved" `ColumnReference` constructor
-        // left to fill in, and `data_type`/`nullable` are non-`Option` by
-        // construction (E4/D3), so there is nothing left to assert here —
-        // pure passthrough. `expr_id` legitimately stays `None` for a
-        // tier-(d) struct-qualifier reference (and its outer twin) — see
-        // `ColumnReference::expr_id`'s doc.
+        Expression::UnresolvedColumn(u) => {
+            resolve_column(u, ctx).map(|resolved| resolved.expression)
+        }
+        // Analyzer-created references are already stamped.
         Expression::ColumnReference(c) => Ok(Expression::ColumnReference(c)),
         // Subqueries: analyze the inner plan with the enclosing context
         // threaded as the outer scope so correlated outer references (e.g.
@@ -3227,9 +3745,74 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
         // walker. Covers Unary / Cast (non-implicit) / CaseWhen / Window /
         // Alias / Between / InList / Like / IsDistinctFrom / ExtractValue /
         // ArrayLiteral / MapLiteral / StructLiteral plus the
-        // leaf variants (Literal, Star) which return themselves unchanged
-        // inside `map_children`.
+        // leaf variants (Literal and the remaining Star variants) which
+        // return themselves unchanged inside `map_children`.
         _ => expr.map_children(|e| resolve_and_stamp(e, ctx)),
+    }
+}
+
+fn reject_nested_dataframe_star(
+    plan_id: i64,
+    ctx: &ResolveContext,
+) -> Result<Expression, AnalyzerError> {
+    ctx.plan_ids.resolve_star(plan_id)?;
+    Err(AnalyzerError::UnsupportedRule {
+        rule: "nested-dataframe-star".to_owned(),
+        reason: "expanding one star into multiple child expressions is not implemented".to_owned(),
+    })
+}
+
+fn reject_nested_regex(regex: &UnresolvedRegexExpression) -> Result<Expression, AnalyzerError> {
+    compile_unresolved_regex(&regex.pattern)?;
+    Err(AnalyzerError::UnsupportedRule {
+        rule: "nested-regex-expansion".to_owned(),
+        reason: "expanding one regex into multiple child expressions is not implemented".to_owned(),
+    })
+}
+
+fn reject_opaque_plan_tagged_column(
+    unresolved: &UnresolvedColumn,
+    ctx: &ResolveContext,
+) -> Result<(), AnalyzerError> {
+    let Some(plan_id) = unresolved.plan_id else {
+        return Ok(());
+    };
+    if unresolved.is_metadata_column {
+        if !ctx.plan_ids.has_column_match(plan_id) {
+            return Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                reason: format!("Cannot resolve metadata column for unknown plan id {plan_id}"),
+            });
+        }
+        if unresolved.name_parts.len() == 1 {
+            return Err(AnalyzerError::UnsupportedRule {
+                rule: "metadata-column-resolution".to_owned(),
+                reason: "source metadata attributes are not represented in τ".to_owned(),
+            });
+        }
+    }
+    ctx.plan_ids.lookup_column(plan_id, unresolved)?;
+    Err(AnalyzerError::UnsupportedRule {
+        rule: "plan-tagged-column-in-lambda".to_owned(),
+        reason: "resolving a Connect column inside a lambda is not implemented".to_owned(),
+    })
+}
+
+fn validate_opaque_connect_expressions(
+    expression: &Expression,
+    ctx: &ResolveContext,
+) -> Result<(), AnalyzerError> {
+    match expression {
+        Expression::Star(StarExpression::DataFrame(plan_id)) => {
+            reject_nested_dataframe_star(*plan_id, ctx).map(|_| ())
+        }
+        Expression::UnresolvedRegex(regex) => reject_nested_regex(regex).map(|_| ()),
+        Expression::UnresolvedColumn(unresolved) if unresolved.plan_id.is_some() => {
+            reject_opaque_plan_tagged_column(unresolved, ctx)
+        }
+        _ => expression
+            .children()
+            .try_for_each(|child| validate_opaque_connect_expressions(child, ctx)),
     }
 }
 
@@ -3243,15 +3826,65 @@ fn resolve_expr_list(
         .collect()
 }
 
-// Resolve ORDER BY keys against the child output first, then against an
-// Aggregate/Project child's input when Spark's aggregate-restatement rules
-// require it. Unmatched promotable keys become hidden outputs and are trimmed
-// from the final schema; unresolvable keys retain Spark's UnknownColumn error.
+fn trim_hidden_outputs(input: TypedAst, original_schema: ResolvedSchema) -> TypedAst {
+    if input.resolved_schema.len() == original_schema.len() {
+        return input;
+    }
+    let projections = original_schema
+        .fields
+        .iter()
+        .map(|field| Expression::ColumnReference(ColumnReference::from_attr(field)))
+        .collect();
+    TypedAst::new(
+        TypedOp::Project {
+            input: Box::new(input),
+            projections,
+        },
+        original_schema,
+    )
+}
 
-/// Resolve every ORDER BY key of a `Sort` against its child `ti`. Per key:
-/// today's direct resolution (unchanged) when it succeeds and the key does
-/// not restate an aggregate; otherwise the fallback in
-/// [`rebind_sort_key`].
+fn analyze_filter_condition(
+    condition: Expression,
+    input: &mut TypedAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    let original = condition.clone();
+    match resolve_boolean_predicate(
+        condition,
+        &ResolveContext::of_input(input, base_types, outer),
+        "filter-condition",
+    ) {
+        Ok(resolved) => Ok(resolved),
+        Err(AnalyzerError::UnknownColumn { name, qualifier }) => {
+            let rebound = match rebind_missing_column(original, input, base_types, outer) {
+                Ok(rebound) => rebound,
+                Err(AnalyzerError::UnknownColumn { .. }) => {
+                    return Err(AnalyzerError::UnknownColumn { name, qualifier });
+                }
+                Err(other) => return Err(other),
+            };
+            let actual = rebound.data_type(&input.resolved_schema);
+            if matches!(
+                actual,
+                DataType::Boolean | DataType::Unresolved | DataType::Null
+            ) {
+                Ok(rebound)
+            } else {
+                Err(AnalyzerError::TypeMismatch {
+                    expected: DataType::Boolean,
+                    actual,
+                    context: "filter-condition".to_owned(),
+                })
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Resolve Sort keys against the child, retrying missing attributes and
+/// aggregate restatements through eligible unary operators.
 fn analyze_sort(
     order: Vec<SortOrder>,
     ti: &mut TypedAst,
@@ -3279,20 +3912,8 @@ fn analyze_sort(
     Ok(resolved)
 }
 
-/// Resolve one ORDER BY key against the Sort's child `ti`.
-///
-/// Step 1 (today's behavior, unchanged): resolve against `ti`'s OUTPUT
-/// schema. Success with no aggregate `FunctionCall` in the resolved key →
-/// done, byte-identical to before this pass.
-///
-/// The fallback (steps 3-4, [`rebind_sort_key`]) triggers ONLY when step 1
-/// (i) fails with `UnknownColumn`, or (ii) succeeds but `ti.op` is
-/// `TypedOp::Aggregate` and the resolved key contains an aggregate
-/// `FunctionCall` (that combination always dies at DuckDB's binder today —
-/// e.g. tpcds-q096's `ORDER BY count(1)` over a global aggregate). Any OTHER
-/// step-1 error propagates unchanged. On trigger (i), a fallback failure
-/// re-raises step 1's EXACT `UnknownColumn` (unchanged error text) rather
-/// than whatever [`rebind_sort_key`] itself constructs.
+/// Direct errors other than `UnknownColumn` retain precedence. A failed retry
+/// of an unknown key preserves the original error.
 fn analyze_sort_key(
     key: Expression,
     ti: &mut TypedAst,
@@ -3308,98 +3929,211 @@ fn analyze_sort_key(
             if !restates_aggregate {
                 return Ok(resolved);
             }
-            rebind_sort_key(original, ti, base_types, outer)
+            rebind_missing_column(original, ti, base_types, outer)
         }
         Err(AnalyzerError::UnknownColumn { name, qualifier }) => {
-            rebind_sort_key(original, ti, base_types, outer)
-                .map_err(|_| AnalyzerError::UnknownColumn { name, qualifier })
+            match rebind_missing_column(original, ti, base_types, outer) {
+                Ok(rebound) => Ok(rebound),
+                Err(AnalyzerError::UnknownColumn { .. }) => {
+                    Err(AnalyzerError::UnknownColumn { name, qualifier })
+                }
+                Err(other) => Err(other),
+            }
         }
         Err(other) => Err(other),
     }
 }
 
-/// Which of the two children [`rebind_over_child`] is rebinding against —
-/// carries the one piece of shape-specific data (`Aggregate`'s `grouping`
-/// list) the shared fallback needs on top of the output list every child
-/// variant already provides.
+/// Project/Aggregate state needed by the shared recovery path.
 #[derive(Clone, Copy)]
-enum SortChild<'a> {
+enum MissingColumnChild<'a> {
     Aggregate { grouping: &'a [Expression] },
     Project,
 }
 
-/// Re-resolve against the child's own input, then bind to or promote a
-/// semantically matching output entry.
-///
-/// Only `TypedOp::Aggregate` / `TypedOp::Project` children define an "own
-/// input" / "own SELECT list" here — any other child (e.g. `Deduplicate`)
-/// never engages this fallback, matching Spark's own refusal to push
-/// resolution through a non-Aggregate/Project operator.
-fn rebind_sort_key(
+/// Re-resolve below eligible unary wrappers, then bind to or promote a
+/// semantically matching Project/Aggregate output entry.
+fn rebind_missing_column(
     original: Expression,
     ti: &mut TypedAst,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
-    match &mut ti.op {
+    let (resolved, schema) = match &mut ti.op {
         TypedOp::Aggregate {
             input,
             grouping,
             aggregates,
             ..
-        } => rebind_over_child(
-            original,
-            input,
-            aggregates,
-            SortChild::Aggregate { grouping },
-            &mut ti.resolved_schema,
-            base_types,
-            outer,
-        ),
+        } => {
+            return rebind_over_child(
+                original,
+                input,
+                aggregates,
+                MissingColumnChild::Aggregate { grouping },
+                &mut ti.resolved_schema,
+                base_types,
+                outer,
+            );
+        }
         TypedOp::Project {
             input, projections, ..
-        } => rebind_over_child(
-            original,
-            input,
-            projections,
-            SortChild::Project,
-            &mut ti.resolved_schema,
-            base_types,
-            outer,
-        ),
-        _ => Err(unresolvable_sort_key_error(&original)),
-    }
+        } => {
+            return rebind_over_child(
+                original,
+                input,
+                projections,
+                MissingColumnChild::Project,
+                &mut ti.resolved_schema,
+                base_types,
+                outer,
+            );
+        }
+        TypedOp::WithColumns {
+            input, recovery, ..
+        }
+        | TypedOp::DropColumns {
+            input, recovery, ..
+        }
+        | TypedOp::WithColumnsRenamed { input, recovery }
+        | TypedOp::NaFill {
+            input, recovery, ..
+        }
+        | TypedOp::NaReplace {
+            input, recovery, ..
+        } => {
+            return rebind_project_like(
+                original,
+                input,
+                &mut recovery.outputs,
+                &mut ti.resolved_schema,
+                base_types,
+                outer,
+            );
+        }
+        missing_column_passthrough!(input) => {
+            let resolved = rebind_missing_column(original, input, base_types, outer)?;
+            (resolved, input.resolved_schema.clone())
+        }
+        TypedOp::Generate { input, .. } => {
+            let generated = ti.resolved_schema.fields[input.resolved_schema.len()..].to_vec();
+            let resolved = rebind_missing_column(original, input, base_types, outer)?;
+            let mut fields = input.resolved_schema.fields.clone();
+            fields.extend(generated);
+            (resolved, ResolvedSchema::new(fields))
+        }
+        _ => return Err(unresolvable_sort_key_error(&original)),
+    };
+    ti.resolved_schema = schema;
+    ti.scope = RelScope::of(&ti.op, &ti.resolved_schema);
+    Ok(resolved)
 }
 
-/// The aggregate and project output lists align directly with schema fields;
-/// Star expansion is rejected when it breaks that positional invariant.
+/// Keep output entries aligned with schema fields, expanding a retained bare
+/// star first and rejecting only a residual mismatch.
 fn rebind_over_child(
     original: Expression,
-    child_input: &TypedAst,
+    child_input: &mut TypedAst,
     output_list: &mut Vec<Expression>,
-    kind: SortChild<'_>,
+    kind: MissingColumnChild<'_>,
     schema: &mut ResolvedSchema,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
-    // Star projections (and any other schema-expanding rewrite that runs
-    // BEFORE `resolve_and_stamp`) break the 1:1 alignment between
-    // `output_list`'s positions and `schema`'s fields that the rewrite below
-    // depends on — bail rather than mis-index.
     if output_list.len() != schema.len() {
-        return Err(unresolvable_sort_key_error(&original));
+        let mut expanded = Vec::with_capacity(schema.len());
+        for expression in output_list.drain(..) {
+            if matches!(expression, Expression::Star(StarExpression::Unqualified)) {
+                expanded.extend(
+                    child_input.resolved_schema.fields.iter().map(|field| {
+                        Expression::ColumnReference(ColumnReference::from_attr(field))
+                    }),
+                );
+            } else {
+                expanded.push(expression);
+            }
+        }
+        *output_list = expanded;
+        if output_list.len() != schema.len() {
+            return Err(unresolvable_sort_key_error(&original));
+        }
     }
-    let ctx = ResolveContext::of_input(child_input, base_types, outer);
-    let input_resolved = resolve_and_stamp(original.clone(), &ctx)
-        .map_err(|_| unresolvable_sort_key_error(&original))?;
+    let direct = resolve_and_stamp(
+        original.clone(),
+        &ResolveContext::of_input(child_input, base_types, outer),
+    );
+    let input_resolved = match direct {
+        Ok(resolved) => resolved,
+        Err(error) if plan_id_retry_error(&error) => return Err(error),
+        Err(_) => rebind_missing_column(original.clone(), child_input, base_types, outer)?,
+    };
     // `promote_subtree` checks whole-key matches before descending.
     let input_schema = &child_input.resolved_schema;
     promote_subtree(input_resolved, output_list, schema, input_schema, kind)
         .ok_or_else(|| unresolvable_sort_key_error(&original))
 }
 
-/// Bind a sort key to an existing output entry by returning a bare reference
-/// to its schema field. Output entries are already named and read-only.
+fn rebind_project_like(
+    original: Expression,
+    input: &mut TypedAst,
+    missing_outputs: &mut Vec<Expression>,
+    schema: &mut ResolvedSchema,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    let direct = resolve_and_stamp(
+        original.clone(),
+        &ResolveContext::of_input(input, base_types, outer),
+    );
+    let resolved = match direct {
+        Ok(resolved) => resolved,
+        Err(error) if plan_id_retry_error(&error) => return Err(error),
+        Err(_) => rebind_missing_column(original.clone(), input, base_types, outer)?,
+    };
+    expose_missing_references(resolved, missing_outputs, schema, &input.resolved_schema)
+        .ok_or_else(|| unresolvable_sort_key_error(&original))
+}
+
+fn plan_id_retry_error(error: &AnalyzerError) -> bool {
+    matches!(
+        error,
+        AnalyzerError::AmbiguousColumnReference { .. }
+            | AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            }
+    )
+}
+
+fn expose_missing_references(
+    expr: Expression,
+    missing_outputs: &mut Vec<Expression>,
+    schema: &mut ResolvedSchema,
+    input_schema: &ResolvedSchema,
+) -> Option<Expression> {
+    if let Expression::ColumnReference(reference) = expr {
+        let id = reference.expr_id?;
+        if let Some((_, field)) = schema.field_by_id(id, &reference.name) {
+            return Some(Expression::ColumnReference(ColumnReference::from_attr(
+                field,
+            )));
+        }
+        input_schema.field_by_id(id, &reference.name)?;
+        let expression = Expression::ColumnReference(reference);
+        let field = output_attribute(&expression, input_schema);
+        missing_outputs.push(expression);
+        schema.fields.push(field.clone());
+        return Some(Expression::ColumnReference(ColumnReference::from(field)));
+    }
+    if opaque_to_subtree_promotion(&expr) {
+        return None;
+    }
+    expr.map_children(|child| {
+        expose_missing_references(child, missing_outputs, schema, input_schema).ok_or(())
+    })
+    .ok()
+}
+
 fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expression {
     debug_assert!(
         matches!(
@@ -3424,41 +4158,17 @@ fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
         )
 }
 
-/// Recursively bind or promote subtrees of `expr` already resolved against
-/// the child's own input schema. Structurally matching output entries bind
-/// directly; otherwise eligible aggregate, grouping, or bare-column
-/// subtrees are promoted to hidden outputs.
-/// - otherwise, per `kind`: for [`SortChild::Aggregate`], a subtree that is
-///   itself an aggregate-classifier `FunctionCall`, or that matches
-///   (`semantic_eq`) a `grouping` entry, is promoted via
-///   [`promote_hidden_alias`] (a fresh `Alias(subtree, name)` MINTED onto
-///   `output_list`); for [`SortChild::Project`], a bare `ColumnReference`
-///   subtree is PROMOTED via [`promote_bare_column`] (pushed onto
-///   `output_list` verbatim, copying its identity — Spark
-///   `ResolveReferencesInSort`'s "add the missing ATTRIBUTE, not a computed
-///   subexpression"). Deduplication (a subtree already promoted earlier
-///   in the same walk or by an earlier key in the same `ORDER BY`) is caught
-///   by the whole-entry match above since it is now literally present in
-///   `output_list`) — Spark `ResolveAggregateFunctions#buildAggExprList`'s
-///   by the whole-entry match above;
-/// - otherwise, recursion continues into its children (unless
-///   [`opaque_to_subtree_promotion`] says the node is an opaque unit);
-/// - a `ColumnReference` LEAF that survives all of the above (neither bound
-///   nor promotable) is Spark's "cannot be resolved" case: `None`, so the
-///   caller re-raises the ORIGINAL `UnknownColumn` (confirmed against a live
-///   Spark 4.1.1 session to be `UNRESOLVED_COLUMN.WITH_SUGGESTION`, the SAME
-///   class an ordinary unresolvable reference gets — there is no distinct
-///   `MISSING_AGGREGATION`-style error for this shape from `ORDER BY`).
+/// Bind an existing semantic output, or expose an Aggregate grouping/call or
+/// Project column as a hidden output. Other non-opaque expressions recurse;
+/// an unexposable leaf returns `None` so the caller keeps the original error.
 fn promote_subtree(
     expr: Expression,
     output_list: &mut Vec<Expression>,
     schema: &mut ResolvedSchema,
     input_schema: &ResolvedSchema,
-    kind: SortChild<'_>,
+    kind: MissingColumnChild<'_>,
 ) -> Option<Expression> {
-    // Canonicalize the FIXED `expr` side once for both the whole-entry match
-    // below and (Aggregate only) the `grouping` match; `None`
-    // (nondeterministic) short-circuits both.
+    // Nondeterministic expressions cannot participate in semantic matching.
     let ca_expr = (!contains_matching_call(&expr, is_nondeterministic_fn_name))
         .then(|| canonicalize_for_semantic_eq(&expr));
     if let Some(k) = ca_expr.as_ref().and_then(|ca| {
@@ -3469,7 +4179,7 @@ fn promote_subtree(
         return Some(bind_slot(output_list, schema, k));
     }
     match kind {
-        SortChild::Aggregate { grouping } => {
+        MissingColumnChild::Aggregate { grouping } => {
             let is_new_aggregate = matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
             let matches_grouping = ca_expr
                 .as_ref()
@@ -3483,7 +4193,7 @@ fn promote_subtree(
                 ));
             }
         }
-        SortChild::Project => {
+        MissingColumnChild::Project => {
             if matches!(&expr, Expression::ColumnReference(_)) {
                 return Some(promote_bare_column(expr, output_list, schema, input_schema));
             }
@@ -3496,11 +4206,7 @@ fn promote_subtree(
         .ok()
 }
 
-/// [`promote_subtree`]'s `SortChild::Aggregate` promotion: `expr` is either a
-/// fresh aggregate-classifier `FunctionCall` or a computed subexpression
-/// matching a `grouping` entry — either way a brand-new logical column that
-/// did not exist in the output list before this point: MINT (never
-/// clone-derive from `input_schema` here).
+/// Mint a hidden computed output during Aggregate recovery.
 fn promote_hidden_alias(
     expr: Expression,
     aggregates: &mut Vec<Expression>,
@@ -3556,19 +4262,15 @@ fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> St
     }
 }
 
-/// The catch-all `UnknownColumn` for a sort key the fallback could not bind
-/// to any child SELECT-list entry. Named from the original
-/// key when it is itself a bare column reference; otherwise from its
-/// output-name rendering, so the error text still names the offending key.
 fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
     match original {
         Expression::UnresolvedColumn(u) => AnalyzerError::UnknownColumn {
-            name: u.name.clone(),
-            qualifier: u.qualifier.clone(),
+            name: u.display_name(),
+            qualifier: None,
         },
         Expression::ColumnReference(c) => AnalyzerError::UnknownColumn {
             name: c.name.clone(),
-            qualifier: c.qualifier.clone(),
+            qualifier: c.qualifier.as_ref().map(Qualifier::display_name),
         },
         other => AnalyzerError::UnknownColumn {
             name: expression_output_name(other),
@@ -3577,19 +4279,8 @@ fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
     }
 }
 
-/// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
-/// name satisfies `pred` — the shared walk behind both the aggregate-
-/// classifier check ([`is_aggregate_classifier_name`], used to detect a Sort
-/// key that restates a SELECT-list aggregate) and the nondeterministic-
-/// function check
-/// ([`is_nondeterministic_fn_name`], used to exclude a Sort key that calls a
-/// nondeterministic function from the [`semantic_eq`] rebind fallback). Both
-/// rosters are name-keyed and non-exhaustive; per-instance nondeterminism
-///
-/// `Expression::children()` also descends into `WindowFunction.func`, so a
-/// key restating `sum(x) OVER (...)` also trips the aggregate check — that
-/// A window aggregate is not a plain SELECT-list aggregate and therefore is
-/// not rebound.
+/// Whether any nested function name satisfies `pred`. The shared walk powers
+/// aggregate and nondeterminism classification and includes window functions.
 fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
     if let Expression::FunctionCall(f) = expr {
         if pred(&f.name) {
@@ -3599,41 +4290,10 @@ fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
     expr.children().any(|c| contains_matching_call(c, pred))
 }
 
-/// Spark-`semanticEquals`-inspired structural comparison used to bind a
-/// resolved Sort key back onto a matching child SELECT-list entry (Spark
-/// `ResolveAggregateFunctions#buildAggExprList`'s first-match fold over
-/// `agg.aggregateExpressions`). Alias-stripped (mirrors Spark's
-/// `trimAliases`), qualifier-stripped and case-insensitive on column/function
-/// names (the two sides may carry different or absent table qualifiers, and
-/// independently-resolved `data_type`/`nullable` stamps, for the identical
-/// logical column post-resolution). Always `false` when either side contains
-/// a nondeterministic function call.
-///
-/// `a` and `b` are typically (though not necessarily — see below) resolved
-/// against the SAME child-input schema (`rebind_sort_key` re-resolves the
-/// sort key against `child_input`, and `child_list`'s entries were themselves
-/// resolved against that same `child_input` when the Aggregate/Project node
-/// was originally analyzed — see the `CommonOp::Aggregate`/`CommonOp::Project`
-/// arms). Either way, `ColumnReference::expr_id` is [`ExprId`](super::schema::ExprId)
-/// — the SAME process-global identity Spark's own `exprId` provides — so the
-/// [`ids_compatible`] check below is sound EVEN ACROSS DIFFERENT SCHEMAS: two
-/// refs with equal ids are the same logical column no matter which schema
-/// each was resolved against, and two refs that happen to share a
-/// (qualifier-stripped) name but different ids (e.g. `t1.x` and `t2.x` after a
-/// join) are correctly told apart. This is sound across schemas because
-/// single shared input schema. NOTE: [`ColumnReference`]'s hand-written
-/// `PartialEq` deliberately EXCLUDES `expr_id` (it is derived data, not part
-/// of a reference's logical identity for every OTHER analyzer equality
-/// check), so the structural `==` below can never see it —
-/// [`ids_compatible`] re-walks both (already `==`-confirmed, hence
-/// same-shape) canonicalized trees afterwards to add that check back in
-/// specifically for this comparison.
-///
-/// Production call sites (`rebind_over_child`/[`promote_subtree`]) all
-/// compare many candidates against one fixed operand and so call
-/// [`semantic_eq_against`] directly (hoisting the fixed side's
-/// canonicalization out of the loop); this pairwise form is kept for the
-/// single-pair comparisons.
+/// Spark-inspired equality for rebinding recovered expressions to child
+/// outputs. Canonicalization strips aliases and qualifiers and folds names;
+/// nondeterministic calls never match. A separate [`ids_compatible`] walk
+/// retains `ExprId` discrimination omitted by `ColumnReference::PartialEq`.
 #[cfg(test)]
 fn semantic_eq(a: &Expression, b: &Expression) -> bool {
     if contains_matching_call(a, is_nondeterministic_fn_name) {
@@ -3643,16 +4303,7 @@ fn semantic_eq(a: &Expression, b: &Expression) -> bool {
     semantic_eq_against(&ca, b)
 }
 
-/// [`semantic_eq`], factored so a loop comparing many `entry` candidates
-/// against one FIXED expression (`rebind_over_child`/[`promote_subtree`]'s
-/// `.position`/`.any` loops) pays for [`canonicalize_for_semantic_eq`] and
-/// the nondeterminism check on the FIXED side exactly ONCE, not on every
-/// iteration — those
-/// callers precompute `ca_fixed` themselves (skipping the call entirely, and
-/// hence the whole loop, when the fixed side is itself nondeterministic; see
-/// each call site) and pass it in here. The `entry` side is still
-/// canonicalized and nondeterminism-checked per call, since it legitimately
-/// differs every iteration.
+/// Compare one entry against an already canonicalized fixed expression.
 fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
     if contains_matching_call(entry, is_nondeterministic_fn_name) {
         return false;
@@ -3661,16 +4312,7 @@ fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
     ca_fixed == &ce && ids_compatible(ca_fixed, &ce)
 }
 
-/// Walk two expressions already confirmed structurally `==` (hence the same
-/// shape/variant at every level — `==` recurses through `map_children`'s
-/// child slots the same way [`Expression::children`] does) and additionally
-/// require that wherever BOTH sides are a `ColumnReference` carrying a
-/// resolved `expr_id`, those ids agree. Closes the gap
-/// `ColumnReference::eq`'s `expr_id` exclusion leaves open: two different
-/// input columns that happen to share a (qualifier-stripped) name — e.g.
-/// `t1.x` and `t2.x` after a join — canonicalize and `==`-compare IDENTICAL,
-/// so without the id check `semantic_eq` would bind to whichever SELECT-list
-/// entry happens to come first, silently picking the wrong one.
+/// Require corresponding resolved column references to carry equal IDs.
 fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     match (a, b) {
         (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
@@ -3686,26 +4328,8 @@ fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     }
 }
 
-/// Recursively strip every `Alias` wrapper and implicit Cast (analyzer
-/// materialization that Spark's `semanticEquals` does not see)
-/// and case-fold/qualifier-strip `ColumnReference` / `UnresolvedColumn`
-/// identity, producing the canonical form [`semantic_eq`] compares with `==`
-/// (and then re-walks via [`ids_compatible`]). Uses
-/// [`Expression::map_children`] for the
-/// default recursion so every current and future `Expression` variant is
-/// covered without a hand-enumerated match; infallible (`Result<_,
-/// Infallible>`), so the `unwrap_or_else` below can never panic.
-///
-/// `ColumnReference::expr_id` is preserved (only
-/// qualifier/name-case are normalized away here — `data_type`/`nullable` are
-/// carried through unchanged too, since [`ColumnReference`]'s hand-written
-/// `PartialEq` already excludes them from `==`) — [`semantic_eq`]'s
-/// `==` check cannot see `expr_id` either (`ColumnReference::eq` excludes
-/// it), but [`ids_compatible`] reads `expr_id` directly off these
-/// canonicalized trees. Dropping this preservation (e.g. re-normalizing
-/// `expr_id` to `None` here) would silently revert the [`ids_compatible`]
-/// check to always-`true` — `canonicalize_for_semantic_eq_preserves_expr_id`
-/// guards against exactly that regression.
+/// Strip aliases and implicit casts, fold names, and remove qualifiers while
+/// preserving IDs for [`ids_compatible`].
 fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
     if let Expression::Alias(a) = expr {
         return canonicalize_for_semantic_eq(&a.expr);
@@ -3728,9 +4352,9 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
             expr_id: c.expr_id,
         }),
         Expression::UnresolvedColumn(u) => Expression::UnresolvedColumn(UnresolvedColumn {
-            name: fold_key(&u.name),
-            qualifier: None,
+            name_parts: vec![fold_key(&u.resolution_name())],
             plan_id: None,
+            is_metadata_column: u.is_metadata_column,
         }),
         other => other.clone(),
     };
@@ -3783,26 +4407,9 @@ fn analyze_single_column_subquery(
     Ok(SubqueryPlan::Analyzed(Box::new(inner)))
 }
 
-/// Synthetic qualifier attached to plan_id-tagged column refs during Join
-/// condition analysis. Emission renders `ColumnReference { qualifier:
-/// Some(TD_JOIN_LEFT), .. }` as `__td_jl.<col>`, which matches the
-/// left/right subquery aliases `render_join` emits.
+/// Reserved aliases for join-side wrappers synthesized by emission.
 pub(crate) const TD_JOIN_LEFT: &str = "__td_jl";
 pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
-
-//
-// A relation alias (`d` in `... CROSS JOIN dept d`) is not a schema field —
-// the merged join schema (built by `ResolvedSchema::merge`, a positional
-// concatenation) carries no per-field qualifier metadata. But `merge` and
-// `apply_join_nullability` both preserve field count and order, so each
-// source relation occupies a CONTIGUOUS range of the CURRENT resolution
-// schema at every nesting level (already outer-join-flip-correct).
-// The stamped [`RelScope`] maps each alias / table name to that range;
-// `resolve_column`'s qualifier arm restricts a name-only lookup to
-// `schema.fields[range]` when the qualifier binds exactly one scope — so
-// `d.dept_id` resolves against dept's own fields instead of a first-match-by-
-// name scan that can silently pick the wrong side's (wrongly typed / wrongly
-// nullable) column.
 
 /// The enclosing (parent) plan's resolution schema, threaded into subquery
 /// analysis so a correlated outer reference (e.g. `e.salary` inside
@@ -3841,6 +4448,7 @@ struct ResolveContext<'a> {
     /// `Some` when this context is analyzing a subquery's inner plan;
     /// `None` at the top level.
     outer: Option<OuterScope<'a>>,
+    plan_ids: PlanIdResolver<'a>,
 }
 
 impl<'a> ResolveContext<'a> {
@@ -3857,16 +4465,13 @@ impl<'a> ResolveContext<'a> {
             scopes: std::borrow::Cow::Borrowed(&input.scope),
             base_types,
             outer,
+            plan_ids: PlanIdResolver::single(input),
         }
     }
 
     /// Resolve a join condition against the merged `left ⋈ right` schema.
-    /// Composition is [`merge_join_scopes`], with no synthetic whole-side
-    /// aliases:
-    /// this composite scope exists only to offset-merge the two sides' own
-    /// aliases/plan_ids into one range space; a plan_id ref resolves
-    /// bare+ordinal via [`resolve_column`]'s plan_id arm exactly as it would
-    /// above the join.
+    /// [`merge_join_scopes`] composes ordinary alias bindings; plan-tagged
+    /// references search the two child trees through [`PlanIdResolver`].
     ///
     /// Always [`RightSide::Keep`], unlike [`RelScope::of`]: the condition
     /// resolves against the full merged schema regardless of join type
@@ -3876,22 +4481,15 @@ impl<'a> ResolveContext<'a> {
         schema: &'a ResolvedSchema,
         left: &'a TypedAst,
         right: &'a TypedAst,
-        left_plan_ids: &[i64],
-        right_plan_ids: &[i64],
         base_types: &'a BaseTypes,
         outer: Option<OuterScope<'a>>,
     ) -> Self {
         Self {
             schema,
-            scopes: std::borrow::Cow::Owned(merge_join_scopes(
-                left,
-                right,
-                left_plan_ids,
-                right_plan_ids,
-                RightSide::Keep,
-            )),
+            scopes: std::borrow::Cow::Owned(merge_join_scopes(left, right, RightSide::Keep)),
             base_types,
             outer,
+            plan_ids: PlanIdResolver::pair(left, right),
         }
     }
 
@@ -3903,361 +4501,336 @@ impl<'a> ResolveContext<'a> {
             scopes: std::borrow::Cow::Owned(RelScope::default()),
             base_types,
             outer: None,
+            plan_ids: PlanIdResolver::none(),
         }
-    }
-
-    /// Look up `q`'s alias-scope range, guarding it against the current
-    /// schema's length. [`RelScope::lookup`] only ever binds ranges
-    /// within the schema they were built from, so an out-of-bounds range is
-    /// an analyzer invariant violation — surface it loudly in debug builds,
-    /// but degrade to `None` (the caller's legacy fallback) in release
-    /// rather than panicking on the index. Shared by the synthetic
-    /// `__td_jl`/`__td_jr` join-qualifier arm and tier (e) in
-    /// `resolve_column`, so both get the identical guard.
-    fn scoped_range(&self, q: &str) -> Option<std::ops::Range<usize>> {
-        self.scopes.lookup(q).filter(|range| {
-            let in_bounds = range.end <= self.schema.len();
-            debug_assert!(
-                in_bounds,
-                "qualifier `{q}` scope range {range:?} exceeds schema of {} fields",
-                self.schema.len()
-            );
-            in_bounds
-        })
-    }
-
-    /// Look up a plan_id's field range, with the same out-of-bounds guard as
-    /// [`scoped_range`](Self::scoped_range).
-    fn plan_id_lookup(&self, pid: i64) -> Option<std::ops::Range<usize>> {
-        self.scopes.lookup_plan_id(pid).filter(|range| {
-            let in_bounds = range.end <= self.schema.len();
-            debug_assert!(
-                in_bounds,
-                "plan_id `{pid}` scope range {range:?} exceeds schema of {} fields",
-                self.schema.len()
-            );
-            in_bounds
-        })
     }
 }
 
-/// Build an `ExtractValue` chain rooted at the top-level struct attribute,
-/// preserving that attribute's identity, type, and nullability. Shared by
-/// local and correlated struct-field resolution.
-///
-/// `expr_id`: `root` IS the real top-level attribute this reference names,
-/// so its id is stamped directly on the chain's root ref — matching Spark's
-/// `GetStructField`-child-`exprId` model (the child ref names the whole
-/// column and keeps its identity; only the synthesized `ExtractValue` nodes
-/// above it are id-less, same as `GetStructField` itself).
-fn build_struct_extract_chain(root: &Attribute, field_path: &str) -> Expression {
-    let mut expr = Expression::ColumnReference(ColumnReference::from_attr(root));
-    for seg in field_path.split('.') {
-        expr = Expression::ExtractValue(ExtractValueExpression {
-            child: Box::new(expr),
-            extraction: Box::new(Expression::Literal(Literal {
-                value: LiteralValue::String(seg.to_owned()),
-                data_type: DataType::String,
-            })),
+struct BoundPath<'a> {
+    root: &'a Attribute,
+    nested: Vec<String>,
+    data_type: DataType,
+    nullable: bool,
+    qualifier: Option<Qualifier>,
+}
+
+impl BoundPath<'_> {
+    fn into_expression(self) -> Expression {
+        let mut root = ColumnReference::from_attr(self.root);
+        root.qualifier = self.qualifier;
+        self.nested
+            .into_iter()
+            .fold(Expression::ColumnReference(root), |child, field| {
+                Expression::ExtractValue(ExtractValueExpression {
+                    child: Box::new(child),
+                    extraction: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::String(field),
+                        data_type: DataType::String,
+                    })),
+                })
+            })
+    }
+}
+
+fn bind_path<'a, I>(
+    fields: I,
+    parts: &[String],
+    qualifier: Option<Qualifier>,
+    error_name: &str,
+) -> Result<Option<BoundPath<'a>>, AnalyzerError>
+where
+    I: IntoIterator<Item = &'a Attribute>,
+{
+    let Some((root_name, nested)) = parts.split_first() else {
+        return Ok(None);
+    };
+    let mut seen = HashSet::new();
+    let roots: Vec<_> = fields
+        .into_iter()
+        .filter(|field| eq_fold(&field.name, root_name))
+        .filter(|field| seen.insert(field.expr_id))
+        .collect();
+    if roots.len() > 1 {
+        return Err(AnalyzerError::AmbiguousColumn {
+            name: error_name.to_owned(),
+            candidates: roots.iter().map(|field| field.name.clone()).collect(),
         });
     }
-    expr
-}
-
-/// Attempt to resolve an [`UnresolvedColumn`] against the outer (enclosing)
-/// plan's scope. Used as a final fallback (tier (g)) in [`resolve_column`]
-/// when ALL inner tiers have failed — i.e. the column name+qualifier does not
-/// match anything in the inner plan's schema.
-///
-/// **Qualifier-strict**: a qualified reference (`e.salary`) only resolves if
-/// the qualifier binds a scope in the outer context (struct-column precedence
-/// first, then relation-alias scope). An unqualified reference resolves only
-/// when exactly one case-insensitive match exists across the outer schema's
-/// fields (zero or 2+ matches yield `None`).
-///
-/// Returns a fully-built expression on a hit. Correlated references retain
-/// their qualifier and the matched outer attribute's identity; process-wide
-/// ids keep outer and inner attributes distinct.
-fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<Expression> {
-    if let Some(q) = u.qualifier.as_deref() {
-        // Struct-column precedence in the outer schema (matches resolve_column's
-        // existing tier ordering) — same `ExtractValue`-chain construction as
-        // the local tier-(d) twin, rooted at the OUTER struct column's own
-        // attribute.
-        if TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema).is_some() {
-            let root = outer.schema.field_by_name(q)?;
-            return Some(build_struct_extract_chain(root, &u.name));
-        }
-        // Relation-alias scope in the outer context.
-        let range = outer.scopes.lookup(q)?;
-        // Guard against out-of-bounds (same pattern as ResolveContext::scoped_range).
-        if range.end > outer.schema.fields.len() {
-            return None;
-        }
-        let slice = &outer.schema.fields[range.clone()];
-        let (dt, nullable, attr) = TypeInferenceEngine::resolve_in(&u.name, slice)?;
-        // `attr` borrows directly from `outer.schema.fields` (via `slice`, a
-        // sub-slice of it), so its `expr_id` needs no `range.start +`
-        // re-basing — it already names the right field wherever it lives.
-        Some(Expression::ColumnReference(ColumnReference {
-            name: u.name.clone(),
-            qualifier: u.qualifier.clone(),
-            data_type: dt,
-            nullable,
-            expr_id: Some(attr.expr_id),
-        }))
-    } else {
-        // Unqualified: exactly-one case-insensitive match in the outer schema.
-        let mut found: Option<&Attribute> = None;
-        for f in &outer.schema.fields {
-            if eq_fold(&f.name, &u.name) {
-                if found.is_some() {
-                    // 2+ matches — ambiguous; do not silently pick one.
-                    return None;
+    let Some(root) = roots.first().copied() else {
+        return Ok(None);
+    };
+    let mut data_type = root.data_type.clone();
+    let mut nullable = root.nullable;
+    for field_name in nested {
+        match data_type {
+            DataType::Struct(struct_type) => {
+                let field = nested_struct_field(&struct_type, field_name)?;
+                data_type = field.data_type.clone();
+                nullable |= field.nullable;
+            }
+            DataType::Map { value, .. } => {
+                // A missing key returns NULL even when the map and its value
+                // type are declared non-null.
+                nullable = true;
+                data_type = *value;
+            }
+            DataType::Array(element, contains_null) => {
+                if let DataType::Struct(struct_type) = element.as_ref() {
+                    let field = nested_struct_field(struct_type, field_name)?;
+                    data_type = DataType::Array(
+                        Box::new(field.data_type.clone()),
+                        contains_null || field.nullable,
+                    );
+                } else {
+                    return Err(AnalyzerError::SparkEmulated {
+                        class: "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+                        reason: format!("Array element type cannot extract field {}", field_name),
+                    });
                 }
-                found = Some(f);
+            }
+            other => {
+                return Err(AnalyzerError::SparkEmulated {
+                    class: "INVALID_EXTRACT_BASE_FIELD_TYPE",
+                    reason: format!("Cannot extract {} from {}", field_name, other),
+                });
             }
         }
-        found.map(|f| {
-            // `name`/`qualifier` come from the REFERENCE, not the attribute:
-            // the match was case-insensitive, so the user's spelling is what
-            // must reach emission.
-            Expression::ColumnReference(ColumnReference {
-                name: u.name.clone(),
-                qualifier: u.qualifier.clone(),
-                ..ColumnReference::from_attr(f)
-            })
-        })
+    }
+    Ok(Some(BoundPath {
+        root,
+        nested: nested.to_vec(),
+        data_type,
+        nullable,
+        qualifier,
+    }))
+}
+
+fn nested_struct_field<'a>(
+    struct_type: &'a StructType,
+    field_name: &str,
+) -> Result<&'a StructField, AnalyzerError> {
+    let matches: Vec<_> = struct_type
+        .fields
+        .iter()
+        .filter(|field| eq_fold(&field.name, field_name))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(AnalyzerError::SparkEmulated {
+            class: "FIELD_NOT_FOUND",
+            reason: format!("No such struct field {}", field_name),
+        }),
+        [field] => Ok(field),
+        _ => Err(AnalyzerError::SparkEmulated {
+            class: "AMBIGUOUS_REFERENCE_TO_FIELDS",
+            reason: format!("Ambiguous reference to fields {}", field_name),
+        }),
     }
 }
 
-fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
-    // Dotted struct paths become ExtractValue chains; emitting the dotted tail
-    // as one identifier would make DuckDB reject the reference.
-    // Unqualified: surface `AmbiguousColumn` whenever more than one field
-    // (case-insensitive match, matching `field_by_name`'s Spark-compatible
-    // rule) resolves. This is the single, central ambiguity check point —
-    // it catches ambiguity everywhere a column reference is resolved
-    // (projections, filters, sort keys, join conditions, ...), not just in
-    // join conditions.
-    // Synthetic join qualifiers are reserved for emission and never resolve
-    // as user qualifiers.
-    let is_synthetic_join_qualifier = matches!(
-        u.qualifier.as_deref(),
-        Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
-    );
-    // When the ref is unqualified but carries a plan_id that maps to a
-    // known join side, restrict resolution to that side's field range.
-    // The condition and above-join paths now share this arm: `resolve_column`
-    // is the single unification point, reached whether the plan_id-tagged
-    // ref lives in the join's own condition (via
-    // `ResolveContext::for_join_condition` binding the join's own
-    // `left_plan_ids`/`right_plan_ids`) or above the join. Fall through to
-    // legacy behavior when the plan_id is unknown (e.g. ref to a non-join
-    // child — Spark tolerates refs resolvable unambiguously without it).
-    if u.qualifier.is_none() {
-        if let Some(pid) = u.plan_id {
-            // An unaliased self-join reusing a plan_id is ambiguous.
-            // Checked BEFORE `plan_id_lookup`'s first-match so we raise
-            // `AmbiguousColumnReference` instead of silently binding the left
-            if ctx.scopes.plan_id_is_ambiguous(pid) {
-                return Err(AnalyzerError::AmbiguousColumnReference {
-                    name: u.name.clone(),
-                });
-            }
-            if let Some(range) = ctx.plan_id_lookup(pid) {
-                let info = TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]);
-                if let Some((dt, nullable, attr)) = info {
-                    // The attribute is borrowed from the schema slice, so its
-                    // identity needs no re-basing.
-                    let expr_id = Some(attr.expr_id);
-                    // Plan-id references are bare and bind in emission by
-                    // attribute identity, even when names are duplicated.
-                    return Ok(Expression::ColumnReference(ColumnReference {
-                        name: u.name,
-                        qualifier: None,
-                        data_type: dt,
-                        nullable,
-                        expr_id,
-                    }));
-                }
-                // plan_id scope found but column name not in that range —
-                // UnknownColumn, not ambiguity.
-                return Err(AnalyzerError::UnknownColumn {
-                    name: u.name,
-                    qualifier: u.qualifier,
-                });
-            }
-            // plan_id unknown in scope map — fall through to legacy
-            // resolution (the ref may be unambiguous without it).
-        }
-        let matches: Vec<&Attribute> = ctx
-            .schema
+fn scoped_candidates<'a>(
+    schema: &'a ResolvedSchema,
+    scope: &RelScope,
+    qualifier: &Qualifier,
+) -> Vec<&'a Attribute> {
+    let ranges = scope.lookup_ranges(qualifier);
+    schema
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(index, field)| {
+            ranges.iter().any(|range| range.contains(index))
+                || field
+                    .qualifier
+                    .as_ref()
+                    .is_some_and(|current| current.matches_suffix(qualifier))
+        })
+        .map(|(_, field)| field)
+        .collect()
+}
+
+fn bind_name_parts<'a>(
+    parts: &[String],
+    schema: &'a ResolvedSchema,
+    scope: &'a RelScope,
+    retain_unique_qualifier: bool,
+) -> Result<Option<BoundPath<'a>>, AnalyzerError> {
+    let display_name = display_name_parts(parts);
+    for split in (1..parts.len()).rev() {
+        let qualifier = Qualifier::from_parts(parts[..split].to_vec());
+        let suffix = &parts[split..];
+        let distinct_roots = schema
             .fields
             .iter()
-            .filter(|f| eq_fold(&f.name, &u.name))
+            .filter(|field| eq_fold(&field.name, &suffix[0]))
+            .map(|field| field.expr_id)
+            .collect::<HashSet<_>>()
+            .len();
+        let retained = (retain_unique_qualifier || distinct_roots > 1).then_some(qualifier.clone());
+        let public = scoped_candidates(schema, scope, &qualifier);
+        let hidden: Vec<_> = scope
+            .hidden_using_donors
+            .iter()
+            .filter(|field| {
+                field
+                    .qualifier
+                    .as_ref()
+                    .is_some_and(|current| current.matches_suffix(&qualifier))
+            })
             .collect();
-        if matches.len() > 1 {
-            let candidates = matches.iter().map(|f| f.name.clone()).collect();
-            return Err(AnalyzerError::AmbiguousColumn {
-                name: u.name,
-                candidates,
+        if let Some(path) = bind_path(public, suffix, retained, &display_name)? {
+            return Ok(Some(path));
+        }
+        if bind_path(hidden, suffix, None, &display_name)?.is_some() {
+            return Err(AnalyzerError::UnsupportedRule {
+                rule: "qualified-using-key".to_owned(),
+                reason: "the requested join-side key is a hidden output".to_owned(),
             });
         }
     }
-    if is_synthetic_join_qualifier {
-        // Reserved emission-namespace qualifiers are not user-bindable.
-        return Err(AnalyzerError::UnknownColumn {
-            name: u.name,
-            qualifier: u.qualifier,
+    bind_path(schema.fields.iter(), parts, None, &display_name)
+}
+
+fn bind_plan_name_parts<'a>(
+    parts: &[String],
+    fields: &'a [Attribute],
+) -> Result<Option<BoundPath<'a>>, AnalyzerError> {
+    let display_name = display_name_parts(parts);
+    for split in (1..parts.len()).rev() {
+        let qualifier = Qualifier::from_parts(parts[..split].to_vec());
+        let candidates = fields.iter().filter(|field| {
+            field
+                .qualifier
+                .as_ref()
+                .is_some_and(|current| current.matches_suffix(&qualifier))
         });
-    }
-    let (dt, nullable, expr_id) = if let Some(q) = u.qualifier.as_deref() {
-        // A qualifier naming a top-level struct takes precedence over a
-        // relation alias.
-        // Both single- and multi-level paths become chains rooted at the
-        // struct attribute, preserving identity for emission.
-        if TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema).is_some() {
-            let root = ctx.schema.field_by_name(q).expect(
-                "struct_qualifier_info matched q as a top-level struct column on this same schema",
-            );
-            return Ok(build_struct_extract_chain(root, &u.name));
-        } else {
-            match ctx.scoped_range(q) {
-                // (e) qualifier binds exactly one in-bounds relation scope —
-                // restrict the name-only lookup to that relation's own
-                // fields. A miss here means `q` is a real, unambiguous
-                // relation but `name` does not exist on it: a Spark-emulated
-                // `UnknownColumn` (ADR-022 cat-1), not an opaque DuckDB bind
-                // error.
-                Some(range) => {
-                    match TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]) {
-                        Some((dt, nullable, attr)) => {
-                            // The attribute is borrowed from the schema slice;
-                            // its identity needs no rebase.
-                            let expr_id = Some(attr.expr_id);
-                            // A uniquely named projected column can bind bare
-                            // by identity; duplicated names retain the
-                            // qualifier for disambiguation.
-                            let name_count = ctx
-                                .schema
-                                .fields
-                                .iter()
-                                .filter(|f| eq_fold(&f.name, &u.name))
-                                .count();
-                            if name_count == 1 {
-                                return Ok(Expression::ColumnReference(ColumnReference {
-                                    name: u.name,
-                                    qualifier: None,
-                                    expr_id,
-                                    data_type: dt,
-                                    nullable,
-                                }));
-                            }
-                            (dt, nullable, expr_id)
-                        }
-                        None => {
-                            return Err(AnalyzerError::UnknownColumn {
-                                name: u.name.clone(),
-                                qualifier: u.qualifier.clone(),
-                            });
-                        }
-                    }
-                }
-                // (f) qualifier binds no in-bounds scope. Two cases collapse
-                // to this arm: `q` binds 2+ ranges (a duplicate alias / bare
-                // table name on both sides of a join — `RelScope::lookup`
-                // collapses 2+ matches to `None`, same as 0), or `q` binds no
-                // scope at all (for example, USING joins). Distinguish them
-                // via `lookup_all` — 2+ is genuinely
-                // ambiguous (Spark: AMBIGUOUS_REFERENCE) and must not fall
-                // through to the permissive legacy name-only lookup; 0 is
-                // resolved below.
-                None => {
-                    let matches = ctx.scopes.lookup_all(q);
-                    if matches.len() > 1 {
-                        let candidates = (0..matches.len())
-                            .map(|i| format!("{q}#{i}.{}", u.name))
-                            .collect();
-                        return Err(AnalyzerError::AmbiguousColumn {
-                            name: u.name.clone(),
-                            candidates,
-                        });
-                    }
-                    // With no scope hit, consult each field's own lineage.
-                    let hits: Vec<usize> = ctx
-                        .schema
-                        .fields
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, f)| {
-                            eq_fold(&f.name, &u.name)
-                                && f.source_quals.iter().any(|qq| eq_fold(qq, q))
-                        })
-                        .map(|(i, _)| i)
-                        .collect();
-                    match hits.len() {
-                        1 => {
-                            // Projected-through (F10): resolve by
-                            // attribute identity and DROP the qualifier
-                            // so emission renders the bare column, which
-                            // binds by that identity over any wrapper —
-                            // no strand.
-                            let k = hits[0];
-                            // `name` from the REFERENCE (the `source_quals`
-                            // match was case-insensitive); everything else
-                            // copied from the resolved attribute.
-                            return Ok(Expression::ColumnReference(ColumnReference {
-                                name: u.name,
-                                ..ColumnReference::from_attr(&ctx.schema.fields[k])
-                            }));
-                        }
-                        n if n >= 2 => {
-                            return Err(AnalyzerError::AmbiguousColumn {
-                                name: u.name.clone(),
-                                candidates: hits
-                                    .iter()
-                                    .map(|&i| ctx.schema.fields[i].name.clone())
-                                    .collect(),
-                            });
-                        }
-                        // 0 hits: NOT projected-through. Degrade to
-                        // Unresolved so the shared tier-(g) tail below tries
-                        // the OUTER scope (correlation, tbl-005/sq-*) and
-                        // otherwise raises UnknownColumn (F8) — NO
-                        // permissive name-only fallback here.
-                        _ => (DataType::Unresolved, false, None),
-                    }
-                }
-            }
+        if let Some(path) = bind_path(candidates, &parts[split..], None, &display_name)? {
+            return Ok(Some(path));
         }
-    } else {
-        let (dt, nullable, attr) =
-            TypeInferenceEngine::qualified_resolve_in(&u.name, None, ctx.schema);
-        // ADR-024: same attribute the lookup resolved.
-        let expr_id = attr.map(|a| a.expr_id);
-        (dt, nullable, expr_id)
+    }
+    bind_path(fields.iter(), parts, None, &display_name)
+}
+
+fn resolve_structured_outer(
+    unresolved: &UnresolvedColumn,
+    outer: OuterScope<'_>,
+) -> Result<Option<Expression>, AnalyzerError> {
+    bind_name_parts(&unresolved.name_parts, outer.schema, outer.scopes, true)
+        .map(|path| path.map(BoundPath::into_expression))
+}
+
+struct ResolvedColumn {
+    expression: Expression,
+    output_attribute: Option<Attribute>,
+}
+
+fn materialize_plan_column(
+    candidate: PlanColumnCandidate,
+    schema: &ResolvedSchema,
+) -> Result<ResolvedColumn, AnalyzerError> {
+    let mut current = schema
+        .fields
+        .iter()
+        .filter(|field| field.expr_id == candidate.target.expr_id)
+        .peekable();
+    let Some(first) = current.peek().copied() else {
+        return Err(AnalyzerError::Internal {
+            reason: format!(
+                "plan-id candidate {:?} survived traversal but is absent from the resolution schema",
+                candidate.target.expr_id
+            ),
+        });
     };
-    if matches!(dt, DataType::Unresolved) {
-        // After local resolution fails, try the immediate outer scope for a
-        // correlated reference. Preserve the outer attribute's identity.
-        if let Some(outer) = ctx.outer {
-            if let Some(expr) = resolve_in_outer(&u, outer) {
-                return Ok(expr);
-            }
-        }
+    let nullable = current.any(|field| field.nullable);
+    let mut root = ColumnReference::from_attr(first);
+    root.nullable = nullable;
+    let expression =
+        candidate
+            .nested
+            .iter()
+            .cloned()
+            .fold(Expression::ColumnReference(root), |child, field| {
+                Expression::ExtractValue(ExtractValueExpression {
+                    child: Box::new(child),
+                    extraction: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::String(field),
+                        data_type: DataType::String,
+                    })),
+                })
+            });
+    let output_attribute = candidate.nested.is_empty().then(|| {
+        let mut target = candidate.target;
+        target.nullable = nullable;
+        target
+    });
+    Ok(ResolvedColumn {
+        expression,
+        output_attribute,
+    })
+}
+
+fn resolve_column(
+    unresolved: UnresolvedColumn,
+    ctx: &ResolveContext<'_>,
+) -> Result<ResolvedColumn, AnalyzerError> {
+    let parts = &unresolved.name_parts;
+    if unresolved.plan_id.is_none()
+        && parts.len() > 1
+        && matches!(parts[0].as_str(), TD_JOIN_LEFT | TD_JOIN_RIGHT)
+    {
         return Err(AnalyzerError::UnknownColumn {
-            name: u.name,
-            qualifier: u.qualifier,
+            name: unresolved.display_name(),
+            qualifier: None,
         });
     }
-    Ok(Expression::ColumnReference(ColumnReference {
-        name: u.name,
-        qualifier: u.qualifier,
-        data_type: dt,
-        nullable,
-        expr_id,
-    }))
+
+    if let Some(plan_id) = unresolved.plan_id {
+        if unresolved.is_metadata_column {
+            if !ctx.plan_ids.has_column_match(plan_id) {
+                return Err(AnalyzerError::SparkEmulated {
+                    class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                    reason: format!("Cannot resolve metadata column for unknown plan id {plan_id}"),
+                });
+            }
+            if parts.len() != 1 {
+                return Err(AnalyzerError::UnknownColumn {
+                    name: unresolved.display_name(),
+                    qualifier: None,
+                });
+            }
+            return Err(AnalyzerError::UnsupportedRule {
+                rule: "metadata-column-resolution".to_owned(),
+                reason: "source metadata attributes are not represented in τ".to_owned(),
+            });
+        }
+        let lookup = ctx.plan_ids.lookup_column(plan_id, &unresolved)?;
+        if let Some(candidate) = lookup.candidate {
+            return materialize_plan_column(candidate, ctx.schema);
+        }
+        return Err(AnalyzerError::UnknownColumn {
+            name: unresolved.display_name(),
+            qualifier: None,
+        });
+    }
+
+    if let Some(path) = bind_name_parts(parts, ctx.schema, &ctx.scopes, false)? {
+        return Ok(ResolvedColumn {
+            expression: path.into_expression(),
+            output_attribute: None,
+        });
+    }
+
+    if let Some(outer) = ctx.outer {
+        if let Some(expr) = resolve_structured_outer(&unresolved, outer)? {
+            return Ok(ResolvedColumn {
+                expression: expr,
+                output_attribute: None,
+            });
+        }
+    }
+    Err(AnalyzerError::UnknownColumn {
+        name: unresolved.display_name(),
+        qualifier: None,
+    })
 }
 
 /// Return `true` iff any `Expression::UnresolvedColumn` (or
@@ -4312,13 +4885,15 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// identity copies that attribute and merges any stamped qualifier; aliases
 /// and computed expressions mint a fresh identity with empty lineage.
 fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
+    let data_type = e.data_type(input);
+    let nullable = e.nullable(input);
     if let Expression::ColumnReference(cr) = e {
         if let Some(id) = cr.expr_id {
             if let Some((_, src)) = input.field_by_id(id, &cr.name) {
                 let mut attr = src.clone();
                 attr.name = expression_output_name(e);
-                attr.data_type = e.data_type(input);
-                attr.nullable = e.nullable(input);
+                attr.data_type = data_type.clone();
+                attr.nullable = nullable;
                 if let Some(q) = &cr.qualifier {
                     attr.source_quals.insert(q.clone());
                 }
@@ -4326,82 +4901,59 @@ fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
             }
         }
     }
-    Attribute::minted(
-        expression_output_name(e),
-        e.data_type(input),
-        e.nullable(input),
-    )
+    Attribute::minted(expression_output_name(e), data_type, nullable)
 }
-
 fn project_output_schema(
     projections: &[Expression],
+    output_overrides: &[Option<Attribute>],
     input: &TypedAst,
 ) -> Result<ResolvedSchema, AnalyzerError> {
+    if projections.len() != output_overrides.len() {
+        return Err(AnalyzerError::Internal {
+            reason: "projection expressions and output overrides have different lengths".to_owned(),
+        });
+    }
     let input_schema = &input.resolved_schema;
     let mut fields: Vec<Attribute> = Vec::with_capacity(projections.len());
-    for expr in projections {
+    for (expr, output_override) in projections.iter().zip(output_overrides) {
+        if let Some(attribute) = output_override {
+            fields.push(attribute.clone());
+            continue;
+        }
         match expr {
-            Expression::Star(s) => {
-                // Star: expand at schema level. Qualified star: filter by
-                // struct field / qualifier (τ's analyzer keeps it simple —
-                // qualifier match against field name).
-                match &s.qualifier {
-                    None => {
-                        // Unqualified `*`: the SAME columns, just re-listed —
-                        // clone carries each attribute's id forward.
-                        fields.extend(input_schema.fields.iter().cloned());
-                    }
-                    Some(q) => {
-                        // If the qualifier matches a struct field, expand
-                        // that struct's inner fields. These inner fields
-                        // never existed as top-level output columns before —
-                        // mint fresh ids for them.
-                        if let Some(f) = input_schema.field_by_name(q) {
-                            if let DataType::Struct(st) = &f.data_type {
-                                let base_nullable = f.nullable;
-                                for inner in &st.fields {
-                                    fields.push(Attribute::minted(
-                                        inner.name.clone(),
-                                        inner.data_type.clone(),
-                                        base_nullable || inner.nullable,
-                                    ));
-                                }
-                                continue;
-                            }
-                        }
-                        // Table-qualified star (`emp.*` / `e.*`): expand to
-                        // the qualifier's bound field RANGE from the input's
-                        // stamped RelScope — the same contiguous-range
-                        // authority `resolve_column`'s qualifier arm trusts.
-                        // This covers every shape whose scope exposes `q`
-                        // (aliased relations, bare scans, either side of a
-                        // plain multi-relation join, through the
-                        // scope-passthrough operator class); emission keeps
-                        // the alias visible in exactly those shapes, and its
-                        // `q.*` slot returns that relation's columns in the
-                        // same range order. USING joins stay excluded
-                        // automatically (their RelScope is empty), as are
-                        // ambiguous duplicates (`lookup` bails on 2+
-                        // matches). These are the SAME columns re-listed —
-                        // clone carries each attribute's id forward.
-                        if let Some(range) = input.scope.lookup(q) {
-                            debug_assert!(range.end <= input_schema.len());
-                            if range.end <= input_schema.len() {
-                                fields.extend(input_schema.fields[range].iter().cloned());
-                                continue;
-                            }
-                        }
-                        // Unknown qualifier — do NOT silently expand as `*`.
-                        // Surface as an UnknownColumn error so `SELECT
-                        // nonexistent.*` produces the same Spark-emulated
-                        // diagnostic as an unqualified `nonexistent`.
-                        return Err(AnalyzerError::UnknownColumn {
-                            name: format!("{q}.*"),
-                            qualifier: Some(q.clone()),
-                        });
-                    }
+            Expression::Star(star) => match star {
+                StarExpression::Unqualified | StarExpression::DataFrame(_) => {
+                    fields.extend(input_schema.fields.iter().cloned());
                 }
-            }
+                StarExpression::Qualified(q) => {
+                    if let Some(target) =
+                        bind_name_parts(q.parts(), input_schema, &input.scope, false)?
+                    {
+                        if let DataType::Struct(st) = target.data_type {
+                            let base_nullable = target.nullable;
+                            for inner in &st.fields {
+                                fields.push(Attribute::minted(
+                                    inner.name.clone(),
+                                    inner.data_type.clone(),
+                                    base_nullable || inner.nullable,
+                                ));
+                            }
+                            continue;
+                        } else {
+                            return Err(AnalyzerError::SparkEmulated {
+                                class: "_LEGACY_ERROR_TEMP_1050",
+                                reason: format!(
+                                    "Can only star expand a struct data type, but `{q}` is not a struct"
+                                ),
+                            });
+                        }
+                    }
+                    return Err(AnalyzerError::SparkEmulated {
+                        class: "CANNOT_RESOLVE_STAR_EXPAND",
+                        reason: format!("Cannot resolve star expansion target `{q}`"),
+                    });
+                }
+            },
             other => fields.push(output_attribute(other, input_schema)),
         }
     }
@@ -4591,6 +5143,24 @@ fn build_stats_output_schema(cols: &[String]) -> ResolvedSchema {
     ResolvedSchema::new(fields)
 }
 
+fn validate_named_columns(
+    cols: &[String],
+    input_schema: &ResolvedSchema,
+) -> Result<(), AnalyzerError> {
+    let names: HashSet<String> = input_schema
+        .fields
+        .iter()
+        .map(|field| fold_key(&field.name))
+        .collect();
+    if let Some(missing) = cols.iter().find(|col| !names.contains(&fold_key(col))) {
+        return Err(AnalyzerError::UnknownColumn {
+            name: missing.clone(),
+            qualifier: None,
+        });
+    }
+    Ok(())
+}
+
 /// Materialise a caller-supplied `cols` list against `input_schema`:
 ///   - empty ⇒ all input columns in schema order (Spark default);
 ///   - non-empty ⇒ each name resolves case-insensitively or
@@ -4603,19 +5173,7 @@ fn materialise_stats_cols(
     if cols.is_empty() {
         Ok(input_schema.fields.iter().map(|f| f.name.clone()).collect())
     } else {
-        let lowercase_names: HashSet<String> = input_schema
-            .fields
-            .iter()
-            .map(|f| fold_key(&f.name))
-            .collect();
-        for c in &cols {
-            if !lowercase_names.contains(&fold_key(c)) {
-                return Err(AnalyzerError::UnknownColumn {
-                    name: c.clone(),
-                    qualifier: None,
-                });
-            }
-        }
+        validate_named_columns(&cols, input_schema)?;
         Ok(cols)
     }
 }
@@ -4799,7 +5357,7 @@ fn analyze_pivot(
     // `input schema − pivot column − aggregate-referenced columns`, in input
     // order, per Spark parity (ADR-015).
     let grouping = match grouping {
-        PivotGrouping::Explicit(g) => resolve_expr_list(g, &ctx)?,
+        PivotGrouping::Explicit(g) => g,
         PivotGrouping::Implicit => {
             derive_implicit_grouping(input_schema, &pivot_column, &aggregates)
         }
@@ -4811,7 +5369,9 @@ fn analyze_pivot(
     // from them; emission consumes `aggregates` via `.unaliased()`).
     // `derive_implicit_grouping` produces bare references, so this is a no-op
     // for implicit grouping.
-    let grouping: Vec<Expression> = grouping.into_iter().map(ensure_named).collect();
+    let grouping_count = grouping.len();
+    let (grouping, grouping_overrides) =
+        resolve_named_expressions(grouping, vec![None; grouping_count], &ctx)?;
     // Pivot values are literals; they only need type resolution against the
     // pivot column (Spark coerces them into that type at read). We defer
     // typing to the emission stage — literals carry their own type already.
@@ -4828,7 +5388,13 @@ fn analyze_pivot(
 
     // Build the output schema. Grouping columns come first, verbatim.
     let mut output_fields: Vec<Attribute> = Vec::new();
-    output_fields.extend(grouping.iter().map(|g| output_attribute(g, input_schema)));
+    output_fields.extend(grouping.iter().zip(&grouping_overrides).map(
+        |(expression, output_override)| {
+            output_override
+                .clone()
+                .unwrap_or_else(|| output_attribute(expression, input_schema))
+        },
+    ));
 
     // `pivot_values` is non-empty by construction — the punt at the top of
     // this fn rejects an empty list, `resolve_expr_list` preserves length,
@@ -4907,13 +5473,7 @@ pub fn crosstab_to_aggregate(
     use super::ast::GroupingKind;
     use super::expression::{BinaryOp, UnaryOp};
 
-    let col_ref = |name: &str| {
-        Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
-            plan_id: None,
-        })
-    };
+    let col_ref = |name: &str| UnresolvedColumn::bare(name);
 
     // col0: WHEN col1 IS NULL THEN 'null' ELSE CAST(col1 AS STRING) END
     // AS "{col1}_{col2}". Spark's `StatFunctions.crossTabulate` relabels a NULL
@@ -5062,7 +5622,7 @@ fn collect_referenced_columns(expr: &Expression, acc: &mut HashSet<String>) {
             acc.insert(fold_key(&c.name));
         }
         Expression::UnresolvedColumn(u) => {
-            acc.insert(fold_key(&u.name));
+            acc.insert(fold_key(&u.resolution_name()));
         }
         _ => {
             for child in expr.children() {
@@ -5131,7 +5691,7 @@ fn expression_output_name(expr: &Expression) -> String {
     match expr {
         Expression::Alias(a) => a.alias.clone(),
         Expression::ColumnReference(c) => c.name.clone(),
-        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::UnresolvedColumn(u) => u.resolution_name().into_owned(),
         // An unaliased function call is named by Spark's `toPrettySQL`
         // rendering (`fn(args)`, e.g. `sum(ss_net_profit)`), not the bare
         // function name — verified against Spark 4.1.1's own column naming
@@ -5232,7 +5792,7 @@ const SPARK_UPPER_PRETTY: &[&str] = &[
 fn pretty_name(expr: &Expression) -> String {
     match expr {
         Expression::ColumnReference(c) => c.name.clone(),
-        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::UnresolvedColumn(u) => u.resolution_name().into_owned(),
         Expression::Alias(a) => a.alias.clone(),
         Expression::Literal(l) => pretty_literal(&l.value),
         Expression::Binary(b) => format!(
@@ -5265,9 +5825,9 @@ fn pretty_name(expr: &Expression) -> String {
                 spark_type_sql(&c.to_type)
             )
         }
-        Expression::Star(s) => match &s.qualifier {
-            Some(q) => format!("{q}.*"),
-            None => "*".to_owned(),
+        Expression::Star(star) => match star {
+            StarExpression::Qualified(q) => format!("{q}.*"),
+            StarExpression::Unqualified | StarExpression::DataFrame(_) => "*".to_owned(),
         },
         // Spark names a struct-field access by its leaf field name (the string
         // extraction key), e.g. `address.geo.lat` → `lat`.
@@ -5534,10 +6094,11 @@ mod tests {
     use super::super::analyzer_fixtures;
     use super::super::ast::{CommonAst, GroupingKind};
     use super::super::expression::{
-        AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery,
-        FunctionCall, InSubquery, IntervalExpression, IntervalKind, LambdaExpression,
-        LambdaVariableExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery,
-        SortDirection, StarExpression, UnaryExpression, UnaryOp, UnresolvedRegexExpression,
+        AliasExpression, ArrayLiteralExpression, BetweenExpression, BinaryExpression, BinaryOp,
+        ExistsSubquery, FunctionCall, InSubquery, IntervalExpression, IntervalKind,
+        LambdaExpression, LambdaVariableExpression, Literal, LiteralValue, NullOrdering,
+        ScalarSubquery, SortDirection, StarExpression, UnaryExpression, UnaryOp,
+        UnresolvedRegexExpression,
     };
     use super::super::schema::ExprId;
     use super::*;
@@ -5560,7 +6121,7 @@ mod tests {
 
     fn scan(name: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
-            table: name.to_owned(),
+            table: Qualifier::single(name),
         })
     }
 
@@ -5570,17 +6131,17 @@ mod tests {
 
     fn unresolved_col(name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
+            name_parts: vec![name.to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })
     }
 
     fn qcol(qualifier: &str, name: &str) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: Some(qualifier.to_owned()),
+            name_parts: vec![qualifier.to_owned(), name.to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })
     }
 
@@ -5658,8 +6219,6 @@ mod tests {
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         })
     }
 
@@ -5721,7 +6280,7 @@ mod tests {
         BaseTypes::from_entries(
             tables
                 .iter()
-                .map(|(name, schema)| ((*name).to_owned(), schema.clone()))
+                .map(|(name, schema)| (Qualifier::single(*name), schema.clone()))
                 .collect(),
         )
     }
@@ -5733,18 +6292,851 @@ mod tests {
     fn aliased_scan(table: &str, alias: &str) -> CommonAst {
         CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: table.to_owned(),
+                table: Qualifier::single(table),
             })),
             alias: alias.to_owned(),
         })
     }
 
     #[test]
+    fn quoted_dot_column_does_not_collapse_into_nested_parts() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::nullable("b.c", DataType::String)]),
+        )]);
+        let project = |name_parts: Vec<&str>| {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(aliased_scan("src", "a")),
+                projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name_parts: name_parts.into_iter().map(str::to_owned).collect(),
+                    plan_id: None,
+                    is_metadata_column: false,
+                })],
+            })
+        };
+
+        let quoted = analyze(project(vec!["a", "b.c"]), &base_types).expect("quoted column");
+        assert_eq!(quoted.resolved_schema.fields[0].name, "b.c");
+
+        assert!(matches!(
+            analyze(project(vec!["a", "b", "c"]), &base_types),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_name_part_column_resolves_as_a_literal_name() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::nullable("", DataType::String)]),
+        )]);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec![String::new()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
+        });
+
+        let typed = analyze(project, &base_types).expect("empty-name column should resolve");
+        assert_eq!(typed.resolved_schema.fields[0].name, "");
+    }
+
+    #[test]
+    fn qualified_star_preserves_quoted_struct_field_parts() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::nullable(
+                "b.c",
+                DataType::Struct(StructType::new(vec![StructField::not_null(
+                    "x",
+                    DataType::Long,
+                )])),
+            )]),
+        )]);
+        let project = |parts: Vec<&str>| {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(aliased_scan("src", "a")),
+                projections: vec![Expression::Star(StarExpression::Qualified(
+                    Qualifier::from_parts(parts.into_iter().map(str::to_owned).collect()),
+                ))],
+            })
+        };
+
+        let quoted = analyze(project(vec!["a", "b.c"]), &base_types)
+            .expect("quoted struct-field star should expand");
+        assert_eq!(
+            quoted
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x"]
+        );
+
+        assert!(matches!(
+            analyze(project(vec!["a", "b", "c"]), &base_types),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_STAR_EXPAND",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ambiguous_structured_column_precedes_nested_path_validation() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![
+                StructField::nullable(
+                    "a",
+                    DataType::Struct(StructType::new(vec![StructField::not_null(
+                        "b",
+                        DataType::Long,
+                    )])),
+                ),
+                StructField::not_null("a", DataType::Integer),
+            ]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["a".to_owned(), "missing".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
+        });
+        assert!(matches!(
+            analyze(ast, &base_types),
+            Err(AnalyzerError::AmbiguousColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn ambiguous_structured_star_precedes_struct_path_validation() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![
+                StructField::nullable(
+                    "a",
+                    DataType::Struct(StructType::new(vec![StructField::not_null(
+                        "b",
+                        DataType::Long,
+                    )])),
+                ),
+                StructField::not_null("a", DataType::Integer),
+            ]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(vec!["a".to_owned(), "missing".to_owned()]),
+            ))],
+        });
+        assert!(matches!(
+            analyze(ast, &base_types),
+            Err(AnalyzerError::AmbiguousColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn repeated_same_attribute_is_not_ambiguous_for_structured_paths() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::nullable(
+                "a",
+                DataType::Struct(StructType::new(vec![StructField::not_null(
+                    "b",
+                    DataType::Long,
+                )])),
+            )]),
+        )]);
+        let repeated = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![UnresolvedColumn::bare("a"), UnresolvedColumn::bare("a")],
+        });
+        let column = CommonAst::new(CommonOp::Project {
+            input: Box::new(repeated.clone()),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["a".to_owned(), "b".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
+        });
+        let typed = analyze(column, &base_types).expect("repeated attribute should deduplicate");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+
+        let star = CommonAst::new(CommonOp::Project {
+            input: Box::new(repeated),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("a"),
+            ))],
+        });
+        let typed = analyze(star, &base_types).expect("repeated attribute star should deduplicate");
+        assert_eq!(typed.resolved_schema.fields[0].name, "b");
+    }
+
+    #[test]
+    fn qualified_column_prefers_relation_alias_over_struct_root() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![
+                StructField::nullable(
+                    "a",
+                    DataType::Struct(StructType::new(vec![StructField::not_null(
+                        "b",
+                        DataType::Long,
+                    )])),
+                ),
+                StructField::not_null("b", DataType::Integer),
+            ]),
+        )]);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("src", "a")),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["a".to_owned(), "b".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
+        });
+        let typed = analyze(project, &base_types).expect("qualified b should bind alias a");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn qualified_zero_candidate_falls_back_to_struct_root() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![
+                StructField::nullable(
+                    "a",
+                    DataType::Struct(StructType::new(vec![StructField::not_null(
+                        "b",
+                        DataType::Struct(StructType::new(vec![StructField::not_null(
+                            "d",
+                            DataType::Long,
+                        )])),
+                    )])),
+                ),
+                StructField::not_null("c", DataType::Integer),
+            ]),
+        )]);
+        let column = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("src", "a")),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["a".to_owned(), "b".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
+        });
+        let typed = analyze(column, &base_types).expect("struct root should remain available");
+        assert!(matches!(
+            typed.resolved_schema.fields[0].data_type,
+            DataType::Struct(_)
+        ));
+
+        let star = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("src", "a")),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(vec!["a".to_owned(), "b".to_owned()]),
+            ))],
+        });
+        let typed = analyze(star, &base_types).expect("struct star should remain available");
+        assert_eq!(typed.resolved_schema.fields[0].name, "d");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+    }
+
+    #[test]
+    fn quoted_multipart_alias_does_not_match_unquoted_prefix() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null("c", DataType::Long)]),
+        )]);
+        let project = |parts: Vec<&str>| {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(aliased_scan("src", "a.b")),
+                projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name_parts: parts.into_iter().map(str::to_owned).collect(),
+                    plan_id: None,
+                    is_metadata_column: false,
+                })],
+            })
+        };
+        let quoted = analyze(project(vec!["a.b", "c"]), &base_types)
+            .expect("quoted multipart alias should bind");
+        assert_eq!(quoted.resolved_schema.fields[0].data_type, DataType::Long);
+        assert!(matches!(
+            analyze(project(vec!["a", "b", "c"]), &base_types),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn analyze_preserves_exact_plan_boundaries() {
+        let ast = CommonAst::new(CommonOp::PlanBoundary {
+            input: Box::new(emp_scan().with_plan_id(10)),
+        })
+        .with_plan_id(20);
+        let typed = analyze(ast, &base_types_with_emp_dept()).unwrap();
+        assert_eq!(typed.plan_id, Some(20));
+        let TypedOp::PlanBoundary { input } = &typed.op else {
+            panic!("expected PlanBoundary");
+        };
+        assert_eq!(input.plan_id, Some(10));
+        assert_eq!(typed.resolved_schema, input.resolved_schema);
+        assert_eq!(typed.scope, input.scope);
+        assert!(has_resolved_schema(&typed));
+    }
+
+    #[test]
+    fn dataframe_star_expands_to_bound_columns() {
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan().with_plan_id(10)),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("analyze");
+
+        let TypedOp::Project { input, projections } = &typed.op else {
+            panic!("expected Project");
+        };
+        assert!(projections
+            .iter()
+            .all(|expr| matches!(expr, Expression::ColumnReference(_))));
+        assert_eq!(typed.resolved_schema, input.resolved_schema);
+        assert!(has_resolved_schema(&typed));
+    }
+
+    #[test]
+    fn dataframe_star_selects_one_join_side() {
+        let joined = join(
+            scan("emp").with_plan_id(10),
+            scan("dept").with_plan_id(20),
+            JoinType::Cross,
+            None,
+        );
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![Expression::Star(StarExpression::DataFrame(20))],
+        });
+        let typed = analyze(ast, &base_types_with_emp_dept()).unwrap();
+        assert_eq!(typed.resolved_schema, dept_schema());
+        let TypedOp::Project { input, projections } = &typed.op else {
+            panic!("expected Project");
+        };
+        for (projection, field) in projections.iter().zip(&input.resolved_schema.fields[4..]) {
+            let Expression::ColumnReference(reference) = projection else {
+                panic!("expected ColumnReference");
+            };
+            assert_eq!(reference.expr_id, Some(field.expr_id));
+        }
+    }
+
+    #[test]
+    fn dataframe_star_descends_through_union() {
+        let union = set_op(
+            SetOpKind::Union,
+            true,
+            vec![emp_scan().with_plan_id(10), emp_scan()],
+        );
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(union),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+
+        let typed = analyze(ast, &base_types_with_emp_dept())
+            .expect("DataFrame-star lookup must recurse through Union");
+        assert_eq!(
+            typed.resolved_schema.field_names(),
+            emp_schema().field_names()
+        );
+    }
+
+    #[test]
+    fn dataframe_star_preserves_target_qualifier_across_relation_alias() {
+        let starred = || {
+            let original = aliased_scan("emp", "orig").with_plan_id(10);
+            let renamed = CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(original),
+                alias: "x".to_owned(),
+            });
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(renamed),
+                projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+            })
+        };
+
+        let typed = analyze(starred(), &base_types_with_emp_dept()).unwrap();
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .all(|field| { field.qualifier.as_ref() == Some(&Qualifier::single("orig")) }));
+        let TypedOp::Project { projections, .. } = &typed.op else {
+            panic!("expected Project");
+        };
+        assert!(projections.iter().all(|projection| {
+            matches!(projection, Expression::ColumnReference(reference) if reference.qualifier.is_none())
+        }));
+
+        let original_ref = CommonAst::new(CommonOp::Project {
+            input: Box::new(starred()),
+            projections: vec![qcol("orig", "id")],
+        });
+        analyze(original_ref, &base_types_with_emp_dept())
+            .expect("the target node qualifier must survive the DataFrame star");
+
+        let current_alias_ref = CommonAst::new(CommonOp::Project {
+            input: Box::new(starred()),
+            projections: vec![qcol("x", "id")],
+        });
+        assert!(matches!(
+            analyze(current_alias_ref, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn dataframe_star_rejects_missing_or_filtered_plan() {
+        let missing = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan().with_plan_id(10)),
+            projections: vec![Expression::Star(StarExpression::DataFrame(99))],
+        });
+        assert!(matches!(
+            analyze(missing, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+
+        let narrowed = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan().with_plan_id(10)),
+            projections: vec![unresolved_col("id")],
+        })
+        .with_plan_id(20);
+        let filtered = CommonAst::new(CommonOp::Project {
+            input: Box::new(narrowed),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+        assert!(matches!(
+            analyze(filtered, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+
+        let reordered = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan().with_plan_id(10)),
+            projections: vec![
+                unresolved_col("salary"),
+                unresolved_col("id"),
+                unresolved_col("name"),
+                unresolved_col("dept_id"),
+            ],
+        })
+        .with_plan_id(20);
+        let reordered_star = CommonAst::new(CommonOp::Project {
+            input: Box::new(reordered),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+        assert_eq!(
+            analyze(reordered_star, &base_types_with_emp_dept())
+                .unwrap()
+                .resolved_schema
+                .field_names(),
+            vec!["id", "name", "dept_id", "salary"]
+        );
+    }
+
+    #[test]
+    fn dataframe_star_rejects_ambiguous_plan_id() {
+        let joined = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+        assert!(matches!(
+            analyze(ast, &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_dataframe_star_preserves_plan_id_errors_and_boundaries() {
+        let project = |input, plan_id| {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(input),
+                projections: vec![func(
+                    "count",
+                    vec![Expression::Star(StarExpression::DataFrame(plan_id))],
+                )],
+            })
+        };
+        let aggregate_star = |input, plan_id| {
+            aggregate(
+                input,
+                vec![],
+                vec![func(
+                    "count",
+                    vec![Expression::Star(StarExpression::DataFrame(plan_id))],
+                )],
+            )
+        };
+
+        assert!(matches!(
+            analyze(
+                project(emp_scan().with_plan_id(10), 99),
+                &base_types_with_emp_dept()
+            ),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+
+        let ambiguous = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        assert!(matches!(
+            analyze(project(ambiguous, 10), &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+
+        let matched = analyze(
+            project(emp_scan().with_plan_id(10), 10),
+            &base_types_with_emp_dept(),
+        )
+        .expect_err("nested expansion is an honest boundary");
+        assert_eq!(matched.category(), ErrorCategory::ThunderduckBoundary);
+
+        assert!(matches!(
+            analyze(
+                aggregate_star(emp_scan().with_plan_id(10), 99),
+                &base_types_with_emp_dept()
+            ),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+        let ambiguous = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        assert!(matches!(
+            analyze(aggregate_star(ambiguous, 10), &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+        assert_eq!(
+            analyze(
+                aggregate_star(emp_scan().with_plan_id(10), 10),
+                &base_types_with_emp_dept()
+            )
+            .expect_err("nested aggregate expansion is an honest boundary")
+            .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let filtered_duplicate = join(
+            emp_scan().with_plan_id(10),
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(emp_scan().with_plan_id(10)),
+                projections: vec![unresolved_col("id")],
+            }),
+            JoinType::Cross,
+            Some(func(
+                "hash",
+                vec![Expression::Star(StarExpression::DataFrame(10))],
+            )),
+        );
+        assert_eq!(
+            analyze(filtered_duplicate, &base_types_with_emp_dept())
+                .expect_err("only one sibling star survives ancestor filtering")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let lambda_plan = |plan_id| {
+            let lambda = Expression::Lambda(LambdaExpression {
+                params: vec!["x".to_owned()],
+                body: Box::new(Expression::Star(StarExpression::DataFrame(plan_id))),
+            });
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![func("transform", vec![unresolved_col("tags"), lambda])],
+            })
+        };
+        let tags = base_types_for(&[("emp", emp_tags_schema())]);
+        assert!(matches!(
+            analyze(lambda_plan(99), &tags),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+        assert_eq!(
+            analyze(lambda_plan(10), &tags)
+                .expect_err("lambda-contained expansion is an honest boundary")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let lambda_column_plan = |input, name, plan_id| {
+            let lambda = Expression::Lambda(LambdaExpression {
+                params: vec!["x".to_owned()],
+                body: Box::new(pcol(name, plan_id)),
+            });
+            let values = Expression::ArrayLiteral(ArrayLiteralExpression {
+                elements: vec![lit_str("x")],
+                element_type: DataType::String,
+            });
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(input),
+                projections: vec![func("transform", vec![values, lambda])],
+            })
+        };
+        assert!(matches!(
+            analyze(
+                lambda_column_plan(scan("emp").with_plan_id(10), "id", 99),
+                &tags
+            ),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+        assert_eq!(
+            analyze(
+                lambda_column_plan(scan("emp").with_plan_id(10), "id", 10),
+                &tags
+            )
+            .expect_err("lambda-contained plan column is an honest boundary")
+            .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+        assert_eq!(
+            analyze(
+                lambda_column_plan(scan("emp").with_plan_id(10), "does_not_exist", 10),
+                &tags
+            )
+            .expect_err("a matched plan with no candidate is an honest boundary")
+            .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let ambiguous = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        assert!(matches!(
+            analyze(lambda_column_plan(ambiguous, "id", 10), &tags),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+
+        let filtered_duplicate = join(
+            scan("emp").with_plan_id(10),
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![unresolved_col("name")],
+            }),
+            JoinType::Cross,
+            None,
+        );
+        assert_eq!(
+            analyze(lambda_column_plan(filtered_duplicate, "id", 10), &tags)
+                .expect_err("only one sibling plan column survives ancestor filtering")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let lambda_condition = || {
+            func(
+                "transform",
+                vec![
+                    Expression::ArrayLiteral(ArrayLiteralExpression {
+                        elements: vec![lit_str("x")],
+                        element_type: DataType::String,
+                    }),
+                    Expression::Lambda(LambdaExpression {
+                        params: vec!["x".to_owned()],
+                        body: Box::new(pcol("id", 10)),
+                    }),
+                ],
+            )
+        };
+        let direct_over_deeper = join(
+            scan("emp").with_plan_id(10),
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![unresolved_col("id")],
+            })
+            .with_plan_id(20),
+            JoinType::Cross,
+            Some(lambda_condition()),
+        );
+        assert_eq!(
+            analyze(direct_over_deeper, &tags)
+                .expect_err("the direct plan match outranks the deeper match")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let two_direct = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            Some(lambda_condition()),
+        );
+        assert!(matches!(
+            analyze(two_direct, &tags),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+
+        let boundary = |input, plan_id| {
+            CommonAst::new(CommonOp::PlanBoundary {
+                input: Box::new(input),
+            })
+            .with_plan_id(plan_id)
+        };
+        let unequal_nonzero_depths = join(
+            boundary(scan("emp").with_plan_id(10), 11),
+            boundary(boundary(scan("emp").with_plan_id(10), 12), 13),
+            JoinType::Cross,
+            Some(lambda_condition()),
+        );
+        assert!(matches!(
+            analyze(unequal_nonzero_depths, &tags),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+
+        let filtered = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![unresolved_col("name")],
+        });
+        assert_eq!(
+            analyze(lambda_column_plan(filtered, "id", 10), &tags)
+                .expect_err("a filtered candidate still records the matched plan")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+    }
+
+    #[test]
+    fn nested_regex_expansion_is_an_honest_boundary() {
+        let regex = || {
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern: ".*".to_owned(),
+                qualifier: None,
+            })
+        };
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![func("hash", vec![regex()])],
+        });
+        assert_eq!(
+            analyze(project, &base_types_with_emp_dept())
+                .expect_err("nested Project regex is an honest boundary")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let aggregate = aggregate(emp_scan(), vec![], vec![func("hash", vec![regex()])]);
+        assert_eq!(
+            analyze(aggregate, &base_types_with_emp_dept())
+                .expect_err("Aggregate regex is an honest boundary")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+    }
+
+    #[test]
+    fn dataframe_star_over_using_join_is_an_honest_boundary() {
+        for join_type in [JoinType::Left, JoinType::Full] {
+            let joined = CommonAst::new(CommonOp::Join {
+                left: Box::new(scan("emp").with_plan_id(10)),
+                right: Box::new(scan("dept").with_plan_id(20)),
+                join_type,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            });
+            let ast = CommonAst::new(CommonOp::Project {
+                input: Box::new(joined),
+                projections: vec![Expression::Star(StarExpression::DataFrame(20))],
+            });
+            let err = analyze(ast, &base_types_with_emp_dept()).unwrap_err();
+            assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+        }
+    }
+
+    #[test]
+    fn dataframe_star_distinguishes_hidden_key_from_an_ordinary_project_drop() {
+        let using_join = || {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(scan("emp").with_plan_id(10)),
+                right: Box::new(scan("dept").with_plan_id(20)),
+                join_type: JoinType::Left,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            })
+        };
+
+        let right_without_public_key = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join()),
+            projections: vec![qcol("dept", "dept_name")],
+        });
+        let hidden_star = CommonAst::new(CommonOp::Project {
+            input: Box::new(right_without_public_key),
+            projections: vec![Expression::Star(StarExpression::DataFrame(20))],
+        });
+        assert_eq!(
+            analyze(hidden_star, &base_types_with_emp_dept())
+                .unwrap_err()
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
+
+        let narrowed_left = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join()),
+            projections: vec![qcol("emp", "dept_id")],
+        });
+        let dropped_star = CommonAst::new(CommonOp::Project {
+            input: Box::new(narrowed_left),
+            projections: vec![Expression::Star(StarExpression::DataFrame(10))],
+        });
+        assert!(matches!(
+            analyze(dropped_star, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn rel_scope_aliased_scan_binds_alias_only_shadowing_table_name() {
         let bt = base_types_with_emp_dept();
         let typed = analyze(aliased_scan("emp", "e"), &bt).unwrap();
-        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
-        assert!(typed.scope.plan_ids.is_empty());
+        assert_eq!(typed.scope.aliases, vec![(Qualifier::single("e"), 0..4)]);
     }
 
     #[test]
@@ -5755,7 +7147,7 @@ mod tests {
             alias: "e".to_owned(),
         });
         let typed = analyze(ast, &bt).unwrap();
-        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
+        assert_eq!(typed.scope.aliases, vec![(Qualifier::single("e"), 0..4)]);
     }
 
     #[test]
@@ -5775,7 +7167,10 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(
             typed.scope.aliases,
-            vec![("e".to_owned(), 0..4), ("d".to_owned(), 4..6)]
+            vec![
+                (Qualifier::single("e"), 0..4),
+                (Qualifier::single("d"), 4..6)
+            ]
         );
     }
 
@@ -5794,7 +7189,7 @@ mod tests {
             Some(cond),
         );
         let typed = analyze(ast, &bt).unwrap();
-        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
+        assert_eq!(typed.scope.aliases, vec![(Qualifier::single("e"), 0..4)]);
     }
 
     #[test]
@@ -5808,12 +7203,9 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let typed = analyze(ast, &bt).unwrap();
         assert!(typed.scope.aliases.is_empty());
-        assert!(typed.scope.plan_ids.is_empty());
     }
 
     #[test]
@@ -5848,59 +7240,6 @@ mod tests {
     }
 
     #[test]
-    fn rel_scope_join_plan_ids_outermost_first() {
-        let bt = base_types_for(&[
-            ("emp", emp_schema()),
-            ("dept", dept_schema()),
-            ("bonus", dept_schema()),
-        ]);
-        let inner = CommonAst::new(CommonOp::Join {
-            left: Box::new(emp_scan()),
-            right: Box::new(scan("dept")),
-            join_type: JoinType::Inner,
-            condition: Some(Expression::Binary(BinaryExpression {
-                op: BinaryOp::Eq,
-                left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
-                    name: "dept_id".to_owned(),
-                    qualifier: None,
-                    plan_id: Some(1),
-                })),
-                right: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
-                    name: "dept_id".to_owned(),
-                    qualifier: None,
-                    plan_id: Some(2),
-                })),
-            })),
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![1],
-            right_plan_ids: vec![2],
-        });
-        let outer = CommonAst::new(CommonOp::Join {
-            left: Box::new(inner),
-            right: Box::new(scan("bonus")),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![1],
-            right_plan_ids: vec![3],
-        });
-        let typed = analyze(outer, &bt).unwrap();
-        let pid1_entries: Vec<_> = typed
-            .scope
-            .plan_ids
-            .iter()
-            .filter(|(pid, _)| *pid == 1)
-            .collect();
-        assert_eq!(pid1_entries.len(), 2);
-        assert_eq!(pid1_entries[0].1, 0..6);
-        assert_eq!(pid1_entries[1].1, 0..4);
-    }
-
-    #[test]
     fn rel_scope_generate_appends_generated_range() {
         let bt = base_types_with_emp_dept();
         let input = analyze(aliased_scan("emp", "e"), &bt).unwrap();
@@ -5923,29 +7262,30 @@ mod tests {
         );
         assert_eq!(
             typed.scope.aliases,
-            vec![("e".to_owned(), 0..4), ("t".to_owned(), 4..5)]
+            vec![
+                (Qualifier::single("e"), 0..4),
+                (Qualifier::single("t"), 4..5)
+            ]
         );
     }
 
     fn pcol(name: &str, plan_id: i64) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
+            name_parts: vec![name.to_owned()],
             plan_id: Some(plan_id),
+            is_metadata_column: false,
         })
     }
 
     fn plan_id_join(condition: Option<Expression>) -> CommonAst {
         CommonAst::new(CommonOp::Join {
-            left: Box::new(emp_scan()),
-            right: Box::new(scan("dept")),
+            left: Box::new(emp_scan().with_plan_id(1)),
+            right: Box::new(scan("dept").with_plan_id(2)),
             join_type: JoinType::Inner,
             condition,
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![1],
-            right_plan_ids: vec![2],
         })
     }
 
@@ -6019,13 +7359,11 @@ mod tests {
             left: Box::new(pcol("id", 1)),
             right: Box::new(pcol("id", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(2),
             JoinType::Inner,
             Some(cond),
-            vec![1],
-            vec![2],
         );
         let typed = analyze(joined, &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
@@ -6073,7 +7411,7 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_ref_does_not_leak_into_nested_joins() {
+    fn ancestor_plan_id_with_duplicate_output_is_ambiguous() {
         let bt = base_types_for(&[
             ("emp", emp_schema()),
             ("dept", dept_schema()),
@@ -6084,7 +7422,8 @@ mod tests {
             left: Box::new(qcol("emp", "dept_id")),
             right: Box::new(qcol("dept", "dept_id")),
         });
-        let inner = join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond));
+        let inner =
+            join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond)).with_plan_id(7);
         let outer_cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 7)),
@@ -6092,14 +7431,12 @@ mod tests {
         });
         let outer = CommonAst::new(CommonOp::Join {
             left: Box::new(inner),
-            right: Box::new(scan("bonus")),
+            right: Box::new(scan("bonus").with_plan_id(8)),
             join_type: JoinType::Inner,
             condition: Some(outer_cond),
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![7],
-            right_plan_ids: vec![8],
         });
         let filtered = CommonAst::new(CommonOp::Filter {
             input: Box::new(outer),
@@ -6109,22 +7446,10 @@ mod tests {
                 right: Box::new(lit_double(0.0)),
             }),
         });
-        let typed = analyze(filtered, &bt).unwrap();
-        let TypedOp::Filter {
-            input: outer,
-            condition,
-        } = &typed.op
-        else {
-            panic!("expected Filter");
-        };
-        let Expression::Binary(BinaryExpression { left, .. }) = condition else {
-            panic!("expected Binary condition");
-        };
-        let Expression::ColumnReference(ancestor_ref) = left.as_ref() else {
-            panic!("expected ColumnReference, got {left:?}");
-        };
-        assert_eq!(ancestor_ref.qualifier, None);
-        assert_eq!(ancestor_ref.expr_id, Some(merged_join_expr_id_at(outer, 2)));
+        assert!(matches!(
+            analyze(filtered, &bt),
+            Err(AnalyzerError::AmbiguousColumn { .. })
+        ));
     }
 
     fn field_names(typed: &TypedAst) -> Vec<&str> {
@@ -6189,9 +7514,9 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression {
-                qualifier: Some("emp".to_owned()),
-            })],
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("emp"),
+            ))],
         });
         let typed = analyze(ast, &bt).expect("analyze emp.*");
         assert_eq!(typed.resolved_schema, emp_schema());
@@ -6213,9 +7538,9 @@ mod tests {
                 JoinType::LeftSemi,
                 None,
             )),
-            projections: vec![Expression::Star(StarExpression {
-                qualifier: Some("e".to_owned()),
-            })],
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("e"),
+            ))],
         });
         let typed = analyze(ast, &bt).expect("analyze e.* over semi join");
         assert_eq!(typed.resolved_schema, emp_schema());
@@ -6226,20 +7551,48 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression {
-                qualifier: Some("bogus".to_owned()),
-            })],
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("bogus"),
+            ))],
         });
         let err = analyze(ast, &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_STAR_EXPAND",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn qualified_star_over_scalar_uses_spark_legacy_error() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null("s", DataType::Long)]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("s"),
+            ))],
+        });
+        let err = analyze(ast, &base_types).unwrap_err();
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class: "_LEGACY_ERROR_TEMP_1050",
+                ..
+            }
+        ));
     }
 
     fn qstar_project(input: CommonAst, q: &str) -> CommonAst {
         CommonAst::new(CommonOp::Project {
             input: Box::new(input),
-            projections: vec![Expression::Star(StarExpression {
-                qualifier: Some(q.to_owned()),
-            })],
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single(q),
+            ))],
         })
     }
 
@@ -6313,7 +7666,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_star_over_using_join_still_rejects() {
+    fn qualified_star_over_using_join_is_an_honest_boundary() {
         let bt = base_types_with_emp_dept();
         let using_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -6323,15 +7676,158 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
-        let err = analyze(qstar_project(using_join, "e"), &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+        let visible = analyze(qstar_project(using_join.clone(), "e"), &bt)
+            .expect("selected-side star uses the public key");
+        assert_eq!(
+            visible.resolved_schema.field_names(),
+            vec!["dept_id", "id", "name", "salary"]
+        );
+        let err = analyze(qstar_project(using_join, "d"), &bt).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+        assert!(matches!(err, AnalyzerError::UnsupportedRule { .. }));
     }
 
     #[test]
-    fn qualified_star_ambiguous_duplicate_alias_rejects() {
+    fn qualified_star_over_projected_using_join_keeps_the_boundary() {
+        let using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Left,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+        });
+        let projected = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join),
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
+        });
+        let err = analyze(qstar_project(projected, "d"), &base_types_with_emp_dept()).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+    }
+
+    #[test]
+    fn hidden_using_boundary_survives_dropped_or_aliased_public_key() {
+        let using_join = || {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
+                join_type: JoinType::Left,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            })
+        };
+        let projected = [
+            vec![qcol("e", "name"), qcol("d", "dept_name")],
+            vec![
+                alias_expr(unresolved_col("dept_id"), "joined_id"),
+                qcol("e", "name"),
+                qcol("d", "dept_name"),
+            ],
+        ];
+
+        for projections in projected {
+            let input = CommonAst::new(CommonOp::Project {
+                input: Box::new(using_join()),
+                projections,
+            });
+            let star_err = analyze(
+                qstar_project(input.clone(), "d"),
+                &base_types_with_emp_dept(),
+            )
+            .unwrap_err();
+            assert_eq!(star_err.category(), ErrorCategory::ThunderduckBoundary);
+
+            let column = CommonAst::new(CommonOp::Project {
+                input: Box::new(input),
+                projections: vec![qcol("d", "dept_id")],
+            });
+            assert_eq!(
+                analyze(column, &base_types_with_emp_dept())
+                    .unwrap_err()
+                    .category(),
+                ErrorCategory::ThunderduckBoundary
+            );
+        }
+    }
+
+    fn identical_alias_using_join(join_type: JoinType) -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "same")),
+            right: Box::new(aliased_scan("dept", "same")),
+            join_type,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+        })
+    }
+
+    #[test]
+    fn identical_alias_using_join_qualified_star_is_a_boundary() {
+        let base_types = base_types_with_emp_dept();
+        let joined = identical_alias_using_join(JoinType::Left);
+        let typed = analyze(joined.clone(), &base_types).expect("USING join analyzes");
+        let key = typed
+            .resolved_schema
+            .field_by_name("dept_id")
+            .expect("USING key");
+        assert_eq!(key.source_quals.len(), 1);
+        assert_eq!(typed.scope.hidden_using_donors.len(), 1);
+        assert_eq!(
+            typed.scope.hidden_using_donors[0].qualifier,
+            Some(Qualifier::single("same"))
+        );
+
+        let err = analyze(qstar_project(joined, "same"), &base_types).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+    }
+
+    #[test]
+    fn identical_alias_using_join_projected_star_keeps_the_boundary() {
+        let projected = CommonAst::new(CommonOp::Project {
+            input: Box::new(identical_alias_using_join(JoinType::Left)),
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
+        });
+        let typed = analyze(projected.clone(), &base_types_with_emp_dept())
+            .expect("unqualified star projects the public output");
+        assert_eq!(typed.scope.hidden_using_donors.len(), 1);
+
+        let err = analyze(
+            qstar_project(projected, "same"),
+            &base_types_with_emp_dept(),
+        )
+        .unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+    }
+
+    #[test]
+    fn public_using_key_precedes_hidden_keys_with_the_same_alias() {
+        for join_type in [JoinType::Inner, JoinType::Left, JoinType::Right] {
+            let project = CommonAst::new(CommonOp::Project {
+                input: Box::new(identical_alias_using_join(join_type)),
+                projections: vec![qcol("same", "dept_id")],
+            });
+            analyze(project, &base_types_with_emp_dept()).unwrap_or_else(|error| {
+                panic!("{join_type:?} public key should resolve before metadata: {error:?}")
+            });
+        }
+
+        let full = CommonAst::new(CommonOp::Project {
+            input: Box::new(identical_alias_using_join(JoinType::Full)),
+            projections: vec![qcol("same", "dept_id")],
+        });
+        assert!(matches!(
+            analyze(full, &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_star_duplicate_alias_gathers_all_matching_fields() {
         let bt = base_types_with_emp_dept();
         let dup_join = join(
             aliased_scan("emp", "x"),
@@ -6339,8 +7835,48 @@ mod tests {
             JoinType::Cross,
             None,
         );
-        let err = analyze(qstar_project(dup_join, "x"), &bt).unwrap_err();
-        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+        let typed = analyze(qstar_project(dup_join, "x"), &bt).expect("x.* gathers both aliases");
+        assert_eq!(
+            typed
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "dept_id", "salary", "dept_id", "dept_name"]
+        );
+    }
+
+    #[test]
+    fn mixed_sparse_and_regular_alias_gathers_all_matching_fields() {
+        let sparse = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(aliased_scan("emp", "x")),
+            cols: vec!["id".to_owned()],
+            values: vec![int_lit(0)],
+        });
+        let joined = join(sparse, aliased_scan("dept", "x"), JoinType::Cross, None);
+        let typed = analyze(
+            qstar_project(joined.clone(), "x"),
+            &base_types_with_emp_dept(),
+        )
+        .expect("x.* gathers sparse and regular aliases");
+        assert_eq!(
+            typed
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["name", "dept_id", "salary", "dept_id", "dept_name"]
+        );
+
+        let column = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![qcol("x", "name")],
+        });
+        let typed = analyze(column, &base_types_with_emp_dept())
+            .expect("x.name gathers the one matching field");
+        assert_eq!(typed.resolved_schema.fields[0].name, "name");
     }
 
     #[test]
@@ -6391,17 +7927,19 @@ mod tests {
             op: BinaryOp::Eq,
             right: Box::new(pcol("id", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            aliased("emp", "x").with_plan_id(1),
+            aliased("emp", "x").with_plan_id(2),
             JoinType::Inner,
             Some(join_cond),
-            vec![1],
-            vec![2],
         );
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(joined),
-            projections: vec![plan_id_col("id", 2)],
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["x".to_owned(), "id".to_owned()],
+                plan_id: Some(2),
+                is_metadata_column: false,
+            })],
         });
         let typed = analyze(project, &bt).expect("plan_id should disambiguate above join");
         match &typed.op {
@@ -6416,7 +7954,7 @@ mod tests {
         }
     }
 
-    fn quals_of(schema: &ResolvedSchema) -> Vec<BTreeSet<String>> {
+    fn quals_of(schema: &ResolvedSchema) -> Vec<BTreeSet<Qualifier>> {
         schema
             .fields
             .iter()
@@ -6432,7 +7970,7 @@ mod tests {
             alias: "e".to_owned(),
         });
         let typed = analyze(ast, &bt).unwrap();
-        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        let e: BTreeSet<Qualifier> = [Qualifier::single("e")].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![e; 4]);
     }
 
@@ -6448,7 +7986,7 @@ mod tests {
             projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
         });
         let typed = analyze(project, &bt).unwrap();
-        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        let e: BTreeSet<Qualifier> = [Qualifier::single("e")].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![e.clone(), e]);
     }
 
@@ -6471,8 +8009,8 @@ mod tests {
     fn source_quals_plain_join_composes_left_and_right() {
         let bt = base_types_with_emp_dept();
         let typed = analyze(emp_dept_aliased_join(), &bt).unwrap();
-        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
+        let e: BTreeSet<Qualifier> = [Qualifier::single("e")].into_iter().collect();
+        let d: BTreeSet<Qualifier> = [Qualifier::single("d")].into_iter().collect();
         let mut expected = vec![e; 4];
         expected.extend(vec![d; 2]);
         assert_eq!(quals_of(&typed.resolved_schema), expected);
@@ -6489,17 +8027,47 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let typed = analyze(ast, &bt).unwrap();
-        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
-        let key: BTreeSet<String> = e.union(&d).cloned().collect();
+        let e: BTreeSet<Qualifier> = [Qualifier::single("e")].into_iter().collect();
+        let d: BTreeSet<Qualifier> = [Qualifier::single("d")].into_iter().collect();
+        let key: BTreeSet<Qualifier> = e.union(&d).cloned().collect();
         assert_eq!(
             quals_of(&typed.resolved_schema),
             vec![key, e.clone(), e.clone(), e, d]
         );
+    }
+
+    #[test]
+    fn hidden_using_donors_follow_spark_join_kinds() {
+        let expected = [
+            (JoinType::Inner, vec!["d"]),
+            (JoinType::Left, vec!["d"]),
+            (JoinType::Right, vec!["e"]),
+            (JoinType::Full, vec!["e", "d"]),
+            (JoinType::LeftSemi, vec![]),
+            (JoinType::LeftAnti, vec![]),
+        ];
+        for (join_type, expected_qualifiers) in expected {
+            let joined = CommonAst::new(CommonOp::Join {
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
+                join_type,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            });
+            let typed = analyze(joined, &base_types_with_emp_dept()).unwrap();
+            let qualifiers: Vec<_> = typed
+                .scope
+                .hidden_using_donors
+                .iter()
+                .filter_map(|donor| donor.qualifier.as_ref())
+                .map(|qualifier| qualifier.parts()[0].as_str())
+                .collect();
+            assert_eq!(qualifiers, expected_qualifiers, "{join_type:?}");
+        }
     }
 
     #[test]
@@ -6512,7 +8080,7 @@ mod tests {
             crate::transpiler_v2::ast::GroupingKind::GroupBy,
         ));
         let typed = analyze(ast, &bt).unwrap();
-        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        let emp: BTreeSet<Qualifier> = [Qualifier::single("emp")].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![emp, BTreeSet::new()]);
     }
 
@@ -6528,7 +8096,7 @@ mod tests {
             ],
         );
         let typed = analyze(ast, &bt).unwrap();
-        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        let emp: BTreeSet<Qualifier> = [Qualifier::single("emp")].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![emp, BTreeSet::new()]);
     }
 
@@ -6537,10 +8105,10 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let star_project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let typed = analyze(star_project.clone(), &bt).unwrap();
-        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        let emp: BTreeSet<Qualifier> = [Qualifier::single("emp")].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![emp; 4]);
 
         let filter = CommonAst::new(CommonOp::Filter {
@@ -6566,7 +8134,7 @@ mod tests {
             renames: vec![("id".to_owned(), "y".to_owned())],
         });
         let typed = analyze(renamed, &bt).unwrap();
-        let t: BTreeSet<String> = ["t".to_owned()].into_iter().collect();
+        let t: BTreeSet<Qualifier> = [Qualifier::single("t")].into_iter().collect();
         let renamed_field = typed
             .resolved_schema
             .field_by_name("y")
@@ -6615,8 +8183,8 @@ mod tests {
         let err = analyze(filter_renamed, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "y");
-                assert_eq!(qualifier.as_deref(), Some("t"));
+                assert_eq!(name, "t.y");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -6677,8 +8245,8 @@ mod tests {
         let err = analyze(filter_renamed, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "c0");
-                assert_eq!(qualifier.as_deref(), Some("t"));
+                assert_eq!(name, "t.c0");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -6745,8 +8313,8 @@ mod tests {
         let err = analyze(filter_b, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "id");
-                assert_eq!(qualifier.as_deref(), Some("b"));
+                assert_eq!(name, "b.id");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -6767,8 +8335,8 @@ mod tests {
         let err = analyze(ast, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "x");
-                assert_eq!(qualifier.as_deref(), Some("v"));
+                assert_eq!(name, "v.x");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -6797,8 +8365,8 @@ mod tests {
         let err = analyze(ast, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "x");
-                assert_eq!(qualifier.as_deref(), Some("v"));
+                assert_eq!(name, "v.x");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -6816,8 +8384,6 @@ mod tests {
                 using_columns: vec!["dept_id".to_owned()],
                 natural: false,
                 lateral: false,
-                left_plan_ids: vec![],
-                right_plan_ids: vec![],
             });
             let filter = CommonAst::new(CommonOp::Filter {
                 input: Box::new(join),
@@ -6899,8 +8465,8 @@ mod tests {
         let err = analyze(filter, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "k");
-                assert_eq!(qualifier.as_deref(), Some("e"));
+                assert_eq!(name, "e.k");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -7024,8 +8590,8 @@ mod tests {
         let err = analyze(filter, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "active");
-                assert_eq!(qualifier.as_deref(), Some("e"));
+                assert_eq!(name, "e.active");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -7103,8 +8669,8 @@ mod tests {
         let err = analyze(filter, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "metric");
-                assert_eq!(qualifier.as_deref(), Some("e"));
+                assert_eq!(name, "e.metric");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -7182,8 +8748,8 @@ mod tests {
         let err = analyze(filter, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "Alice");
-                assert_eq!(qualifier.as_deref(), Some("e"));
+                assert_eq!(name, "e.Alice");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -7233,7 +8799,10 @@ mod tests {
                             ..
                         } => match b.right.as_ref() {
                             Expression::ColumnReference(c) => {
-                                assert_eq!(c.qualifier.as_deref(), Some("e"));
+                                assert_eq!(
+                                    c.qualifier.as_ref().map(Qualifier::display_name),
+                                    Some("e".to_owned())
+                                );
                                 assert_eq!(c.name, "salary");
                                 assert_eq!(c.data_type, DataType::Double);
                             }
@@ -7352,8 +8921,6 @@ mod tests {
                 using_columns: vec!["dept_id".to_owned()],
                 natural: false,
                 lateral: false,
-                left_plan_ids: vec![],
-                right_plan_ids: vec![],
             })),
             projections: vec![qcol("e", "name")],
         });
@@ -7368,6 +8935,136 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn hidden_using_key_uses_an_honest_boundary() {
+        let joined = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Left,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![qcol("d", "dept_id")],
+        });
+        let err = analyze(ast, &base_types_with_emp_dept()).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+    }
+
+    #[test]
+    fn plan_id_over_using_join_follows_public_expr_id_survival() {
+        let using_join = |left_plan_id: i64, right_plan_id: i64| {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(scan("emp").with_plan_id(left_plan_id)),
+                right: Box::new(scan("dept").with_plan_id(right_plan_id)),
+                join_type: JoinType::Left,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            })
+        };
+
+        let dominant = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join(10, 20)),
+            projections: vec![plan_id_col("dept_id", 10)],
+        });
+        analyze(dominant, &base_types_with_emp_dept())
+            .expect("the public left donor survives a LEFT USING join");
+
+        let hidden = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join(10, 20)),
+            projections: vec![plan_id_col("dept_id", 20)],
+        });
+        assert!(matches!(
+            analyze(hidden, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+
+        for (plan_id, name) in [(10, "name"), (20, "dept_name")] {
+            let project = CommonAst::new(CommonOp::Project {
+                input: Box::new(using_join(10, 20)),
+                projections: vec![plan_id_col(name, plan_id)],
+            });
+            analyze(project, &base_types_with_emp_dept())
+                .unwrap_or_else(|error| panic!("public {name} should resolve: {error:?}"));
+        }
+
+        let structured_base_types = base_types_for(&[
+            (
+                "left_src",
+                StructType::new(vec![
+                    StructField::not_null("id", DataType::Long),
+                    StructField::not_null(
+                        "s",
+                        DataType::Struct(StructType::new(vec![StructField::not_null(
+                            "id",
+                            DataType::Long,
+                        )])),
+                    ),
+                ]),
+            ),
+            (
+                "right_src",
+                StructType::new(vec![StructField::not_null("id", DataType::Long)]),
+            ),
+        ]);
+        let structured_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("left_src").with_plan_id(30)),
+            right: Box::new(scan("right_src").with_plan_id(40)),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["id".to_owned()],
+            natural: false,
+            lateral: false,
+        });
+        let structured = CommonAst::new(CommonOp::Project {
+            input: Box::new(structured_join),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["s".to_owned(), "id".to_owned()],
+                plan_id: Some(30),
+                is_metadata_column: false,
+            })],
+        });
+        analyze(structured, &structured_base_types)
+            .expect("a nested field named like the USING key must remain public");
+
+        let ambiguous = CommonAst::new(CommonOp::Project {
+            input: Box::new(using_join(10, 10)),
+            projections: vec![plan_id_col("dept_id", 10)],
+        });
+        assert!(matches!(
+            analyze(ambiguous, &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+
+        let union = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            allow_missing_columns: false,
+            children: vec![scan("emp").with_plan_id(10), scan("emp")],
+        });
+        let below_union = CommonAst::new(CommonOp::Project {
+            input: Box::new(union),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned()],
+                plan_id: Some(10),
+                is_metadata_column: true,
+            })],
+        });
+        assert!(matches!(
+            analyze(below_union, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -7403,8 +9100,6 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(using_join),
@@ -7455,6 +9150,28 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_id_lookup_does_not_inherit_outer_subquery_roots() {
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![plan_id_col("dept_id", 10)],
+        });
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+
+        assert!(matches!(
+            analyze(outer, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -7740,7 +9457,7 @@ mod tests {
                     negated: false,
                 }),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let typed = analyze(ast, &bt).expect("sq-010 must resolve");
         let sql = super::super::emission::dispatch_op(&typed.op, &typed.resolved_schema).unwrap();
@@ -7852,7 +9569,10 @@ mod tests {
         match inner_cond {
             Expression::Binary(b) => match &*b.right {
                 Expression::ColumnReference(c) => {
-                    assert_eq!(c.qualifier.as_deref(), Some("e"));
+                    assert_eq!(
+                        c.qualifier.as_ref().map(Qualifier::display_name),
+                        Some("e".to_owned())
+                    );
                     assert_eq!(c.name, "dept_id");
                     assert_eq!(
                         c.data_type,
@@ -7999,8 +9719,6 @@ mod tests {
             using_columns: vec![],
             natural: true,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         })
     }
 
@@ -8032,8 +9750,6 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let natural_typed = analyze(natural_ast, &bt).expect("natural analyze");
         let using_typed = analyze(using_ast, &bt).expect("using analyze");
@@ -8078,6 +9794,21 @@ mod tests {
         for f in &typed.resolved_schema.fields {
             assert!(f.nullable, "field {} must be nullable under FULL", f.name);
         }
+    }
+
+    #[test]
+    fn natural_full_join_mints_coalesced_key_id() {
+        let typed = analyze(
+            natural_join(scan("emp"), scan("dept"), JoinType::Full),
+            &base_types_with_emp_dept(),
+        )
+        .expect("natural full analyze");
+        let TypedOp::Join { left, right, .. } = &typed.op else {
+            panic!("expected Join, got {:?}", typed.op);
+        };
+        let output_id = typed.resolved_schema.fields[0].expr_id;
+        assert_ne!(output_id, left.resolved_schema.fields[2].expr_id);
+        assert_ne!(output_id, right.resolved_schema.fields[0].expr_id);
     }
 
     #[test]
@@ -8250,21 +9981,18 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression {
-                qualifier: Some("nonexistent".to_owned()),
-            })],
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::single("nonexistent"),
+            ))],
         });
         let err = analyze(ast, &bt).unwrap_err();
-        match err {
-            AnalyzerError::UnknownColumn {
-                ref name,
-                ref qualifier,
-            } => {
-                assert_eq!(name, "nonexistent.*");
-                assert_eq!(qualifier.as_deref(), Some("nonexistent"));
+        assert!(matches!(
+            err,
+            AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_STAR_EXPAND",
+                ..
             }
-            other => panic!("expected UnknownColumn, got {other:?}"),
-        }
+        ));
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
     }
 
@@ -8650,8 +10378,16 @@ mod tests {
         let ast = union_by_name_allow_missing(vec![left, right]);
         let typed = analyze(ast, &bt).unwrap();
         let widened = widened_of(&typed);
+        let TypedOp::SetOp { children, .. } = &typed.op else {
+            panic!("expected SetOp");
+        };
         assert_eq!(widened.fields[0].name, "x");
         assert_eq!(widened.fields[0].data_type, DataType::Double);
+        assert_ne!(
+            widened.fields[0].expr_id, children[0].resolved_schema.fields[0].expr_id,
+            "first-child widening is a fresh Cast Alias"
+        );
+        assert!(widened.fields[0].source_quals.is_empty());
         assert_eq!(widened.fields[1].name, "y");
         assert_eq!(widened.fields[1].data_type, DataType::Integer);
         assert!(
@@ -8706,7 +10442,7 @@ mod tests {
         let widened = widened_of(&typed);
         assert_eq!(widened.field_names(), vec!["x", "y", "z"]);
         let quals = quals_of(widened);
-        let a: BTreeSet<String> = ["a".to_owned()].into_iter().collect();
+        let a: BTreeSet<Qualifier> = [Qualifier::single("a")].into_iter().collect();
         assert_eq!(
             quals[0], a,
             "x is present in the FIRST child; its donor qualifier (`a`) stays addressable"
@@ -8841,7 +10577,7 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema, emp_schema());
@@ -9360,7 +11096,7 @@ mod tests {
             vec![],
             vec![func(
                 "count",
-                vec![Expression::Star(StarExpression { qualifier: None })],
+                vec![Expression::Star(StarExpression::Unqualified)],
             )],
             Some(int_lit(5)),
         );
@@ -9525,7 +11261,7 @@ mod tests {
             pivot_values: vec![int_lit(10), int_lit(20)],
             aggregates: vec![func(
                 "count",
-                vec![Expression::Star(StarExpression { qualifier: None })],
+                vec![Expression::Star(StarExpression::Unqualified)],
             )],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -9718,7 +11454,11 @@ mod tests {
         let bt = base_types_with_nested_struct();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![qcol("address", "geo.lat")],
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["address".to_owned(), "geo".to_owned(), "lat".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
         });
         let typed = analyze(ast, &bt).expect("multi-level dot path must resolve");
         let proj = match &typed.op {
@@ -9848,6 +11588,192 @@ mod tests {
     }
 
     #[test]
+    fn nested_struct_field_duplicates_are_ambiguous() {
+        let bt = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null(
+                "payload",
+                DataType::Struct(StructType::new(vec![
+                    StructField::not_null("value", DataType::Long),
+                    StructField::nullable("VALUE", DataType::String),
+                ])),
+            )]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![qcol("payload", "value")],
+        });
+        assert!(matches!(
+            analyze(ast, &bt),
+            Err(AnalyzerError::SparkEmulated {
+                class: "AMBIGUOUS_REFERENCE_TO_FIELDS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn array_struct_field_keeps_top_level_non_nullability() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null(
+                "items",
+                DataType::Array(
+                    Box::new(DataType::Struct(StructType::new(vec![
+                        StructField::nullable("value", DataType::Long),
+                    ]))),
+                    true,
+                ),
+            )]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![qcol("items", "value")],
+        });
+
+        let typed = analyze(ast, &base_types).unwrap();
+        assert!(!typed.resolved_schema.fields[0].nullable);
+        assert_eq!(
+            typed.resolved_schema.fields[0].data_type,
+            DataType::Array(Box::new(DataType::Long), true)
+        );
+    }
+
+    #[test]
+    fn map_lookup_and_struct_star_are_nullable_for_missing_keys() {
+        let base_types = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null(
+                "m",
+                DataType::Map {
+                    key: Box::new(DataType::String),
+                    value: Box::new(DataType::Struct(StructType::new(vec![
+                        StructField::not_null("value", DataType::Long),
+                    ]))),
+                    value_nullable: false,
+                },
+            )]),
+        )]);
+        let lookup = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![qcol("m", "missing")],
+        });
+        assert!(analyze(lookup, &base_types).unwrap().resolved_schema.fields[0].nullable);
+
+        let star = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(vec!["m".to_owned(), "missing".to_owned()]),
+            ))],
+        });
+        let typed = analyze(star, &base_types).unwrap();
+        assert_eq!(typed.resolved_schema.fields[0].name, "value");
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn nested_struct_star_path_expands_final_struct() {
+        let bt = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null(
+                "payload",
+                DataType::Struct(StructType::new(vec![StructField::not_null(
+                    "nested",
+                    DataType::Struct(StructType::new(vec![
+                        StructField::not_null("left", DataType::Long),
+                        StructField::nullable("right", DataType::String),
+                    ])),
+                )])),
+            )]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![Expression::Star(StarExpression::Qualified(
+                Qualifier::from_parts(vec!["payload".to_owned(), "nested".to_owned()]),
+            ))],
+        });
+        let typed = analyze(ast, &bt).expect("nested struct star should expand");
+        assert_eq!(
+            typed
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["left", "right"]
+        );
+    }
+
+    #[test]
+    fn map_struct_and_array_struct_nested_paths_resolve() {
+        let bt = base_types_for(&[(
+            "src",
+            StructType::new(vec![
+                StructField::not_null(
+                    "mapped",
+                    DataType::Map {
+                        key: Box::new(DataType::String),
+                        value: Box::new(DataType::Struct(StructType::new(vec![
+                            StructField::not_null("value", DataType::Long),
+                        ]))),
+                        value_nullable: true,
+                    },
+                ),
+                StructField::not_null(
+                    "items",
+                    DataType::Array(
+                        Box::new(DataType::Struct(StructType::new(vec![
+                            StructField::nullable("value", DataType::Long),
+                        ]))),
+                        true,
+                    ),
+                ),
+            ]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name_parts: vec!["mapped".to_owned(), "key".to_owned(), "value".to_owned()],
+                    plan_id: None,
+                    is_metadata_column: false,
+                }),
+                qcol("items", "value"),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("map and array struct paths should resolve");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+        assert!(typed.resolved_schema.fields[0].nullable);
+        assert_eq!(
+            typed.resolved_schema.fields[1].data_type,
+            DataType::Array(Box::new(DataType::Long), true)
+        );
+        assert!(!typed.resolved_schema.fields[1].nullable);
+    }
+
+    #[test]
+    fn plain_array_dotted_extraction_is_not_base_type_error() {
+        let bt = base_types_for(&[(
+            "src",
+            StructType::new(vec![StructField::not_null(
+                "items",
+                DataType::Array(Box::new(DataType::Long), false),
+            )]),
+        )]);
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("src")),
+            projections: vec![qcol("items", "value")],
+        });
+        assert!(matches!(
+            analyze(ast, &bt),
+            Err(AnalyzerError::SparkEmulated {
+                class: "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn semantic_eq_rejects_same_named_struct_field_different_root_ids() {
         let id_a = ExprId::fresh();
         let id_b = ExprId::fresh();
@@ -9880,16 +11806,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_unknown_nested_field_falls_through_to_unknown_column() {
+    fn resolve_unknown_nested_field_reports_field_not_found() {
         let bt = base_types_with_nested_struct();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![qcol("address", "geo.nope")],
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["address".to_owned(), "geo".to_owned(), "nope".to_owned()],
+                plan_id: None,
+                is_metadata_column: false,
+            })],
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::UnknownColumn { .. }) => {}
-            other => panic!("expected UnknownColumn error, got {other:?}"),
-        }
+        assert!(matches!(
+            analyze(ast, &bt),
+            Err(AnalyzerError::SparkEmulated {
+                class: "FIELD_NOT_FOUND",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -10272,24 +12205,27 @@ mod tests {
     }
 
     #[test]
-    fn expand_regex_projections_matches_2_of_3_fields_in_schema_order() {
+    fn expand_regex_projections_matches_whole_names_case_insensitively() {
         let schema = regex_test_schema();
         let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
-            pattern: ".*_id".to_owned(),
-            plan_id: Some(9),
+            pattern: ".*_ID".to_owned(),
+            qualifier: None,
         })];
         let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
         assert_eq!(expanded.len(), 2);
         match &expanded[0] {
-            Expression::UnresolvedColumn(u) => {
-                assert_eq!(u.name, "customer_id");
-                assert_eq!(u.plan_id, Some(9));
+            Expression::ColumnReference(column) => {
+                assert_eq!(column.name, "customer_id");
+                assert_eq!(column.expr_id, Some(schema.fields[0].expr_id));
             }
-            _ => panic!("expected UnresolvedColumn"),
+            _ => panic!("expected ColumnReference"),
         }
         match &expanded[1] {
-            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "order_id"),
-            _ => panic!("expected UnresolvedColumn"),
+            Expression::ColumnReference(column) => {
+                assert_eq!(column.name, "order_id");
+                assert_eq!(column.expr_id, Some(schema.fields[2].expr_id));
+            }
+            _ => panic!("expected ColumnReference"),
         }
     }
 
@@ -10298,7 +12234,7 @@ mod tests {
         let schema = regex_test_schema();
         let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: "[unclosed".to_owned(),
-            plan_id: None,
+            qualifier: None,
         })];
         let err = expand_regex_projections(projections, &schema).unwrap_err();
         assert!(matches!(err, AnalyzerError::Other { .. }));
@@ -10306,20 +12242,178 @@ mod tests {
     }
 
     #[test]
-    fn expand_regex_projections_zero_match_returns_unknown_column() {
+    fn expand_regex_projections_accepts_java_lookahead() {
         let schema = regex_test_schema();
         let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
-            pattern: "no_such_.*_col".to_owned(),
-            plan_id: None,
+            pattern: "(?!name).*".to_owned(),
+            qualifier: None,
         })];
-        let err = expand_regex_projections(projections, &schema).unwrap_err();
-        match err {
-            AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "no_such_.*_col");
-                assert!(qualifier.is_none());
+
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+        let names: Vec<_> = expanded
+            .iter()
+            .map(|expression| match expression {
+                Expression::ColumnReference(column) => column.name.as_str(),
+                _ => panic!("expected ColumnReference"),
+            })
+            .collect();
+        assert_eq!(names, ["customer_id", "order_id"]);
+    }
+
+    #[test]
+    fn expand_regex_projections_zero_match_is_an_empty_projection() {
+        let schema = regex_test_schema();
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: "id".to_owned(),
+            qualifier: None,
+        })];
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn expand_regex_projections_filters_by_current_qualifier_final_part() {
+        let schema = ResolvedSchema::new(vec![
+            Attribute::minted("left_id", DataType::Long, false)
+                .with_quals(
+                    [Qualifier::single("right")]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )
+                .with_qualifier(Qualifier::single("left")),
+            Attribute::minted("right_id", DataType::Long, false)
+                .with_quals(
+                    [Qualifier::single("left")]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )
+                .with_qualifier(Qualifier::from_parts(vec![
+                    "catalog".to_owned(),
+                    "right".to_owned(),
+                ])),
+        ]);
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*_id".to_owned(),
+            qualifier: Some(Qualifier::single("RIGHT")),
+        })];
+
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+
+        assert_eq!(expanded.len(), 1);
+        let Expression::ColumnReference(column) = &expanded[0] else {
+            panic!("expected ColumnReference");
+        };
+        assert_eq!(column.expr_id, Some(schema.fields[1].expr_id));
+
+        let dotted_capture = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*_id".to_owned(),
+            qualifier: Some(Qualifier::single("catalog.right")),
+        })];
+        assert!(
+            expand_regex_projections(dotted_capture, &schema)
+                .expect("expand dotted capture")
+                .is_empty(),
+            "raw dotted capture is one part"
+        );
+    }
+
+    fn using_regex_plan(join_type: JoinType, qualifier: Option<&str>) -> CommonAst {
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+        });
+        CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern: "dept_id".to_owned(),
+                qualifier: qualifier.map(Qualifier::single),
+            })],
+        })
+    }
+
+    fn assert_using_regex_qualifier(join_type: JoinType, expected: Option<&str>) {
+        let bt = base_types_with_emp_dept();
+        for qualifier in [None, Some("e"), Some("d")] {
+            let typed =
+                analyze(using_regex_plan(join_type, qualifier), &bt).expect("analyze regex");
+            let expected_len = usize::from(qualifier.is_none() || qualifier == expected);
+            assert_eq!(
+                typed.resolved_schema.len(),
+                expected_len,
+                "{join_type:?} regex qualifier {qualifier:?}"
+            );
+            if let Some(field) = typed.resolved_schema.fields.first() {
+                assert_eq!(
+                    field
+                        .qualifier
+                        .as_ref()
+                        .map(Qualifier::display_name)
+                        .as_deref(),
+                    expected
+                );
             }
-            other => panic!("expected UnknownColumn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inner_using_regex_uses_left_output_qualifier() {
+        assert_using_regex_qualifier(JoinType::Inner, Some("e"));
+    }
+
+    #[test]
+    fn left_using_regex_uses_left_output_qualifier() {
+        assert_using_regex_qualifier(JoinType::Left, Some("e"));
+    }
+
+    #[test]
+    fn semi_and_anti_using_regex_use_left_output_qualifier() {
+        assert_using_regex_qualifier(JoinType::LeftSemi, Some("e"));
+        assert_using_regex_qualifier(JoinType::LeftAnti, Some("e"));
+    }
+
+    #[test]
+    fn right_using_regex_uses_right_output_qualifier() {
+        assert_using_regex_qualifier(JoinType::Right, Some("d"));
+    }
+
+    #[test]
+    fn full_using_regex_has_no_output_qualifier() {
+        assert_using_regex_qualifier(JoinType::Full, None);
+    }
+
+    #[test]
+    fn expand_regex_projections_preserves_duplicate_attribute_identities() {
+        let schema = ResolvedSchema::new(vec![
+            Attribute::minted("dup", DataType::Long, false),
+            Attribute::minted("dup", DataType::Long, true),
+        ]);
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: "dup".to_owned(),
+            qualifier: None,
+        })];
+
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+
+        assert_eq!(expanded.len(), 2);
+        let ids: Vec<_> = expanded
+            .iter()
+            .map(|expression| match expression {
+                Expression::ColumnReference(column) => column.expr_id,
+                _ => panic!("expected ColumnReference"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                Some(schema.fields[0].expr_id),
+                Some(schema.fields[1].expr_id)
+            ]
+        );
     }
 
     #[test]
@@ -10331,7 +12425,7 @@ mod tests {
             non_regex_before.clone(),
             Expression::UnresolvedRegex(UnresolvedRegexExpression {
                 pattern: ".*_id".to_owned(),
-                plan_id: None,
+                qualifier: None,
             }),
             non_regex_after.clone(),
         ];
@@ -10339,12 +12433,12 @@ mod tests {
         assert_eq!(expanded.len(), 4);
         assert_eq!(expanded[0], non_regex_before);
         match &expanded[1] {
-            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "customer_id"),
-            _ => panic!("expected UnresolvedColumn at [1]"),
+            Expression::ColumnReference(column) => assert_eq!(column.name, "customer_id"),
+            _ => panic!("expected ColumnReference at [1]"),
         }
         match &expanded[2] {
-            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "order_id"),
-            _ => panic!("expected UnresolvedColumn at [2]"),
+            Expression::ColumnReference(column) => assert_eq!(column.name, "order_id"),
+            _ => panic!("expected ColumnReference at [2]"),
         }
         assert_eq!(expanded[3], non_regex_after);
     }
@@ -10353,7 +12447,7 @@ mod tests {
     fn expression_is_fully_resolved_returns_false_for_unresolved_regex() {
         let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: ".*".to_owned(),
-            plan_id: None,
+            qualifier: None,
         });
         assert!(!expression_is_fully_resolved(&expr));
     }
@@ -10618,7 +12712,7 @@ mod tests {
 
     #[test]
     fn pretty_name_star_unqualified() {
-        let expr = Expression::Star(StarExpression { qualifier: None });
+        let expr = Expression::Star(StarExpression::Unqualified);
         assert_eq!(pretty_name(&expr), "*");
     }
 
@@ -10838,7 +12932,7 @@ mod tests {
     fn aliased(table: &str, alias: &str) -> CommonAst {
         CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: table.to_owned(),
+                table: Qualifier::single(table),
             })),
             alias: alias.to_owned(),
         })
@@ -10875,11 +12969,86 @@ mod tests {
         let err = analyze(ast, &bt).unwrap_err();
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "id");
-                assert_eq!(qualifier.as_deref(), Some("d"));
+                assert_eq!(name, "d.id");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn metadata_flag_only_changes_plan_tagged_resolution() {
+        let untagged = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned()],
+                plan_id: None,
+                is_metadata_column: true,
+            })],
+        });
+        analyze(untagged, &base_types_with_emp_dept())
+            .expect("an untagged metadata flag follows ordinary resolution");
+
+        let tagged = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned()],
+                plan_id: Some(10),
+                is_metadata_column: true,
+            })],
+        });
+        let err = analyze(tagged, &base_types_with_emp_dept()).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
+
+        let unknown = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned()],
+                plan_id: Some(99),
+                is_metadata_column: true,
+            })],
+        });
+        assert!(matches!(
+            analyze(unknown, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+
+        let multipart = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned(), "nested".to_owned()],
+                plan_id: Some(10),
+                is_metadata_column: true,
+            })],
+        });
+        assert!(matches!(
+            analyze(multipart, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+
+        let joined = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        let ambiguous = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["id".to_owned()],
+                plan_id: Some(10),
+                is_metadata_column: true,
+            })],
+        });
+        assert_eq!(
+            analyze(ambiguous, &base_types_with_emp_dept())
+                .expect_err("metadata outputs are not represented")
+                .category(),
+            ErrorCategory::ThunderduckBoundary
+        );
     }
 
     #[test]
@@ -10900,32 +13069,36 @@ mod tests {
                 ref name,
                 ref qualifier,
             } => {
-                assert_eq!(name, "id");
-                assert_eq!(qualifier.as_deref(), Some("emp"));
+                assert_eq!(name, "emp.id");
+                assert_eq!(qualifier, &None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
     }
 
     #[test]
-    fn qualifier_binds_both_sides_of_join_is_ambiguous() {
+    fn duplicate_qualifier_filters_candidates_by_name() {
         let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(join(
-                aliased("emp", "x"),
-                aliased("dept", "x"),
-                JoinType::Inner,
-                None,
-            )),
+        let joined = join(
+            aliased("emp", "x"),
+            aliased("dept", "x"),
+            JoinType::Inner,
+            None,
+        );
+        let unique = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined.clone()),
             projections: vec![qcol("x", "id")],
         });
-        let err = analyze(ast, &bt).unwrap_err();
+        analyze(unique, &bt).expect("x.id has one matching attribute");
+
+        let ambiguous = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![qcol("x", "dept_id")],
+        });
+        let err = analyze(ambiguous, &bt).unwrap_err();
         match err {
-            AnalyzerError::AmbiguousColumn {
-                ref name,
-                ref candidates,
-            } => {
-                assert_eq!(name, "id");
+            AnalyzerError::AmbiguousColumn { name, candidates } => {
+                assert_eq!(name, "x.dept_id");
                 assert_eq!(candidates.len(), 2);
             }
             other => panic!("expected AmbiguousColumn, got {other:?}"),
@@ -10982,7 +13155,7 @@ mod tests {
     }
 
     #[test]
-    fn using_join_qualifier_resolution_stays_on_legacy_path_no_panic() {
+    fn hidden_using_key_is_an_honest_boundary() {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Join {
@@ -10993,18 +13166,16 @@ mod tests {
                 using_columns: vec!["dept_id".to_owned()],
                 natural: false,
                 lateral: false,
-                left_plan_ids: vec![],
-                right_plan_ids: vec![],
             })),
             projections: vec![qcol("d", "dept_id")],
         });
-        let typed = analyze(ast, &bt).expect("USING join qualifier resolution must not panic");
-        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        let err = analyze(ast, &bt).unwrap_err();
+        assert_eq!(err.category(), ErrorCategory::ThunderduckBoundary);
     }
 
     fn contains_unresolved_ref(expr: &Expression, name: &str) -> bool {
         match expr {
-            Expression::UnresolvedColumn(u) => eq_fold(&u.name, name),
+            Expression::UnresolvedColumn(u) => eq_fold(&u.resolution_name(), name),
             other => other.children().any(|c| contains_unresolved_ref(c, name)),
         }
     }
@@ -11090,9 +13261,29 @@ mod tests {
         let expanded = expand_lateral_column_aliases(vec![shadow, later], &schema)
             .expect("input-column collision must not error");
         match &expanded[1] {
-            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "dept_id"),
+            Expression::UnresolvedColumn(u) => {
+                assert_eq!(u.resolution_name(), "dept_id")
+            }
             other => panic!("expected untouched UnresolvedColumn(\"dept_id\"), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lateral_column_alias_does_not_capture_plan_tagged_reference() {
+        let base = scan("emp").with_plan_id(10);
+        let narrow = CommonAst::new(CommonOp::Project {
+            input: Box::new(base),
+            projections: vec![unresolved_col("name")],
+        });
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(narrow),
+            projections: vec![alias_expr(int_lit(1), "id"), plan_id_col("id", 10)],
+        });
+
+        assert!(matches!(
+            analyze(outer, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
     }
 
     #[test]
@@ -11264,13 +13455,47 @@ mod tests {
         });
         let err = analyze(plan, &base_types_for(&[("emp", emp_tags_schema())]))
             .expect_err("input qualifier must not bind generated columns");
-        assert!(matches!(
-            err,
-            AnalyzerError::UnknownColumn {
-                name,
-                qualifier: Some(qualifier)
-            } if name == "tag" && qualifier == "e"
-        ));
+        assert!(
+            matches!(
+                &err,
+                AnalyzerError::UnknownColumn {
+                    ref name,
+                    qualifier: None
+                } if name == "e.tag"
+            ),
+            "expected unresolved `e.tag`, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_generator_regex_selects_only_generated_slots() {
+        let schema = StructType::new(vec![
+            StructField::nullable("tag", DataType::String),
+            StructField::nullable("tags", DataType::Array(Box::new(DataType::String), true)),
+        ]);
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(generate_plan("explode", qcol("e", "tags"), &["tag"])),
+            projections: vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern: "tag".to_owned(),
+                qualifier: Some(Qualifier::single("t")),
+            })],
+        });
+
+        let typed =
+            analyze(plan, &base_types_for(&[("emp", schema)])).expect("qualified generator regex");
+        let TypedOp::Project { input, .. } = &typed.op else {
+            panic!("expected Project, got {:?}", typed.op);
+        };
+        let input_tag = input.resolved_schema.fields[0].expr_id;
+        let generated_tag = input.resolved_schema.fields[2].expr_id;
+
+        assert_eq!(typed.resolved_schema.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].expr_id, generated_tag);
+        assert_ne!(typed.resolved_schema.fields[0].expr_id, input_tag);
+        assert_eq!(
+            typed.resolved_schema.fields[0].qualifier,
+            Some(Qualifier::single("t"))
+        );
     }
 
     #[test]
@@ -11349,8 +13574,6 @@ mod tests {
             using_columns: vec![],
             natural: false,
             lateral: true,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         })
     }
 
@@ -11410,8 +13633,6 @@ mod tests {
             using_columns: vec![],
             natural: true,
             lateral: true,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + natural must error");
         assert_eq!(
@@ -11434,8 +13655,6 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: true,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let err = analyze(ast, &bt).expect_err("lateral + USING must error");
         assert_eq!(
@@ -11585,7 +13804,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let bt = BaseTypes::empty();
@@ -11652,7 +13871,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "chain".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
@@ -11681,7 +13900,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let bt = BaseTypes::empty();
         let err = analyze(outer, &bt).expect_err("should reject UNION without ALL");
@@ -11709,7 +13928,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let bt = BaseTypes::empty();
         let err = analyze(outer, &bt).expect_err("should reject arity mismatch");
@@ -11736,7 +13955,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
         let bt = BaseTypes::empty();
         let err = analyze(outer, &bt).expect_err("should reject recursive term arity mismatch");
@@ -11772,7 +13991,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let typed = analyze(outer, &bt).expect("analyze should succeed (CTE shadows catalog)");
@@ -11828,7 +14047,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let bt = BaseTypes::empty();
@@ -11860,7 +14079,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "seq".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let typed =
@@ -11928,7 +14147,7 @@ mod tests {
                 input: Box::new(cte_node),
                 alias: "chain".to_owned(),
             })),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            projections: vec![Expression::Star(StarExpression::Unqualified)],
         });
 
         let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
@@ -11947,30 +14166,9 @@ mod tests {
 
     fn plan_id_col(name: &str, pid: i64) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: None,
+            name_parts: vec![name.to_owned()],
             plan_id: Some(pid),
-        })
-    }
-
-    fn join_with_plan_ids(
-        left: CommonAst,
-        right: CommonAst,
-        join_type: JoinType,
-        condition: Option<Expression>,
-        left_plan_ids: Vec<i64>,
-        right_plan_ids: Vec<i64>,
-    ) -> CommonAst {
-        CommonAst::new(CommonOp::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type,
-            condition,
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids,
-            right_plan_ids,
+            is_metadata_column: false,
         })
     }
 
@@ -11982,13 +14180,11 @@ mod tests {
             op: BinaryOp::Eq,
             right: Box::new(pcol("id", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(2),
             JoinType::Inner,
             Some(join_cond),
-            vec![1],
-            vec![2],
         );
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(joined),
@@ -12022,13 +14218,11 @@ mod tests {
             op: BinaryOp::Eq,
             right: Box::new(pcol("salary", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(2),
             JoinType::Inner,
             Some(join_cond),
-            vec![1],
-            vec![2],
         );
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(joined),
@@ -12061,13 +14255,11 @@ mod tests {
     #[test]
     fn plan_id_binds_both_sides_of_same_join_is_ambiguous() {
         let bt = base_types_with_emp_dept();
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(1),
             JoinType::Inner,
             None,
-            vec![1],
-            vec![1],
         );
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(joined),
@@ -12090,13 +14282,11 @@ mod tests {
             left: Box::new(pcol("id", 1)),
             right: Box::new(pcol("id", 1)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(1),
             JoinType::Inner,
             Some(cond),
-            vec![1],
-            vec![1],
         );
         let err = analyze(joined, &bt).unwrap_err();
         match err {
@@ -12125,13 +14315,11 @@ mod tests {
             left: Box::new(pcol("dept_id", 1)),
             right: Box::new(pcol("dept_id", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("left_t"),
-            scan("right_t"),
+        let joined = join(
+            scan("left_t").with_plan_id(1),
+            scan("right_t").with_plan_id(2),
             JoinType::Inner,
             Some(cond),
-            vec![1],
-            vec![2],
         );
         let typed = analyze(joined, &bt).expect("distinct-pid dept_id condition should resolve");
         let (l, r) = join_condition_refs(&typed);
@@ -12149,26 +14337,22 @@ mod tests {
             op: BinaryOp::Eq,
             right: Box::new(pcol("id", 2)),
         });
-        let inner_join = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
+        let inner_join = join(
+            scan("emp").with_plan_id(1),
+            scan("emp").with_plan_id(2),
             JoinType::Inner,
             Some(inner_cond),
-            vec![1],
-            vec![2],
         );
         let outer_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("dept_id", 1)),
             op: BinaryOp::Eq,
             right: Box::new(pcol("dept_id", 3)),
         });
-        let outer_join = join_with_plan_ids(
+        let outer_join = join(
             inner_join,
-            scan("dept"),
+            scan("dept").with_plan_id(3),
             JoinType::Inner,
             Some(outer_cond),
-            vec![1, 2],
-            vec![3],
         );
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(outer_join),
@@ -12188,13 +14372,11 @@ mod tests {
             op: BinaryOp::Eq,
             right: Box::new(pcol("dept_id", 2)),
         });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("dept"),
+        let joined = join(
+            scan("emp").with_plan_id(1),
+            scan("dept").with_plan_id(2),
             JoinType::Inner,
             Some(join_cond),
-            vec![1],
-            vec![2],
         );
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(joined),
@@ -12223,19 +14405,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_id_unknown_falls_back_to_legacy() {
+    fn unknown_plan_id_never_falls_back_by_name() {
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![plan_id_col("id", 99)],
         });
-        let typed = analyze(project, &bt).expect("unknown plan_id should fall back");
-        assert_eq!(typed.resolved_schema.fields.len(), 1);
-        assert_eq!(typed.resolved_schema.fields[0].name, "id");
+        assert!(matches!(
+            analyze(project, &bt),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn plan_id_under_plain_non_join_input_unaffected() {
+    fn unknown_plan_id_under_plain_input_is_rejected() {
         let bt = base_types_with_emp_dept();
         let filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(scan("emp")),
@@ -12245,8 +14431,726 @@ mod tests {
                 right: Box::new(int_lit(100)),
             }),
         });
-        let typed = analyze(filter, &bt).expect("plan_id with no join should resolve normally");
-        assert_eq!(typed.resolved_schema.fields.len(), 4);
+        assert!(matches!(
+            analyze(filter, &bt),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plan_id_column_preserves_target_qualifier_across_relation_alias() {
+        let projected = || {
+            let original = aliased("emp", "orig").with_plan_id(10);
+            let current = CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(original),
+                alias: "x".to_owned(),
+            });
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(current),
+                projections: vec![plan_id_col("id", 10)],
+            })
+        };
+
+        let typed = analyze(projected(), &base_types_with_emp_dept()).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields[0].qualifier,
+            Some(Qualifier::single("orig"))
+        );
+        let TypedOp::Project { projections, .. } = &typed.op else {
+            panic!("expected Project");
+        };
+        assert!(matches!(
+            &projections[0],
+            Expression::ColumnReference(reference) if reference.qualifier.is_none()
+        ));
+
+        let original = CommonAst::new(CommonOp::Project {
+            input: Box::new(projected()),
+            projections: vec![qcol("orig", "id")],
+        });
+        analyze(original, &base_types_with_emp_dept())
+            .expect("the target qualifier must survive projection");
+
+        let current = CommonAst::new(CommonOp::Project {
+            input: Box::new(projected()),
+            projections: vec![qcol("x", "id")],
+        });
+        assert!(matches!(
+            analyze(current, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_id_column_refreshes_only_outer_join_nullability() {
+        let right = aliased("dept", "right").with_plan_id(20);
+        let joined = join(
+            aliased("emp", "left"),
+            right,
+            JoinType::Left,
+            Some(Expression::Binary(BinaryExpression {
+                left: Box::new(qcol("left", "dept_id")),
+                op: BinaryOp::Eq,
+                right: Box::new(qcol("right", "dept_id")),
+            })),
+        );
+        let current = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(joined),
+            alias: "joined".to_owned(),
+        });
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(current),
+            projections: vec![plan_id_col("dept_id", 20)],
+        });
+
+        let typed = analyze(project, &base_types_with_emp_dept()).unwrap();
+        let field = &typed.resolved_schema.fields[0];
+        assert!(field.nullable);
+        assert_eq!(field.qualifier, Some(Qualifier::single("right")));
+    }
+
+    #[test]
+    fn plan_id_aggregate_output_preserves_target_qualifier() {
+        let original = aliased("emp", "orig").with_plan_id(10);
+        let current = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(original),
+            alias: "x".to_owned(),
+        });
+        let aggregate = aggregate(
+            current,
+            vec![plan_id_col("id", 10)],
+            vec![plan_id_col("id", 10)],
+        );
+
+        let typed = analyze(aggregate, &base_types_with_emp_dept()).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields[0].qualifier,
+            Some(Qualifier::single("orig"))
+        );
+    }
+
+    #[test]
+    fn plan_id_pivot_grouping_preserves_target_qualifier() {
+        let original = aliased("emp", "orig").with_plan_id(10);
+        let current = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(original),
+            alias: "x".to_owned(),
+        });
+        let pivot = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(current),
+            grouping: PivotGrouping::Explicit(vec![plan_id_col("dept_id", 10)]),
+            pivot_column: unresolved_col("name"),
+            pivot_values: vec![lit_str("alice")],
+            aggregates: vec![func("sum", vec![unresolved_col("salary")])],
+        });
+
+        let typed = analyze(pivot, &base_types_with_emp_dept()).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields[0].qualifier,
+            Some(Qualifier::single("orig"))
+        );
+    }
+
+    #[test]
+    fn plan_id_missing_column_recovery_matches_sort_and_filter() {
+        let narrowed = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![unresolved_col("name")],
+            })
+        };
+        let predicate = || {
+            Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("id", 10)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            })
+        };
+
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(narrowed()),
+            condition: predicate(),
+        });
+        let filtered = analyze(filter, &base_types_with_emp_dept())
+            .expect("Filter must recover a matched column below Project");
+        assert_eq!(filtered.resolved_schema.field_names(), vec!["name"]);
+        let TypedOp::Project { input, .. } = &filtered.op else {
+            panic!("hidden Filter output must be trimmed");
+        };
+        let TypedOp::Filter { input, .. } = &input.op else {
+            panic!("expected Filter below trim Project");
+        };
+        assert_eq!(input.resolved_schema.field_names(), vec!["name", "id"]);
+
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(narrowed()),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert_eq!(
+            analyze(sort, &base_types_with_emp_dept())
+                .expect("Sort must recover a matched column below Project")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+
+        let limited = || {
+            CommonAst::new(CommonOp::Limit {
+                input: Box::new(narrowed()),
+                limit: 1,
+                offset: None,
+            })
+        };
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(limited()),
+            condition: predicate(),
+        });
+        assert_eq!(
+            analyze(filter, &base_types_with_emp_dept())
+                .expect("Filter must recover through eligible unary wrappers")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(limited()),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert_eq!(
+            analyze(sort, &base_types_with_emp_dept())
+                .expect("Sort must recover through eligible unary wrappers")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+
+        let twice_narrowed = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(narrowed()),
+                projections: vec![unresolved_col("name")],
+            })
+        };
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(twice_narrowed()),
+            condition: predicate(),
+        });
+        assert_eq!(
+            analyze(filter, &base_types_with_emp_dept())
+                .expect("Filter must recover through nested Projects")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(twice_narrowed()),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert_eq!(
+            analyze(sort, &base_types_with_emp_dept())
+                .expect("Sort must recover through nested Projects")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+
+        let starred = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(narrowed()),
+                projections: vec![Expression::Star(StarExpression::Unqualified)],
+            })
+        };
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(starred()),
+            condition: predicate(),
+        });
+        assert_eq!(
+            analyze(filter, &base_types_with_emp_dept())
+                .expect("Filter must recover through a retained star Project")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(starred()),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert_eq!(
+            analyze(sort, &base_types_with_emp_dept())
+                .expect("Sort must recover through a retained star Project")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+
+        let projected_generate = || {
+            let source = CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![unresolved_col("name"), unresolved_col("tags")],
+            });
+            let mut generator =
+                Generator::from_function("explode", vec![unresolved_col("tags")]).unwrap();
+            generator.aliases = vec!["tag".to_owned()];
+            let generated = CommonAst::new(CommonOp::Generate {
+                input: Box::new(source),
+                generator,
+                qualifier: None,
+            });
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(generated),
+                projections: vec![unresolved_col("name")],
+            })
+        };
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(projected_generate()),
+            condition: predicate(),
+        });
+        assert_eq!(
+            analyze(filter, &base_types_for(&[("emp", emp_tags_schema())]))
+                .expect("Filter must recover through Project and Generate")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(projected_generate()),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert_eq!(
+            analyze(sort, &base_types_for(&[("emp", emp_tags_schema())]))
+                .expect("Sort must recover through Project and Generate")
+                .resolved_schema
+                .field_names(),
+            vec!["name"]
+        );
+
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(narrowed()),
+            projections: vec![plan_id_col("id", 10)],
+        });
+        assert!(matches!(
+            analyze(project, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_id_missing_column_recovery_crosses_project_like_ops() {
+        let connection = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        connection
+            .execute_batch(
+                "CREATE TABLE emp(id BIGINT, name VARCHAR, dept_id INTEGER, salary DOUBLE); \
+                 INSERT INTO emp VALUES (1, 'alice', 10, 100.0);",
+            )
+            .expect("test relation");
+        let narrowed = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp").with_plan_id(10)),
+                projections: vec![unresolved_col("name")],
+            })
+        };
+        let plans = vec![
+            (
+                "WithColumns",
+                CommonAst::new(CommonOp::WithColumns {
+                    input: Box::new(narrowed()),
+                    assignments: vec![("x".to_owned(), int_lit(1))],
+                }),
+                vec!["name", "x"],
+            ),
+            (
+                "DropColumns",
+                CommonAst::new(CommonOp::DropColumns {
+                    input: Box::new(scan("emp").with_plan_id(10)),
+                    drop_names: vec!["id".to_owned()],
+                }),
+                vec!["name", "dept_id", "salary"],
+            ),
+            (
+                "WithColumnsRenamed",
+                CommonAst::new(CommonOp::WithColumnsRenamed {
+                    input: Box::new(scan("emp").with_plan_id(10)),
+                    renames: vec![("id".to_owned(), "renamed_id".to_owned())],
+                }),
+                vec!["renamed_id", "name", "dept_id", "salary"],
+            ),
+            (
+                "NaFill",
+                CommonAst::new(CommonOp::NaFill {
+                    input: Box::new(scan("emp").with_plan_id(10)),
+                    cols: vec!["id".to_owned()],
+                    values: vec![int_lit(1)],
+                }),
+                vec!["id", "name", "dept_id", "salary"],
+            ),
+            (
+                "NaReplace",
+                CommonAst::new(CommonOp::NaReplace {
+                    input: Box::new(scan("emp").with_plan_id(10)),
+                    cols: vec!["id".to_owned()],
+                    replacements: vec![(int_lit(1), int_lit(2))],
+                }),
+                vec!["id", "name", "dept_id", "salary"],
+            ),
+        ];
+        let predicate = || {
+            Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("id", 10)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            })
+        };
+
+        for (name, plan, expected) in plans {
+            let filter = CommonAst::new(CommonOp::Filter {
+                input: Box::new(plan.clone()),
+                condition: predicate(),
+            });
+            let filtered = analyze(filter, &base_types_with_emp_dept())
+                .unwrap_or_else(|error| panic!("Filter through {name} failed: {error}"));
+            assert_eq!(filtered.resolved_schema.field_names(), expected);
+            let sql = super::super::emission::dispatch_op(&filtered.op, &filtered.resolved_schema)
+                .unwrap_or_else(|error| panic!("Filter through {name} did not emit: {error}"));
+            let mut statement = connection
+                .prepare(&sql)
+                .unwrap_or_else(|error| panic!("Filter through {name} SQL failed: {error}: {sql}"));
+            {
+                let mut rows = statement.query([]).unwrap();
+                assert!(rows.next().unwrap().is_some());
+            }
+            assert_eq!(statement.column_count(), expected.len());
+
+            let sort = CommonAst::new(CommonOp::Sort {
+                input: Box::new(plan),
+                order: vec![asc_key(plan_id_col("id", 10))],
+                limit: None,
+                offset: None,
+            });
+            let sorted = analyze(sort, &base_types_with_emp_dept())
+                .unwrap_or_else(|error| panic!("Sort through {name} failed: {error}"));
+            assert_eq!(sorted.resolved_schema.field_names(), expected);
+            let sql = super::super::emission::dispatch_op(&sorted.op, &sorted.resolved_schema)
+                .unwrap_or_else(|error| panic!("Sort through {name} did not emit: {error}"));
+            let mut statement = connection
+                .prepare(&sql)
+                .unwrap_or_else(|error| panic!("Sort through {name} SQL failed: {error}: {sql}"));
+            {
+                let mut rows = statement.query([]).unwrap();
+                assert!(rows.next().unwrap().is_some());
+            }
+            assert_eq!(statement.column_count(), expected.len());
+        }
+    }
+
+    #[test]
+    fn recovery_freezes_deduplicate_and_na_drop_inputs() {
+        let connection = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+        connection
+            .execute_batch(
+                "CREATE TABLE recovery_src(id BIGINT, name VARCHAR); \
+                 INSERT INTO recovery_src VALUES (1, 'x'), (2, 'x'), (NULL, 'y');",
+            )
+            .expect("test relation");
+        let base_types = base_types_for(&[(
+            "recovery_src",
+            StructType::new(vec![
+                StructField::nullable("id", DataType::Long),
+                StructField::nullable("name", DataType::String),
+            ]),
+        )]);
+        let query_strings = |sql: &str, column: usize| -> Vec<String> {
+            connection
+                .prepare(sql)
+                .unwrap_or_else(|error| panic!("recovery SQL failed: {error}: {sql}"))
+                .query_map([], |row| row.get(column))
+                .expect("recovery query")
+                .map(|row| row.expect("recovery row"))
+                .collect()
+        };
+        let narrowed = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("recovery_src").with_plan_id(10)),
+                projections: vec![unresolved_col("name")],
+            })
+        };
+
+        let deduplicated = CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(narrowed()),
+            on_columns: vec![],
+        });
+        let sorted = analyze(
+            CommonAst::new(CommonOp::Sort {
+                input: Box::new(deduplicated),
+                order: vec![SortOrder {
+                    expr: Box::new(plan_id_col("id", 10)),
+                    direction: SortDirection::Ascending,
+                    null_ordering: NullOrdering::NullsFirst,
+                }],
+                limit: None,
+                offset: None,
+            }),
+            &base_types,
+        )
+        .expect("Dataset Deduplicate must recover while retaining its original keys");
+        let sql = super::super::emission::dispatch_op(&sorted.op, &sorted.resolved_schema)
+            .expect("Deduplicate recovery emits");
+        assert_eq!(query_strings(&sql, 0), vec!["y", "x"]);
+
+        let dropped = CommonAst::new(CommonOp::NaDrop {
+            input: Box::new(narrowed()),
+            cols: vec![],
+            min_non_nulls: Some(1),
+        });
+        let filtered = analyze(
+            CommonAst::new(CommonOp::Filter {
+                input: Box::new(dropped),
+                condition: Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(plan_id_col("id", 10)),
+                }),
+            }),
+            &base_types,
+        )
+        .expect("NaDrop must recover while retaining its original subset");
+        let sql = super::super::emission::dispatch_op(&filtered.op, &filtered.resolved_schema)
+            .expect("NaDrop recovery emits");
+        assert_eq!(query_strings(&sql, 0), vec!["y"]);
+
+        let replaced = || {
+            CommonAst::new(CommonOp::WithColumns {
+                input: Box::new(scan("recovery_src").with_plan_id(10)),
+                assignments: vec![("id".to_owned(), int_lit(0))],
+            })
+        };
+        let deduplicated = CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(replaced()),
+            on_columns: vec!["id".to_owned()],
+        });
+        let sorted = analyze(
+            CommonAst::new(CommonOp::Sort {
+                input: Box::new(deduplicated),
+                order: vec![asc_key(plan_id_col("id", 10))],
+                limit: None,
+                offset: None,
+            }),
+            &base_types,
+        )
+        .expect("explicit Deduplicate keys retain their public identity");
+        let sql = super::super::emission::dispatch_op(&sorted.op, &sorted.resolved_schema)
+            .expect("explicit Deduplicate recovery emits");
+        assert_eq!(query_strings(&sql, 1).len(), 1);
+
+        let dropped = CommonAst::new(CommonOp::NaDrop {
+            input: Box::new(replaced()),
+            cols: vec!["id".to_owned(), "id".to_owned()],
+            min_non_nulls: Some(2),
+        });
+        let filtered = analyze(
+            CommonAst::new(CommonOp::Filter {
+                input: Box::new(dropped),
+                condition: Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(plan_id_col("id", 10)),
+                }),
+            }),
+            &base_types,
+        )
+        .expect("explicit NaDrop subset retains its public identity");
+        let sql = super::super::emission::dispatch_op(&filtered.op, &filtered.resolved_schema)
+            .expect("explicit NaDrop recovery emits");
+        assert_eq!(query_strings(&sql, 1), vec!["y"]);
+
+        let distinct = CommonAst::new(CommonOp::Distinct {
+            input: Box::new(narrowed()),
+        });
+        let sorted = CommonAst::new(CommonOp::Sort {
+            input: Box::new(distinct),
+            order: vec![asc_key(plan_id_col("id", 10))],
+            limit: None,
+            offset: None,
+        });
+        assert!(matches!(
+            analyze(sorted, &base_types),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn matched_plan_id_missing_column_preserves_narrower_lookup_error() {
+        let narrowed = || {
+            CommonAst::new(CommonOp::Project {
+                input: Box::new(scan("emp")),
+                projections: vec![unresolved_col("name")],
+            })
+            .with_plan_id(10)
+        };
+        let tagged = || plan_id_col("id", 10);
+        let plans = [
+            CommonAst::new(CommonOp::Filter {
+                input: Box::new(narrowed()),
+                condition: Expression::Binary(BinaryExpression {
+                    left: Box::new(tagged()),
+                    op: BinaryOp::Gt,
+                    right: Box::new(int_lit(0)),
+                }),
+            }),
+            CommonAst::new(CommonOp::Sort {
+                input: Box::new(narrowed()),
+                order: vec![asc_key(tagged())],
+                limit: None,
+                offset: None,
+            }),
+        ];
+
+        for plan in plans {
+            assert!(matches!(
+                analyze(plan, &base_types_with_emp_dept()),
+                Err(AnalyzerError::SparkEmulated {
+                    class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn narrower_retry_preserves_plan_id_ambiguity() {
+        let joined = join(
+            scan("emp").with_plan_id(10),
+            scan("emp").with_plan_id(10),
+            JoinType::Cross,
+            None,
+        );
+        let narrowed = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![alias_expr(int_lit(1), "name")],
+        })
+        .with_plan_id(10);
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(narrowed),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("id", 10)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            }),
+        });
+
+        assert!(matches!(
+            analyze(filter, &base_types_with_emp_dept()),
+            Err(AnalyzerError::AmbiguousColumnReference { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_id_column_stops_at_match_and_treats_union_as_a_leaf() {
+        let matching_parent = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp").with_plan_id(10)),
+            projections: vec![unresolved_col("id")],
+        })
+        .with_plan_id(10);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(matching_parent),
+            projections: vec![plan_id_col("id", 10)],
+        });
+        analyze(project, &base_types_with_emp_dept())
+            .expect("a matching ancestor stops lookup below itself");
+
+        let below_union = CommonAst::new(CommonOp::Project {
+            input: Box::new(set_op(
+                SetOpKind::Union,
+                true,
+                vec![scan("emp").with_plan_id(10), scan("emp")],
+            )),
+            projections: vec![plan_id_col("id", 10)],
+        });
+        assert!(matches!(
+            analyze(below_union, &base_types_with_emp_dept()),
+            Err(AnalyzerError::SparkEmulated {
+                class: "CANNOT_RESOLVE_DATAFRAME_COLUMN",
+                ..
+            })
+        ));
+
+        let matching_union =
+            set_op(SetOpKind::Union, true, vec![scan("emp"), scan("emp")]).with_plan_id(10);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(matching_union),
+            projections: vec![plan_id_col("id", 10)],
+        });
+        analyze(project, &base_types_with_emp_dept())
+            .expect("a Union node may resolve its own plan id");
+    }
+
+    #[test]
+    fn plan_id_set_ops_filter_by_their_first_child_output() {
+        for kind in [SetOpKind::Intersect, SetOpKind::Except] {
+            let first = scan("emp").with_plan_id(10);
+            let second = scan("emp").with_plan_id(20);
+
+            let surviving = CommonAst::new(CommonOp::Project {
+                input: Box::new(set_op(kind, true, vec![first.clone(), second.clone()])),
+                projections: vec![plan_id_col("id", 10)],
+            });
+            analyze(surviving, &base_types_with_emp_dept())
+                .expect("the first child identity survives the set operation");
+
+            let filtered = CommonAst::new(CommonOp::Project {
+                input: Box::new(set_op(kind, true, vec![first, second])),
+                projections: vec![plan_id_col("id", 20)],
+            });
+            assert!(matches!(
+                analyze(filtered, &base_types_with_emp_dept()),
+                Err(AnalyzerError::UnknownColumn { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn plan_id_sibling_merge_precedes_semi_join_output_filtering() {
+        for join_type in [JoinType::LeftSemi, JoinType::LeftAnti] {
+            let condition = Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("dept_id", 10)),
+                op: BinaryOp::Eq,
+                right: Box::new(plan_id_col("dept_id", 20)),
+            });
+            analyze(
+                join(
+                    scan("emp").with_plan_id(10),
+                    scan("dept").with_plan_id(20),
+                    join_type,
+                    Some(condition),
+                ),
+                &base_types_with_emp_dept(),
+            )
+            .expect("join conditions search both children for every join type");
+
+            let joined = join(
+                scan("emp").with_plan_id(10),
+                scan("emp").with_plan_id(10),
+                join_type,
+                None,
+            );
+            let project = CommonAst::new(CommonOp::Project {
+                input: Box::new(joined),
+                projections: vec![plan_id_col("id", 10)],
+            });
+            assert!(matches!(
+                analyze(project, &base_types_with_emp_dept()),
+                Err(AnalyzerError::AmbiguousColumnReference { .. })
+            ));
+        }
     }
 
     #[test]
@@ -12267,11 +15171,33 @@ mod tests {
         let err = analyze(ast, &bt).expect_err("user-typed __td_jl qualifier must be rejected");
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "id");
-                assert_eq!(qualifier, Some("__td_jl".to_owned()));
+                assert_eq!(name, "__td_jl.id");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_tagged_reserved_prefix_is_a_struct_path() {
+        let schema = StructType::new(vec![StructField::not_null(
+            "__td_jl",
+            DataType::Struct(StructType::new(vec![StructField::not_null(
+                "id",
+                DataType::Long,
+            )])),
+        )]);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("nested").with_plan_id(10)),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name_parts: vec!["__td_jl".to_owned(), "id".to_owned()],
+                plan_id: Some(10),
+                is_metadata_column: false,
+            })],
+        });
+
+        analyze(project, &base_types_for(&[("nested", schema)]))
+            .expect("plan-tagged multipart names must bypass reserved emission aliases");
     }
 
     #[test]
@@ -12292,8 +15218,8 @@ mod tests {
         let err = analyze(ast, &bt).expect_err("user-typed __td_jr qualifier must be rejected");
         match err {
             AnalyzerError::UnknownColumn { name, qualifier } => {
-                assert_eq!(name, "id");
-                assert_eq!(qualifier, Some("__td_jr".to_owned()));
+                assert_eq!(name, "__td_jr.id");
+                assert_eq!(qualifier, None);
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
@@ -12419,12 +15345,7 @@ mod tests {
     #[test]
     fn sort_count_star_over_global_aggregate_resolves_q096_shape() {
         let bt = base_types_with_emp_dept();
-        let count_star = || {
-            func(
-                "count",
-                vec![Expression::Star(StarExpression { qualifier: None })],
-            )
-        };
+        let count_star = || func("count", vec![Expression::Star(StarExpression::Unqualified)]);
         let agg = aggregate(emp_scan(), vec![], vec![count_star()]);
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13143,14 +16064,14 @@ mod tests {
 
         let bare_qualified = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
-            qualifier: Some("e".to_owned()),
+            qualifier: Some(Qualifier::single("e")),
             data_type: DataType::Integer,
             nullable: true,
             expr_id: None,
         });
         assert_eq!(ensure_named(bare_qualified.clone()), bare_qualified);
 
-        let star = Expression::Star(StarExpression { qualifier: None });
+        let star = Expression::Star(StarExpression::Unqualified);
         assert_eq!(ensure_named(star.clone()), star);
     }
 
@@ -13462,6 +16383,417 @@ mod tests {
     }
 
     #[test]
+    fn with_columns_renamed_mints_renamed_id_and_preserves_untouched_id() {
+        let ast = CommonAst::new(CommonOp::WithColumnsRenamed {
+            input: Box::new(emp_scan()),
+            renames: vec![("id".to_owned(), "employee_id".to_owned())],
+        });
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("rename analyzes");
+        let TypedOp::WithColumnsRenamed { input, .. } = &typed.op else {
+            panic!("expected WithColumnsRenamed, got {:?}", typed.op);
+        };
+        assert_ne!(
+            typed.resolved_schema.fields[0].expr_id,
+            input.resolved_schema.fields[0].expr_id
+        );
+        assert_eq!(
+            typed.resolved_schema.fields[1].expr_id,
+            input.resolved_schema.fields[1].expr_id
+        );
+    }
+
+    #[test]
+    fn with_columns_renamed_applies_pairs_in_order() {
+        let input = values_row(&[
+            ("x", DataType::Long, LiteralValue::Long(1)),
+            ("y", DataType::Long, LiteralValue::Long(2)),
+        ]);
+        let ast = CommonAst::new(CommonOp::WithColumnsRenamed {
+            input: Box::new(input),
+            renames: vec![
+                ("x".to_owned(), "y".to_owned()),
+                ("y".to_owned(), "z".to_owned()),
+            ],
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("ordered renames analyze");
+        assert_eq!(typed.resolved_schema.field_names(), vec!["z", "z"]);
+        let TypedOp::WithColumnsRenamed { input, .. } = &typed.op else {
+            panic!("expected WithColumnsRenamed, got {:?}", typed.op);
+        };
+        for output in &typed.resolved_schema.fields {
+            assert!(input
+                .resolved_schema
+                .fields
+                .iter()
+                .all(|source| output.expr_id != source.expr_id));
+        }
+    }
+
+    #[test]
+    fn to_df_mints_every_renamed_output_id() {
+        let ast = CommonAst::new(CommonOp::ToDf {
+            input: Box::new(emp_scan()),
+            column_names: vec!["a", "b", "c", "d"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        });
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("toDF analyzes");
+        let TypedOp::WithColumnsRenamed { input, .. } = &typed.op else {
+            panic!("expected WithColumnsRenamed, got {:?}", typed.op);
+        };
+        for (output, source) in typed
+            .resolved_schema
+            .fields
+            .iter()
+            .zip(&input.resolved_schema.fields)
+        {
+            assert_ne!(output.expr_id, source.expr_id);
+        }
+    }
+
+    #[test]
+    fn na_fill_mints_filled_ids_and_preserves_skipped_ids() {
+        let schema = StructType::new(vec![
+            StructField::nullable("text", DataType::String),
+            StructField::nullable("count", DataType::Long),
+        ]);
+        let ast = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(scan("t")),
+            cols: vec![],
+            values: vec![int_lit(0)],
+        });
+        let typed = analyze(ast, &base_types_for(&[("t", schema)])).expect("NA fill analyzes");
+        let TypedOp::NaFill { input, .. } = &typed.op else {
+            panic!("expected NaFill, got {:?}", typed.op);
+        };
+        assert_eq!(
+            typed.resolved_schema.fields[0].expr_id,
+            input.resolved_schema.fields[0].expr_id
+        );
+        assert_ne!(
+            typed.resolved_schema.fields[1].expr_id,
+            input.resolved_schema.fields[1].expr_id
+        );
+    }
+
+    #[test]
+    fn na_fill_accounts_for_cast_nullability() {
+        let schema = StructType::new(vec![StructField::nullable("x", DataType::Long)]);
+        let analyze_fill = |value| {
+            analyze(
+                CommonAst::new(CommonOp::NaFill {
+                    input: Box::new(scan("t")),
+                    cols: vec![],
+                    values: vec![value],
+                }),
+                &base_types_for(&[("t", schema.clone())]),
+            )
+            .expect("NA fill analyzes")
+            .resolved_schema
+            .fields[0]
+                .nullable
+        };
+        let long = Expression::Literal(Literal {
+            value: LiteralValue::Long(1),
+            data_type: DataType::Long,
+        });
+        assert!(!analyze_fill(long));
+        assert!(analyze_fill(lit_double(1.5)));
+    }
+
+    #[test]
+    fn na_fill_string_to_numeric_cast_stays_nullable() {
+        let schema = StructType::new(vec![
+            StructField::nullable("x", DataType::Long),
+            StructField::nullable("unused", DataType::Integer),
+        ]);
+        let typed = analyze(
+            CommonAst::new(CommonOp::NaFill {
+                input: Box::new(scan("t")),
+                cols: vec!["x".to_owned(), "unused".to_owned()],
+                values: vec![lit_str("abc"), int_lit(0)],
+            }),
+            &base_types_for(&[("t", schema)]),
+        )
+        .expect("map-style NA fill analyzes");
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn na_fill_nan_branch_makes_non_null_double_nullable() {
+        let schema = StructType::new(vec![
+            StructField::not_null("x", DataType::Double),
+            StructField::nullable("unused", DataType::Integer),
+        ]);
+        let typed = analyze(
+            CommonAst::new(CommonOp::NaFill {
+                input: Box::new(scan("t")),
+                cols: vec!["x".to_owned(), "unused".to_owned()],
+                values: vec![lit_str("abc"), int_lit(0)],
+            }),
+            &base_types_for(&[("t", schema)]),
+        )
+        .expect("map-style NA fill analyzes");
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn na_replace_mints_replaced_ids_and_preserves_unselected_ids() {
+        let ast = CommonAst::new(CommonOp::NaReplace {
+            input: Box::new(emp_scan()),
+            cols: vec!["id".to_owned()],
+            replacements: vec![(int_lit(1), int_lit(2))],
+        });
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("NA replacement analyzes");
+        let TypedOp::NaReplace { input, .. } = &typed.op else {
+            panic!("expected NaReplace, got {:?}", typed.op);
+        };
+        assert_ne!(
+            typed.resolved_schema.fields[0].expr_id,
+            input.resolved_schema.fields[0].expr_id
+        );
+        assert!(typed.resolved_schema.fields[0].nullable);
+        for (output, source) in typed.resolved_schema.fields[1..]
+            .iter()
+            .zip(&input.resolved_schema.fields[1..])
+        {
+            assert_eq!(output.expr_id, source.expr_id);
+        }
+    }
+
+    #[test]
+    fn na_replace_preserves_selected_but_type_incompatible_id() {
+        let schema = StructType::new(vec![
+            StructField::nullable("text", DataType::String),
+            StructField::nullable("count", DataType::Long),
+        ]);
+        let ast = CommonAst::new(CommonOp::NaReplace {
+            input: Box::new(scan("t")),
+            cols: vec![],
+            replacements: vec![(int_lit(1), int_lit(2))],
+        });
+        let typed =
+            analyze(ast, &base_types_for(&[("t", schema)])).expect("NA replacement analyzes");
+        let TypedOp::NaReplace { input, .. } = &typed.op else {
+            panic!("expected NaReplace, got {:?}", typed.op);
+        };
+        assert_eq!(
+            typed.resolved_schema.fields[0].expr_id,
+            input.resolved_schema.fields[0].expr_id
+        );
+        assert_ne!(
+            typed.resolved_schema.fields[1].expr_id,
+            input.resolved_schema.fields[1].expr_id
+        );
+    }
+
+    #[test]
+    fn na_replace_null_target_makes_non_null_string_nullable() {
+        let schema = StructType::new(vec![StructField::not_null("text", DataType::String)]);
+        let null = Expression::Literal(Literal {
+            value: LiteralValue::Null,
+            data_type: DataType::Null,
+        });
+        let ast = CommonAst::new(CommonOp::NaReplace {
+            input: Box::new(scan("t")),
+            cols: vec![],
+            replacements: vec![(lit_str("x"), null)],
+        });
+        let typed =
+            analyze(ast, &base_types_for(&[("t", schema)])).expect("NA replacement analyzes");
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn na_fill_qualified_reference_survives_only_for_untouched_slot() {
+        let make_fill = || {
+            CommonAst::new(CommonOp::NaFill {
+                input: Box::new(aliased_scan("emp", "t")),
+                cols: vec!["id".to_owned()],
+                values: vec![int_lit(0)],
+            })
+        };
+        let untouched = CommonAst::new(CommonOp::Project {
+            input: Box::new(make_fill()),
+            projections: vec![qcol("t", "name")],
+        });
+        analyze(untouched, &base_types_with_emp_dept())
+            .expect("untouched qualified column resolves");
+
+        let touched = CommonAst::new(CommonOp::Project {
+            input: Box::new(make_fill()),
+            projections: vec![qcol("t", "id")],
+        });
+        assert!(matches!(
+            analyze(touched, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn na_replace_qualified_reference_survives_only_for_untouched_slot() {
+        let make_replace = || {
+            CommonAst::new(CommonOp::NaReplace {
+                input: Box::new(aliased_scan("emp", "t")),
+                cols: vec!["id".to_owned()],
+                replacements: vec![(int_lit(1), int_lit(2))],
+            })
+        };
+        let untouched = CommonAst::new(CommonOp::Project {
+            input: Box::new(make_replace()),
+            projections: vec![qcol("t", "name")],
+        });
+        analyze(untouched, &base_types_with_emp_dept())
+            .expect("untouched qualified column resolves");
+
+        let touched = CommonAst::new(CommonOp::Project {
+            input: Box::new(make_replace()),
+            projections: vec![qcol("t", "id")],
+        });
+        assert!(matches!(
+            analyze(touched, &base_types_with_emp_dept()),
+            Err(AnalyzerError::UnknownColumn { .. })
+        ));
+    }
+
+    #[test]
+    fn na_qualified_star_expands_only_untouched_lineage() {
+        let inputs = vec![
+            CommonAst::new(CommonOp::NaFill {
+                input: Box::new(aliased_scan("emp", "t")),
+                cols: vec!["id".to_owned()],
+                values: vec![int_lit(0)],
+            }),
+            CommonAst::new(CommonOp::NaReplace {
+                input: Box::new(aliased_scan("emp", "t")),
+                cols: vec!["id".to_owned()],
+                replacements: vec![(int_lit(1), int_lit(2))],
+            }),
+        ];
+        for input in inputs {
+            let typed = analyze(qstar_project(input, "t"), &base_types_with_emp_dept())
+                .expect("qualified star resolves untouched slots");
+            assert_eq!(
+                typed.resolved_schema.field_names(),
+                vec!["name", "dept_id", "salary"]
+            );
+            let TypedOp::Project { projections, .. } = typed.op else {
+                panic!("expected Project");
+            };
+            assert!(projections
+                .iter()
+                .all(|projection| !matches!(projection, Expression::Star(_))));
+        }
+    }
+
+    #[test]
+    fn na_qualified_star_survives_passthrough_and_duplicate_names() {
+        let fill = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(aliased_scan("emp", "t")),
+            cols: vec!["id".to_owned()],
+            values: vec![int_lit(0)],
+        });
+        let filtered = CommonAst::new(CommonOp::Filter {
+            input: Box::new(fill),
+            condition: lit_bool(true),
+        });
+        let typed = analyze(qstar_project(filtered, "t"), &base_types_with_emp_dept())
+            .expect("lineage survives passthrough");
+        assert_eq!(
+            typed.resolved_schema.field_names(),
+            vec!["name", "dept_id", "salary"]
+        );
+
+        let duplicates = values_row(&[
+            ("id", DataType::Long, LiteralValue::Long(1)),
+            ("x", DataType::Long, LiteralValue::Long(2)),
+            ("x", DataType::Long, LiteralValue::Long(3)),
+        ]);
+        let fill = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(duplicates),
+                alias: "t".to_owned(),
+            })),
+            cols: vec!["id".to_owned()],
+            values: vec![int_lit(0)],
+        });
+        let typed = analyze(qstar_project(fill, "t"), &BaseTypes::empty())
+            .expect("star expansion binds duplicate slots by identity");
+        assert_eq!(typed.resolved_schema.field_names(), vec!["x", "x"]);
+    }
+
+    #[test]
+    fn full_using_join_mints_coalesced_key_id() {
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Full,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+        });
+        let typed = analyze(ast, &base_types_with_emp_dept()).expect("full USING join analyzes");
+        let TypedOp::Join { left, right, .. } = &typed.op else {
+            panic!("expected Join, got {:?}", typed.op);
+        };
+        let output_id = typed.resolved_schema.fields[0].expr_id;
+        assert_ne!(output_id, left.resolved_schema.fields[2].expr_id);
+        assert_ne!(output_id, right.resolved_schema.fields[0].expr_id);
+    }
+
+    #[test]
+    fn non_full_using_join_copies_dominant_donor_id() {
+        for (join_type, right_donor) in [(JoinType::Left, false), (JoinType::Right, true)] {
+            let ast = CommonAst::new(CommonOp::Join {
+                left: Box::new(emp_scan()),
+                right: Box::new(scan("dept")),
+                join_type,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+            });
+            let typed = analyze(ast, &base_types_with_emp_dept()).expect("USING join analyzes");
+            let TypedOp::Join { left, right, .. } = &typed.op else {
+                panic!("expected Join, got {:?}", typed.op);
+            };
+            let donor_id = if right_donor {
+                right.resolved_schema.fields[0].expr_id
+            } else {
+                left.resolved_schema.fields[2].expr_id
+            };
+            assert_eq!(typed.resolved_schema.fields[0].expr_id, donor_id);
+        }
+    }
+
+    #[test]
+    fn union_by_name_missing_first_child_mints_padding_id() {
+        let left = values_row(&[("x", DataType::Long, LiteralValue::Long(1))]);
+        let right = values_row(&[
+            ("x", DataType::Long, LiteralValue::Long(2)),
+            ("z", DataType::Long, LiteralValue::Long(3)),
+        ]);
+        let typed = analyze(
+            union_by_name_allow_missing(vec![left, right]),
+            &BaseTypes::empty(),
+        )
+        .expect("unionByName with padding analyzes");
+        let TypedOp::SetOp { children, .. } = &typed.op else {
+            panic!("expected SetOp, got {:?}", typed.op);
+        };
+        assert_eq!(
+            typed.resolved_schema.fields[0].expr_id,
+            children[0].resolved_schema.fields[0].expr_id
+        );
+        assert_ne!(
+            typed.resolved_schema.fields[1].expr_id,
+            children[1].resolved_schema.fields[1].expr_id
+        );
+    }
+
+    #[test]
     fn inner_join_output_schema_concatenates_both_sides_ids_in_order() {
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
@@ -13557,7 +16889,7 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields[0].expr_id, scan_id);
         assert_eq!(typed.resolved_schema.fields[1].expr_id, scan_name);
 
-        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        let emp: BTreeSet<Qualifier> = [Qualifier::single("emp")].into_iter().collect();
         assert_eq!(
             quals_of(&sort_ast.resolved_schema),
             vec![emp.clone(), emp.clone(), emp.clone()],
@@ -13580,14 +16912,17 @@ mod tests {
             .expect("emp has dept_id");
         let cr = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
-            qualifier: Some("e".to_owned()),
+            qualifier: Some(Qualifier::single("e")),
             data_type: field.data_type.clone(),
             nullable: field.nullable,
             expr_id: Some(field.expr_id),
         });
         let attr = output_attribute(&cr, &scanned.resolved_schema);
-        let expected: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
+        let expected: BTreeSet<Qualifier> = [Qualifier::single("emp"), Qualifier::single("e")]
+            .into_iter()
+            .collect();
         assert_eq!(attr.source_quals, expected);
+        assert_eq!(attr.qualifier, Some(Qualifier::single("emp")));
         assert_eq!(
             attr.expr_id, field.expr_id,
             "COPY branch must carry the id forward too"
@@ -13607,6 +16942,75 @@ mod tests {
         let resolved = resolve_and_stamp(computed, &ctx).expect("computed expr resolves");
         let attr = output_attribute(&resolved, &scanned.resolved_schema);
         assert!(attr.source_quals.is_empty());
+        assert!(attr.qualifier.is_none());
+    }
+
+    #[test]
+    fn table_qualifier_survives_passthrough_and_bare_projection() {
+        let table = Qualifier::from_parts(vec!["catalog".into(), "emp".into()]);
+        let scan = CommonAst::new(CommonOp::TableScan {
+            table: table.clone(),
+        });
+        let bt = BaseTypes::build_from_plan(&scan, |name| (name == "catalog.emp").then(emp_schema));
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(scan),
+                limit: 1,
+                offset: None,
+            })),
+            projections: vec![unresolved_col("id")],
+        });
+
+        let typed = analyze(plan, &bt).expect("analyze multipart passthrough");
+        assert_eq!(typed.resolved_schema.fields[0].qualifier, Some(table));
+    }
+
+    #[test]
+    fn relation_alias_replaces_current_qualifier_as_one_literal_part() {
+        let bt = base_types_with_emp_dept();
+        let typed = analyze(aliased_scan("emp", "e.v"), &bt).expect("analyze literal-dot alias");
+        let expected = Some(Qualifier::single("e.v"));
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .all(|field| field.qualifier == expected));
+
+        let regex = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("emp", "e.v")),
+            projections: vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern: "id".to_owned(),
+                qualifier: Some(Qualifier::single("e.v")),
+            })],
+        });
+        let typed = analyze(regex, &bt).expect("regex binds literal-dot alias");
+        assert_eq!(typed.resolved_schema.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].qualifier, expected);
+    }
+
+    #[test]
+    fn alias_and_computed_project_outputs_clear_current_qualifier() {
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("emp", "e")),
+            projections: vec![
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(unresolved_col("id")),
+                    alias: "renamed".to_owned(),
+                }),
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Add,
+                    left: Box::new(unresolved_col("dept_id")),
+                    right: Box::new(int_lit(1)),
+                }),
+            ],
+        });
+
+        let typed = analyze(plan, &base_types_with_emp_dept()).expect("analyze computed project");
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .all(|field| field.qualifier.is_none()));
     }
 
     #[test]
@@ -13620,13 +17024,11 @@ mod tests {
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         });
         let typed = analyze(ast, &bt).unwrap();
-        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
-        let key: BTreeSet<String> = e.union(&d).cloned().collect();
+        let e: BTreeSet<Qualifier> = [Qualifier::single("e")].into_iter().collect();
+        let d: BTreeSet<Qualifier> = [Qualifier::single("d")].into_iter().collect();
+        let key: BTreeSet<Qualifier> = e.union(&d).cloned().collect();
         let field = typed
             .resolved_schema
             .field_by_name("dept_id")
@@ -13686,7 +17088,7 @@ mod tests {
     fn push_setop_casts_preserves_childs_own_id_not_the_widened_donor_id() {
         let input = TypedAst::new(
             TypedOp::TableScan {
-                table: "dept".to_owned(),
+                table: Qualifier::single("dept"),
             },
             ResolvedSchema::new(vec![Attribute::minted("dept_id", DataType::Integer, false)]),
         );
@@ -13721,14 +17123,14 @@ mod tests {
     fn widen_by_position_output_schema_carries_child_zero_ids() {
         let left = TypedAst::new(
             TypedOp::TableScan {
-                table: "emp".to_owned(),
+                table: Qualifier::single("emp"),
             },
             ResolvedSchema::new(vec![Attribute::minted("id", DataType::Long, false)]),
         );
         let left_id = left.resolved_schema.fields[0].expr_id;
         let right = TypedAst::new(
             TypedOp::TableScan {
-                table: "dept".to_owned(),
+                table: Qualifier::single("dept"),
             },
             ResolvedSchema::new(vec![Attribute::minted("id", DataType::Integer, false)]),
         );
@@ -13741,20 +17143,47 @@ mod tests {
     }
 
     #[test]
+    fn widen_by_position_mints_when_first_child_requires_cast() {
+        let left = TypedAst::new(
+            TypedOp::TableScan {
+                table: Qualifier::single("left"),
+            },
+            ResolvedSchema::new(vec![Attribute::minted("x", DataType::Integer, false)
+                .with_quals(
+                    [Qualifier::single("left")]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )]),
+        );
+        let left_id = left.resolved_schema.fields[0].expr_id;
+        let right = TypedAst::new(
+            TypedOp::TableScan {
+                table: Qualifier::single("right"),
+            },
+            ResolvedSchema::new(vec![Attribute::minted("x", DataType::Long, false)]),
+        );
+        let widened = widen_by_position(SetOpKind::Union, &[left, right])
+            .expect("single-column arity matches");
+        assert_eq!(widened.fields[0].data_type, DataType::Long);
+        assert_ne!(widened.fields[0].expr_id, left_id);
+        assert!(widened.fields[0].source_quals.is_empty());
+    }
+
+    #[test]
     fn semantic_eq_rejects_same_name_different_join_side_ids() {
         let id_a = ExprId::fresh();
         let id_b = ExprId::fresh();
         assert_ne!(id_a, id_b);
         let a = Expression::ColumnReference(ColumnReference {
             name: "x".to_owned(),
-            qualifier: Some("t1".to_owned()),
+            qualifier: Some(Qualifier::single("t1")),
             data_type: DataType::Integer,
             nullable: true,
             expr_id: Some(id_a),
         });
         let b = Expression::ColumnReference(ColumnReference {
             name: "x".to_owned(),
-            qualifier: Some("t2".to_owned()),
+            qualifier: Some(Qualifier::single("t2")),
             data_type: DataType::Integer,
             nullable: true,
             expr_id: Some(id_b),
@@ -13780,7 +17209,7 @@ mod tests {
             JoinType::Inner,
             Some(cond),
         );
-        let child_input = analyze(joined_ast, &bt).expect("self-join analyzes");
+        let mut child_input = analyze(joined_ast, &bt).expect("self-join analyzes");
         let e_field = child_input.resolved_schema.fields[2].clone();
         let d_field = child_input.resolved_schema.fields[6].clone();
         assert_eq!(e_field.name, "dept_id");
@@ -13808,9 +17237,9 @@ mod tests {
 
         let bound = rebind_over_child(
             qcol("d", "dept_id"),
-            &child_input,
+            &mut child_input,
             &mut aggregates,
-            SortChild::Aggregate {
+            MissingColumnChild::Aggregate {
                 grouping: &grouping,
             },
             &mut schema,
@@ -13994,7 +17423,10 @@ mod tests {
         match cmp.right.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "salary");
-                assert_eq!(c.qualifier.as_deref(), Some("e"));
+                assert_eq!(
+                    c.qualifier.as_ref().map(Qualifier::display_name),
+                    Some("e".to_owned())
+                );
                 assert_eq!(
                     c.expr_id,
                     Some(outer_salary_id),
@@ -14010,7 +17442,7 @@ mod tests {
         let id = ExprId::fresh();
         let c = Expression::ColumnReference(ColumnReference {
             name: "X".to_owned(),
-            qualifier: Some("t".to_owned()),
+            qualifier: Some(Qualifier::single("t")),
             data_type: DataType::Integer,
             nullable: true,
             expr_id: Some(id),
@@ -14042,7 +17474,7 @@ mod tests {
         });
         let typed = analyze(select_ast, &bt).expect("select(\"é\") should resolve `É`");
         assert_eq!(typed.resolved_schema.len(), 1);
-        assert_eq!(typed.resolved_schema.fields[0].name, "é");
+        assert_eq!(typed.resolved_schema.fields[0].name, "É");
 
         let drop_ast = CommonAst::new(CommonOp::DropColumns {
             input: Box::new(scan("t")),

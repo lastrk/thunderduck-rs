@@ -421,3 +421,93 @@ explicit `THUNDERDUCK_BINARY` is supplied.
   selecting a branch or implementation target. Nearby branch context can be
   stale: here, an active plan-origin branch suggested Phase 2 work while the
   named plan's Phase 3 was the generator-IR migration.
+
+## 2026-08-09 — Run independent broad audits on isolated branches
+
+The architecture plan originally deferred the whole-tree comment audit until
+after structural work. The user correctly moved it onto a parallel thread.
+When a broad, review-heavy pass is independent of the active representation
+change, isolate it in a separate worktree and partition ownership by path; do
+not serialize it behind the critical path or mix its churn into that diff.
+
+- **Report production and repository LOC separately before calling a refactor
+  smaller.** The `bff14bd` deletion slice removed 306 net production lines but
+  added a 645-line task plan, so the commit grew by 339 lines overall. Keep the
+  plan proportional, and state both measurements when documentation reverses
+  the repository-level result.
+
+- **Separate Git state from architectural intent.** The
+  `plan-origin-metadata` and `relation-plan-id-metadata` worktrees were two
+  drafts of one Phase 2 effort; a duplicate tooling commit and overlapping
+  dirty files did not make them separate designs. Compare objectives and
+  invariants before explaining consolidation mechanics.
+
+- **Spark Connect plan IDs are plan-node lookup anchors, not freely propagated
+  source lineage.** The Phase 2 audit (2026-08-10) confirmed that Spark tags
+  every logical-plan node, searches top-down for a matching ID, and filters the
+  resolved attribute through ancestor outputs. Preserve that algorithm before
+  deleting join-side vectors; rename, Union, star, USING, and unknown-ID
+  behavior cannot be inferred from generic lineage rules.
+
+- **Retired ADRs should leave the active context, not just gain a superseded
+  banner.** ADR-023 still consumed the authoritative spine and influenced agent
+  reasoning after ADR-024/026 replaced it. Move superseded text under
+  `docs/adrs/retired/`, remove it from active dependency/ratification tables,
+  and keep only successor links to the historical rationale.
+
+## 2026-08-10 — Resolve the active PR stack before starting the next phase
+
+- A phase's plan can be current while its branch is based below a later phase
+  that already has an open PR. Before refreshing code indexes or implementing
+  the next slice, inspect the open PR base/head graph and stack onto its actual
+  tip. Here, Phase 2 needed to move above the already-open Phase 3 generator-IR
+  PR rather than continue directly from the safe-deletion checkpoint.
+
+- Refresh the remote before acting on a remembered PR stack. Once the user
+  reported that every earlier PR had merged, comparing patch identity showed
+  that only the current WIP branch still carried unique work; rebasing the
+  merged branches would only manufacture empty history. Check ancestry and
+  `git cherry` separately, then checkpoint dirty work before rebasing the one
+  patch-unique branch.
+
+## 2026-08-10 — Preserve front-end semantics in the IR
+
+- Parsed multipart names must remain ordered parts; flattening them makes a
+  quoted dotted name indistinguishable from nested access. Carry the same
+  structured representation through qualifiers, lineage, and emission;
+  qualifier suffix matching cannot be recovered from a joined string.
+  Resolve ambiguity over distinct root attributes before nested extraction,
+  not over relation-binding counts or path-compatible candidates. Likewise,
+  Spark's Java-regex contract requires a Java-compatible engine, not Rust
+  `regex` plus ad hoc anchoring. Run the full unit suite after representation
+  changes: focused parity witnesses did not expose legacy error-shape and
+  fixture drift.
+
+## 2026-08-10 — Keep expression semantics single-homed
+
+- Do not duplicate complex-type type/nullability rules in the analyzer after
+  the resolved expression already owns them. The duplicate ExtractValue path
+  drifted on both `GetArrayStructFields` and `GetMapValue`; deleting it was
+  smaller and safer than maintaining two rule matrices.
+- A DataFrame-star target attribute and the SQL expression used to read its
+  surviving value are different facts. Preserve the target attribute in the
+  output schema, refresh only ancestor-changed nullability, and bind the
+  physical projection by `ExprId`.
+- Similar-looking identifier consumers may use different Spark parsers and
+  error classes. NamedTable follows the SQL multipart-identifier lexer;
+  unresolved attributes and stars follow AttributeNameParser.
+- When a narrow compatibility form starts importing an entire upstream lexer
+  contract, stop and use an explicit feature boundary. Partial support for
+  `IDENTIFIER(...)` grew raw strings, escape decoding, concatenation, and token
+  adjacency special cases; deleting that parser was safer than maintaining a
+  second Spark SQL string implementation.
+
+## 2026-08-11 — Preserve logical-operator identity during recovery
+
+- SQL `Distinct` and Dataset `Deduplicate` can emit similar SQL while having
+  different Catalyst recovery rules. Keep them as distinct IR nodes instead of
+  inferring semantics from an empty key list.
+- Missing-column recovery may expand a child schema, but it must not expand an
+  existing operator's keys or predicates. Freeze `Deduplicate` keys and
+  `NaDrop` subsets by `ExprId` before recovery, then bind those identities
+  through emission wrappers.

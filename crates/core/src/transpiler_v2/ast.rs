@@ -6,28 +6,36 @@
 //! `crate::generator`, `crate::functions`, `crate::runtime`,
 //! `crate::types::TypeInferenceEngine`.
 //!
-//! The wrapper `CommonAst { op: CommonOp }` exists so τ's analyzer can attach
-//! resolution metadata (resolved schema, plan_id, etc.) without a source-wide
-//! refactor. τ keeps the wrapper minimal.
+//! `CommonAst` keeps source-only node metadata outside the shared operator
+//! enum.
 
 use super::expression::{Expression, Literal, SortOrder};
 use super::generator::Generator;
+use super::identifier::Qualifier;
 use crate::types::StructType;
 
 /// τ's canonical plan tree — a single wrapper around a [`CommonOp`] variant.
 ///
-/// τ's analyzer extends this wrapper (e.g. `pub resolved_schema: Option<StructType>`).
-/// τ keeps it as a thin wrapper so the extension is additive.
+/// τ's analyzer converts this source tree into a schema-bearing `TypedAst`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommonAst {
     /// The plan operator this node represents.
     pub op: CommonOp,
+    /// Spark Connect's external identifier for this exact relation node.
+    /// SparkSQL nodes carry `None`.
+    pub plan_id: Option<i64>,
 }
 
 impl CommonAst {
     /// Construct a `CommonAst` wrapping the given [`CommonOp`].
     pub fn new(op: CommonOp) -> Self {
-        Self { op }
+        Self { op, plan_id: None }
+    }
+
+    /// Attach the Spark Connect identifier for this exact relation node.
+    pub fn with_plan_id(mut self, plan_id: i64) -> Self {
+        self.plan_id = Some(plan_id);
+        self
     }
 }
 
@@ -157,8 +165,8 @@ pub enum CommonOp {
     /// (INV7 / ADR-004), which is also what Spark does — an alias shadows the
     /// base table name rather than adding a second binding.
     TableScan {
-        /// The table name (as written by the caller).
-        table: String,
+        /// Parsed table name.
+        table: Qualifier,
     },
 
     /// An in-line `VALUES (...) AS t(col_names)` relation.
@@ -398,6 +406,13 @@ pub enum CommonOp {
         on_columns: Vec<String>,
     },
 
+    /// SQL `SELECT DISTINCT`. Unlike Dataset `Deduplicate`, Catalyst does not
+    /// recover missing Sort/Filter attributes through this boundary.
+    Distinct {
+        /// The input relation.
+        input: Box<CommonAst>,
+    },
+
     /// `df.alias(name)` — wrap the input in a named subquery alias.
     /// Semantically transparent for schemas (analyzer passes input schema
     /// through); the alias name is retained for scope-resolution in
@@ -407,6 +422,12 @@ pub enum CommonOp {
         input: Box<CommonAst>,
         /// The alias to apply.
         alias: String,
+    },
+
+    /// A tagged Connect relation whose operator is otherwise irrelevant to τ.
+    PlanBoundary {
+        /// The relation below the retained boundary.
+        input: Box<CommonAst>,
     },
 
     /// `df.toDF(new1, new2, ...)` — positional rename all columns.
@@ -419,7 +440,7 @@ pub enum CommonOp {
     },
 
     /// `df.withColumnsRenamed({old: new, ...})` — rename columns.
-    /// Column identity + types + nullability are preserved.
+    /// Renamed columns receive new identities; untouched columns are preserved.
     WithColumnsRenamed {
         /// The input relation.
         input: Box<CommonAst>,
@@ -530,10 +551,6 @@ pub enum CommonOp {
 
     /// A binary join.
     ///
-    /// `left_plan_ids` / `right_plan_ids` carry the set of proto `plan_id`s
-    /// that appear on each side of the join. τ's analyzer's analyzer uses these
-    /// to disambiguate column references on either side without string
-    /// qualifier encoding.
     Join {
         /// The left relation.
         left: Box<CommonAst>,
@@ -557,10 +574,6 @@ pub enum CommonOp {
         /// Orthogonal to `condition` — a lateral join may carry an ON clause
         /// (`JOIN LATERAL (...) t ON cond`).
         lateral: bool,
-        /// Plan-ids appearing anywhere under the left side.
-        left_plan_ids: Vec<i64>,
-        /// Plan-ids appearing anywhere under the right side.
-        right_plan_ids: Vec<i64>,
     },
 }
 
@@ -579,9 +592,11 @@ macro_rules! common_op_children {
             | CommonOp::WithColumns { input, .. }
             | CommonOp::DropColumns { input, .. }
             | CommonOp::AliasedRelation { input, .. }
+            | CommonOp::PlanBoundary { input }
             | CommonOp::WithColumnsRenamed { input, .. }
             | CommonOp::ToDf { input, .. }
             | CommonOp::Deduplicate { input, .. }
+            | CommonOp::Distinct { input }
             | CommonOp::NaFill { input, .. }
             | CommonOp::NaDrop { input, .. }
             | CommonOp::NaReplace { input, .. }
@@ -771,6 +786,21 @@ mod tests {
     fn common_ast_single_row_constructs() {
         let plan = CommonAst::new(CommonOp::SingleRow);
         assert!(matches!(plan.op, CommonOp::SingleRow));
+        assert_eq!(plan.plan_id, None);
+    }
+
+    #[test]
+    fn common_ast_plan_id_identifies_only_its_node() {
+        let child = CommonAst::new(CommonOp::SingleRow).with_plan_id(10);
+        let plan = CommonAst::new(CommonOp::PlanBoundary {
+            input: Box::new(child),
+        })
+        .with_plan_id(20);
+        assert_eq!(plan.plan_id, Some(20));
+        let CommonOp::PlanBoundary { input } = plan.op else {
+            panic!("expected PlanBoundary");
+        };
+        assert_eq!(input.plan_id, Some(10));
     }
 
     #[test]
@@ -789,32 +819,6 @@ mod tests {
                 assert_eq!(projections[0], lit);
             }
             _ => panic!("expected Project"),
-        }
-    }
-
-    #[test]
-    fn common_op_join_carries_plan_ids() {
-        let plan = CommonAst::new(CommonOp::Join {
-            left: Box::new(CommonAst::new(CommonOp::SingleRow)),
-            right: Box::new(CommonAst::new(CommonOp::SingleRow)),
-            join_type: JoinType::Inner,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![1, 2],
-            right_plan_ids: vec![3],
-        });
-        match plan.op {
-            CommonOp::Join {
-                left_plan_ids,
-                right_plan_ids,
-                ..
-            } => {
-                assert_eq!(left_plan_ids, vec![1i64, 2]);
-                assert_eq!(right_plan_ids, vec![3i64]);
-            }
-            _ => panic!("expected Join"),
         }
     }
 
@@ -898,14 +902,14 @@ mod tests {
     fn common_op_pivot_carries_grouping_pivot_column_values_and_aggregates() {
         use super::super::expression::{Literal, LiteralValue, UnresolvedColumn};
         let group = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "dept_id".to_owned(),
-            qualifier: None,
+            name_parts: vec!["dept_id".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         });
         let pivot_col = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "active".to_owned(),
-            qualifier: None,
+            name_parts: vec!["active".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         });
         let v_true = Expression::Literal(Literal {
             value: LiteralValue::Boolean(true),
@@ -916,9 +920,9 @@ mod tests {
             data_type: DataType::Boolean,
         });
         let agg = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "n".to_owned(),
-            qualifier: None,
+            name_parts: vec!["n".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         });
         let plan = CommonAst::new(CommonOp::Pivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
@@ -951,21 +955,21 @@ mod tests {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 UnresolvedColumn {
-                    name: "active".to_owned(),
-                    qualifier: None,
+                    name_parts: vec!["active".to_owned()],
                     plan_id: None,
+                    is_metadata_column: false,
                 },
             )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
+                name_parts: vec!["dept_id".to_owned()],
                 plan_id: None,
+                is_metadata_column: false,
             }),
             pivot_values: vec![],
             aggregates: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "salary".to_owned(),
-                qualifier: None,
+                name_parts: vec!["salary".to_owned()],
                 plan_id: None,
+                is_metadata_column: false,
             })],
         });
         match plan.op {
@@ -1072,9 +1076,9 @@ mod tests {
         let plan = CommonAst::new(CommonOp::SampleBy {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             col: Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
+                name_parts: vec!["dept_id".to_owned()],
                 plan_id: None,
+                is_metadata_column: false,
             }),
             fractions: vec![
                 (dept_lit(10), 0.5),
@@ -1121,9 +1125,9 @@ mod tests {
         use super::super::expression::UnresolvedColumn;
         let dept_id = || {
             Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
+                name_parts: vec!["dept_id".to_owned()],
                 plan_id: None,
+                is_metadata_column: false,
             })
         };
         let count_star = Expression::FunctionCall(super::super::expression::FunctionCall {

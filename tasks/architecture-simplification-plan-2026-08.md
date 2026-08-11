@@ -11,15 +11,15 @@
 
 Reduce the system by deleting parallel protocols and synthetic representations,
 not by merely shortening `match` arms. The intended end state has one
-representation for plan origin, one explicit representation for row-generating
-expressions, one live source of truth for ordinary function semantics, and a
-smaller runtime API whose types state whether an operation queries, mutates, or
-invalidates cached schema.
+Spark-faithful plan-ID lookup path, one explicit representation for
+row-generating expressions, one live source of truth for ordinary function
+semantics, and a smaller runtime API whose types state whether an operation
+queries, mutates, or invalidates cached schema.
 
 This plan deliberately separates proven deletions from architectural bets. A
-prototype that adds machinery without removing more machinery does not advance.
-The current design remains in place whenever a proposed replacement does not
-produce a measured reduction in concepts, code, or invalid states.
+coexistence prototype may add temporary comparison machinery, but the migration
+does not advance until it deletes the old representation and produces a measured
+reduction in concepts, code, or invalid states.
 
 ## Authority and non-negotiable constraints
 
@@ -28,8 +28,8 @@ produce a measured reduction in concepts, code, or invalid states.
   an ADR amendment before production code changes.
 - τ remains the only production path under ADR-022. No fallback, dispatch flag,
   legacy transpiler, or runtime-owned semantic path may be introduced.
-- ADR-024's must-preserve outcomes remain intact: stable attribute identity,
-  source-qualifier lineage, exact ambiguity behavior, and emission-time binding.
+- ADR-024's attribute-identity outcomes and ADR-026's Spark Connect plan-ID
+  lookup contract remain intact.
 - Spark-invalid input remains a Spark-emulated error; Spark-valid but
   unsupported input remains an honest Thunderduck-boundary error.
 - DuckDB does not become the semantic oracle. Spark parity remains owned by τ
@@ -71,7 +71,7 @@ modules:
 
 | Concern | Current representation | Target representation |
 |---|---|---|
-| Spark plan identity | Partial raw-proto traversal plus join-only left/right ID vectors | Origin metadata carried by every plan node and consumed generically by analysis |
+| Spark plan identity | Partial raw-proto traversal plus join-only left/right ID vectors | Per-node IDs plus Catalyst-style top-down lookup and ancestor-output filtering |
 | Row generators | Reserved scalar-function names interpreted by parser, analyzer, inference, and emission | A structured generator node with explicit kind, arguments, aliases, outer semantics, and output |
 | Function semantics | Independent catalog, type, nullability, aggregate, emission, extension, and runtime-macro lists | One live `FunctionSpec` registry for ordinary cases; exhaustive special handlers for irreducible cases |
 | Analysis phase | Near-parallel `CommonOp`/`TypedOp` trees plus unresolved/resolved expression states | Keep the current split unless a small phase-typed prototype measurably removes duplication and invalid states |
@@ -206,59 +206,66 @@ Fix comments that currently contradict the code or the authoritative ADRs:
 - Production line count is net negative. If a replacement abstraction costs
   as much as the deleted code, split it out and evaluate it separately.
 
-## Phase 2 — make plan origin ordinary node metadata
+## Phase 2 — mirror Spark Connect plan-ID lookup
 
-### Current duplication
+### Starting duplication
 
-`CommonAst` carries only an operator even though it is the natural preservation
-boundary for relation metadata. The converter compensates with the deliberately
-partial `collect_relation_plan_ids` raw-proto traversal and stores
-`left_plan_ids` / `right_plan_ids` only on joins. Those vectors are threaded
-through both common and typed operators; the audit found roughly 125 references
-to each name and about 150 empty-vector initializers.
-
-This is not join semantics. It is source-origin metadata forced into a join
-special case because the common plan discarded it too early.
+At plan adoption, `CommonAst` discarded each relation's `plan_id`. Until Step 5,
+the converter also reconstructs selected descendant IDs with the partial
+`collect_relation_plan_ids` proto walk and stores whole-side `left_plan_ids` /
+`right_plan_ids` on joins. The vectors are threaded through both common and
+typed operators, erasing the plan-node depth and ancestor-output checks that
+participate in Spark resolution.
 
 ### Target invariant
 
-Every converted relation node preserves its own Spark plan ID, when present.
-Analysis derives the IDs visible from a child subtree through one generic
-metadata/scope path. Join resolution consumes its left and right child scopes;
-the join operator carries no special plan-ID vectors. No code walks selected
-raw proto variants merely to reconstruct metadata after conversion.
+Every Connect relation retains its own optional plan ID, and DataFrame expression
+conversion follows Spark's exact attribute/star/regex rules. A direct resolver
+searches the roots supplied by the owning analyzer rule—normally the operator's
+inputs—top-down, resolves at the matching node, and keeps the candidate only
+while its referenced `ExprId`s survive through each ancestor output. Join sides
+are tree positions, not stored ID sets. SparkSQL carries no ID, and no bottom-up
+plan-ID lineage is computed.
 
 ### Work
 
-1. Write the ADR-024 amendment or companion decision first. Preserve its
-   identity and qualifier outcomes; distinguish relation origin from attribute
-   `ExprId`.
-2. Prototype metadata on the smallest viable shape, initially
-   `CommonAst { op, plan_id: Option<i64> }`, plus the minimum typed metadata
-   needed for bottom-up scope construction. Do not commit to a collection type
-   until self-join and nested-plan witnesses establish what must be retained.
-3. Convert plan IDs at the same point each relation is converted. Missing IDs
-   remain explicit `None`, not a magic integer.
-4. Derive subtree bindings through the exhaustive child structure or the
-   already-computed child scopes.
-5. Rewrite join-condition resolution to use those generic child bindings.
-6. Delete `collect_relation_plan_ids`, `left_plan_ids`, `right_plan_ids`, and
-   all empty-vector plumbing.
+1. Adopt ADR-026 and treat Spark 4.1.1 source—not the current vectors—as the
+   semantic oracle.
+2. Add exact `plan_id: Option<i64>` metadata to `CommonAst` and `TypedAst` and
+   populate it at the outer relation-conversion boundary. Preserve every tagged
+   cosmetic boundary, using a transparent plan node when retaining the original
+   operator would add irrelevant semantics.
+3. Mirror Spark's attribute, DataFrame-star, and regex conversion branches;
+   never mint a sentinel for SparkSQL or conflate DataFrame lookup with the
+   separate subquery-plan substitution protocol.
+4. Implement a recursive `PlanIdResolver` matching Catalyst's node match,
+   stop-on-match, ancestor `ExprId` filtering, depth merge, `Union`, star, and
+   delayed missing-column rules.
+5. Supply the same roots used by the owning expression-resolution rule. Join
+   conditions search both children even when the join output retains only the
+   left side.
+6. After the witnesses pass, delete `collect_relation_plan_ids`,
+   `left_plan_ids`, `right_plan_ids`, their empty initializers, and obsolete
+   plan-ID scope ambiguity state.
 
 ### Witnesses
 
-- self-joins with duplicate column names and explicit plan IDs;
-- nested aliases and projections on each side of a join;
-- `USING`, natural, semi, and anti joins;
-- a missing-plan-ID case that must retain name/qualifier semantics;
-- ambiguity errors whose class and candidates must remain byte-for-byte stable.
+- unknown IDs versus matched nodes with missing or ancestor-filtered columns;
+- renamed, reordered, duplicated, computed, and passthrough projections;
+- current and ancestor IDs across `Union`, plus complete and filtered stars;
+- attribute/star/regex conversion and detached subquery-plan isolation;
+- sort/filter missing-column recovery versus a project boundary;
+- distinct- and same-ID self-joins, `USING`/natural, semi/anti, and set ops;
+- parser-originated trees with no IDs; and
+- exact `CANNOT_RESOLVE_DATAFRAME_COLUMN`, `AMBIGUOUS_COLUMN_REFERENCE`, and
+  eventual `UNRESOLVED_COLUMN` behavior.
 
 ### Go/no-go gate
 
-Proceed only if the prototype removes the partial proto traversal and both
-join-only vectors without replacing them with an equally special side table.
-The resulting metadata flow must be exhaustive by construction and net-delete
-production code.
+Proceed only if behavior matches Spark 4.1.1, every previously-green corpus
+case remains green, and the completed migration removes the proto collector and
+join vectors without replacing them with a propagated ID map. The final slice
+must be net-negative in production code.
 
 ## Phase 3 — replace synthetic generator calls with generator IR
 
@@ -559,7 +566,7 @@ Use this order unless a phase's evidence invalidates the next step:
 
 1. Phase 0 baseline and ADR map.
 2. Phase 1 proven deletions, typed interval replacement, and stale comments.
-3. Phase 2 plan-origin metadata.
+3. Phase 2 Spark Connect plan-ID lookup.
 4. Phase 5 runtime/service slices; these may proceed independently but must not
    share a change set with Phase 2.
 5. Phase 3 generator IR prototype and migration.
@@ -608,9 +615,9 @@ do not mark the slice complete.
 
 - τ remains the sole request path and retains all INV3/INV10 contamination
   barriers.
-- Plan IDs are preserved as ordinary node metadata; no join carries
-  `left_plan_ids` or `right_plan_ids`, and no partial raw-proto traversal exists
-  solely to collect them.
+- Plan IDs remain per-node tags resolved by top-down tree search and ancestor
+  `ExprId` filtering; no join carries `left_plan_ids` or `right_plan_ids`, and
+  no partial raw-proto traversal exists solely to collect them.
 - No generator is encoded through a reserved general-function name.
 - Catalog, classification, ordinary inference/nullability, ordinary emission,
   and extension validation consume one live function-spec source for migrated
@@ -687,7 +694,120 @@ service architecture change was mixed into this checkpoint.
 
 ### Next implementation checkpoint
 
-Stop here for review. Before Phase 2, refresh the baseline and write the
-plan-origin ADR amendment. Do not treat the remaining typed-interval or
+Stop here for review. Before Phase 2, refresh the baseline and adopt the
+relation-plan-ID ADR. Do not treat the remaining typed-interval or
 invariant candidates as safe deletion: each changes a represented contract and
 must be planned and witnessed independently.
+
+## Phase 2 decision checkpoint — 2026-08-09
+
+The approved safe-deletion checkpoint is commit `bff14bd`. A fresh baseline at
+that commit reproduced the expected state:
+
+- DataFrame corpus: 421 passed; the same seven documented reds
+  (`errcls-006`, `sqlwrap-001..005`, `prettyname-004`).
+- SQL corpus: 424 passed and two explicitly deferred/skipped cases.
+- Checked-in pass baseline: 829 cases, `REGRESSIONS: 0`; all 14 select-block
+  witnesses remain green.
+
+The 2026-08-10 Spark-source audit invalidated the draft bottom-up scope model.
+ADR-024 remains solely about τ's `ExprId`; its plan-ID draft is retired. ADR-026
+now records Spark's actual contract: plan IDs tag logical-plan nodes, Catalyst
+searches top-down, and resolved attribute references are filtered through every
+ancestor output.
+
+### Implementation gate
+
+The next slice may add per-node metadata and parity witnesses before deleting
+the current collector and vectors, but those structures are only a no-regression
+aid where they already agree with Spark. They are not a comparison oracle.
+
+The implementation must preserve distinct plan boundaries, including cosmetic
+relations currently collapsed by the converter. It must not flatten several
+IDs into one node or replace the join vectors with a bottom-up ID collection:
+both lose the tree position used by Spark's resolver.
+
+The Spark 4.1.1 witnesses must establish unknown-ID failure; rename, reorder,
+computed-column, and passthrough behavior; the column `Union` barrier; star
+all-or-nothing filtering; missing-column recovery through Sort/Filter; same-ID
+self-join ambiguity; and output filtering for USING, set, semi, and anti joins.
+If the direct resolver does not delete the collector, vectors, initializers, and
+their ambiguity bookkeeping for a net production-code reduction, stop and
+re-evaluate the migration.
+
+### Ordered implementation checklist
+
+Complete these steps strictly in order. A step is complete only after its
+targeted checks pass and an independent reviewer reports no unresolved
+correctness, parity, or architecture findings. Do not begin the next step while
+the preceding review is open.
+
+- [x] **Step 1 — make ancestor filtering identity-safe.** Amend ADR-024/026 and
+  add Spark-parity witnesses for every mint-versus-copy decision made observable
+  by plan-ID ancestor filtering. Correct rename, `ToDf`, touched `NaFill` and
+  `NaReplace` outputs, full-outer `USING`/natural keys, and
+  `unionByName(allowMissingColumns = true)` padding. Run focused unit tests and
+  the DataFrame corpus, then obtain an independent review.
+  Completed 2026-08-10: independent review approved; format, lint, 1,381
+  workspace tests, and SQL corpus passed. The DataFrame corpus retained its
+  exact seven-case baseline (421 passed) with no regression.
+- [x] **Step 2 — preserve exact relation-node identity.** Store
+  `plan_id: Option<i64>` on `CommonAst` and `TypedAst`, populate it once at the
+  outer Connect conversion boundary, keep SparkSQL nodes untagged, and retain
+  currently collapsed tagged cosmetic relations through one transparent unary
+  boundary. Run focused converter/analyzer tests and both corpora, then obtain
+  an independent review.
+  Completed 2026-08-10: independent review approved; format, lint, 1,389
+  workspace tests, and both focused metadata paths and SQL corpus passed. The
+  DataFrame corpus retained its exact seven-case baseline (421 passed) with no
+  regression.
+- [x] **Step 3 — mirror Connect expression conversion.** Match Spark 4.1.1 for
+  unresolved attributes, top-level Project DataFrame-star and true-regex
+  expansion, invalid target/plan-ID combinations, and metadata-column flags
+  without conflating `SubqueryExpression.plan_id`. Run focused
+  converter/analyzer tests and the DataFrame corpus, then obtain an independent
+  review. Side-qualified hidden
+  `USING`/natural keys and qualified stars remain an honest boundary: exact
+  support needs hidden donor outputs propagated through SQL wrappers, a
+  separate join-output feature. Until Step 4 installs exact tree lookup, a
+  known plan ID carried through a `USING`/natural join uses the same boundary
+  when its requested root is a merged key. Step 4 replaces that check with
+  tree/`ExprId` survival; Step 5 deletes the inert join-side vectors.
+  NamedTable `IDENTIFIER(...)` remains a
+  `ProtoShape` boundary rather than duplicating Spark's SQL string-literal
+  parser inside the Connect converter. DataFrame stars and true regexes nested
+  inside another expression likewise validate their Spark lookup/pattern
+  errors, then stop at an honest boundary until τ has a general 1:N child
+  expression rewrite; they must never degrade to an unqualified SQL `*`.
+  Plan-tagged columns inside opaque lambda bodies validate tree lookup, then
+  stop at `plan-tagged-column-in-lambda`; ordinary lambda variables stay
+  opaque.
+  Completed 2026-08-10: independent review approved; format, lint, and 1,471
+  workspace unit tests passed. The SQL corpus passed 424 cases with its two
+  declared skips, and the DataFrame corpus retained its exact seven-case
+  baseline (421 passed) with no regression.
+- [x] **Step 4 — install direct tree lookup.** Add a `PlanIdResolver` that
+  searches the roots supplied by each owning analyzer rule, stops below a
+  matching node, filters candidates through ancestor `ExprId` outputs, and
+  implements Spark's depth, ambiguity, `Union`, star, and missing-column rules.
+  Join conditions must search both children for every join type. Run focused
+  resolver tests and both corpora, then obtain an independent review.
+  Completed 2026-08-11: independent review approved the direct resolver,
+  delayed missing-column recovery, frozen `Deduplicate`/`NaDrop` inputs, and
+  the `Distinct`/`Deduplicate` split. Format and lint passed; Connect passed 161
+  tests and core passed 1,325 with five ignored. The SQL corpus passed 424
+  cases with two declared skips, and the DataFrame corpus retained its exact
+  seven-case baseline (421 passed) with no regression.
+- [x] **Step 5 — remove the superseded architecture.** Switch fully to the
+  direct resolver; delete `collect_relation_plan_ids`, join-side ID vectors,
+  plan-ID `RelScope` ranges/ambiguity state, empty initializers, obsolete tests,
+  and stale comments. Require a net production-line reduction and run the full
+  format, lint, unit, and differential gates before the final independent
+  review.
+  Completed 2026-08-11: independent review approved with no findings. Exact
+  SCIP queries report zero removed symbols and leave `PlanIdResolver` as the
+  sole lookup path. The eight affected Rust files fell from 49,357 to 48,856
+  lines. Format and lint passed; Connect passed 160 tests and core passed 1,323
+  with five ignored. The SQL corpus passed 424 cases with two declared skips,
+  and the DataFrame corpus retained its exact seven-case baseline (421 passed)
+  with no regression.

@@ -18,6 +18,7 @@ use super::expression::{
     BinaryExpression, BinaryOp, Expression, ExtractValueExpression, Literal, LiteralValue,
     StarExpression, UnresolvedColumn,
 };
+use super::identifier::Qualifier;
 use super::schema::ResolvedSchema;
 use crate::types::{DataType, StructField, StructType};
 
@@ -149,7 +150,7 @@ pub(crate) fn base_types_all_inputs() -> BaseTypes {
 
 fn table_scan(name: &str) -> CommonAst {
     CommonAst::new(CommonOp::TableScan {
-        table: name.to_owned(),
+        table: Qualifier::single(name),
     })
 }
 
@@ -165,8 +166,6 @@ fn table_scan_chain(names: &[&str]) -> CommonAst {
             using_columns: vec![],
             natural: false,
             lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
         })
     })
 }
@@ -367,8 +366,6 @@ fn left_outer_join_flips_right_nullability() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     // LEFT: left preserved, right flipped nullable.
     let expected = merge(&emp_schema(), &flip_all_nullable_struct(dept_schema()));
@@ -389,8 +386,6 @@ fn right_outer_join_flips_left_nullability() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let expected = merge(&flip_all_nullable_struct(emp_schema()), &dept_schema());
     (
@@ -410,8 +405,6 @@ fn full_outer_join_flips_both_sides() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let expected = merge(
         &flip_all_nullable_struct(emp_schema()),
@@ -431,9 +424,9 @@ fn nested_struct_field_access() -> Fixture {
     // structural (child + extraction), we can express it as two nested
     // ExtractValue expressions over `address`.
     let address_expr = Expression::UnresolvedColumn(UnresolvedColumn {
-        name: "address".to_owned(),
-        qualifier: None,
+        name_parts: vec!["address".to_owned()],
         plan_id: None,
+        is_metadata_column: false,
     });
     let geo_expr = Expression::ExtractValue(ExtractValueExpression {
         child: Box::new(address_expr),
@@ -463,32 +456,27 @@ fn nested_struct_field_access() -> Fixture {
 }
 
 fn plan_id_disambiguates_self_join() -> Fixture {
-    // `emp AS e1 JOIN emp AS e2 ON e1.id = e2.manager_id` — we use aliases
-    // so the join condition columns can be resolved to distinct sides via
-    // qualifier. Plan ids identify the two aliases.
     let cond = Expression::Binary(BinaryExpression {
         op: BinaryOp::Eq,
         left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "id".to_owned(),
-            qualifier: Some("e1".to_owned()),
+            name_parts: vec!["id".to_owned()],
             plan_id: Some(1),
+            is_metadata_column: false,
         })),
         right: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "manager_id".to_owned(),
-            qualifier: Some("e2".to_owned()),
+            name_parts: vec!["manager_id".to_owned()],
             plan_id: Some(2),
+            is_metadata_column: false,
         })),
     });
     let ast = CommonAst::new(CommonOp::Join {
-        left: Box::new(aliased_scan("emp", "e1")),
-        right: Box::new(aliased_scan("emp", "e2")),
+        left: Box::new(aliased_scan("emp", "e1").with_plan_id(1)),
+        right: Box::new(aliased_scan("emp", "e2").with_plan_id(2)),
         join_type: JoinType::Inner,
         condition: Some(cond),
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![1],
-        right_plan_ids: vec![2],
     });
     // Inner join over emp × emp: both sides preserve full schema.
     let expected = merge(&emp_schema(), &emp_schema());
@@ -503,7 +491,7 @@ fn plan_id_disambiguates_self_join() -> Fixture {
 fn star_expansion_in_project() -> Fixture {
     let ast = CommonAst::new(CommonOp::Project {
         input: Box::new(table_scan("dept")),
-        projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        projections: vec![Expression::Star(StarExpression::Unqualified)],
     });
     let expected = dept_schema();
     (
@@ -515,17 +503,12 @@ fn star_expansion_in_project() -> Fixture {
 }
 
 fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
-    // Reference `emp.id` with no plan_id — the analyzer must resolve via
-    // the qualifier (a struct-field lookup falls through to the top-level
-    // column if the qualifier matches an operand alias / column).
-    // τ's analyzer's `resolve_column` uses `qualified_column_type` which
-    // returns Long for `id` from `emp`.
     let ast = CommonAst::new(CommonOp::Project {
         input: Box::new(table_scan("emp")),
         projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "id".to_owned(),
-            qualifier: Some("emp".to_owned()),
+            name_parts: vec!["emp".to_owned(), "id".to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })],
     });
     let expected = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
@@ -537,19 +520,10 @@ fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
     )
 }
 
-//
-// `emp.dept_id` is nullable, `dept.dept_id` is non-null (see the schemas
-// above) — the SAME name on both sides of a join with DIFFERING
-// nullability/type is exactly the shape that defeats a name-only
-// first-match lookup over the flat merged schema. These fixtures pin
-// `QualifierScopes`/`collect_qualifier_bindings` resolving a relation-alias
-// qualifier to the CORRECT side's field, across every join kind and through
-// schema-verbatim passthroughs and join nesting.
-
 fn aliased_scan(table: &str, alias: &str) -> CommonAst {
     CommonAst::new(CommonOp::AliasedRelation {
         input: Box::new(CommonAst::new(CommonOp::TableScan {
-            table: table.to_owned(),
+            table: Qualifier::single(table),
         })),
         alias: alias.to_owned(),
     })
@@ -564,8 +538,6 @@ fn emp_e_dept_d_join(join_type: JoinType) -> CommonAst {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     })
 }
 
@@ -573,9 +545,9 @@ fn project_qualified_ref(input: CommonAst, qualifier: &str, name: &str) -> Commo
     CommonAst::new(CommonOp::Project {
         input: Box::new(input),
         projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-            name: name.to_owned(),
-            qualifier: Some(qualifier.to_owned()),
+            name_parts: vec![qualifier.to_owned(), name.to_owned()],
             plan_id: None,
+            is_metadata_column: false,
         })],
     })
 }
@@ -667,9 +639,12 @@ fn duplicate_name_wrong_type_binds_by_range() -> Fixture {
     let l_schema = StructType::new(vec![StructField::not_null("k", DataType::Integer)]);
     let r_schema = StructType::new(vec![StructField::not_null("k", DataType::Long)]);
     let bt = BaseTypes::from_entries(
-        [("l".to_owned(), l_schema), ("r".to_owned(), r_schema)]
-            .into_iter()
-            .collect(),
+        [
+            (Qualifier::single("l"), l_schema),
+            (Qualifier::single("r"), r_schema),
+        ]
+        .into_iter()
+        .collect(),
     );
     let join = CommonAst::new(CommonOp::Join {
         left: Box::new(aliased_scan("l", "lft")),
@@ -679,8 +654,6 @@ fn duplicate_name_wrong_type_binds_by_range() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let ast = project_qualified_ref(join, "rgt", "k");
     let expected = StructType::new(vec![StructField::not_null("k", DataType::Long)]);
@@ -727,8 +700,6 @@ fn nested_left_join_inner_join_ranges_beat_side_schemas() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let outer = CommonAst::new(CommonOp::Join {
         left: Box::new(aliased_scan("emp", "a")),
@@ -738,8 +709,6 @@ fn nested_left_join_inner_join_ranges_beat_side_schemas() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let ast = project_qualified_ref(outer, "c", "id");
     let expected = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
@@ -782,8 +751,6 @@ fn semi_join_child_sibling_offset_alignment() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let outer = CommonAst::new(CommonOp::Join {
         left: Box::new(semi),
@@ -793,8 +760,6 @@ fn semi_join_child_sibling_offset_alignment() -> Fixture {
         using_columns: vec![],
         natural: false,
         lateral: false,
-        left_plan_ids: vec![],
-        right_plan_ids: vec![],
     });
     let ast = project_qualified_ref(outer, "d2", "dept_id");
     let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);

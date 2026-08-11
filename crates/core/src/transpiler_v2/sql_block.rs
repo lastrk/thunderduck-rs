@@ -14,7 +14,7 @@
 //! check their analyzer-stamped qualifiers against (the emission-side
 //! counterpart of the analyzer's `RelScope`).
 
-use super::emission::quote_ident;
+use super::identifier::{quote_ident, Qualifier};
 
 /// Clause ordinals in SQL's logical evaluation order. An operator may merge
 /// into a block only "downstream" of everything already occupied:
@@ -72,11 +72,10 @@ impl SqlUnit {
 /// One item in a block's FROM clause.
 #[derive(Debug)]
 pub(crate) enum FromItem {
-    /// `FROM <base> [AS <alias>]` — a bare table. Names are stored RAW
-    /// (unquoted); rendering quotes them, scope matching compares them.
+    /// `FROM <base> [AS <alias>]` — a bare table.
     Relation {
-        /// Table name (raw).
-        base: String,
+        /// Parsed table name.
+        base: Qualifier,
         /// Optional user alias (raw).
         alias: Option<String>,
     },
@@ -105,8 +104,8 @@ pub(crate) enum FromItem {
     Raw {
         /// The FROM-body SQL.
         sql: String,
-        /// Alias names (raw) this body exposes.
-        exposed: Vec<String>,
+        /// Qualifiers this body exposes.
+        exposed: Vec<Qualifier>,
     },
 }
 
@@ -114,10 +113,10 @@ impl FromItem {
     fn to_sql(&self) -> String {
         match self {
             FromItem::Relation { base, alias } => {
-                let name = quote_ident(base);
+                let name = base.to_sql();
                 match alias {
                     Some(a) => format!("{name} AS {}", quote_ident(a)),
-                    None => name.into_owned(),
+                    None => name,
                 }
             }
             FromItem::Derived { unit, alias } => {
@@ -138,14 +137,16 @@ impl FromItem {
     }
 
     /// The alias names this item exposes to the enclosing block's clauses.
-    pub(crate) fn exposed(&self) -> Vec<String> {
+    pub(crate) fn exposed(&self) -> Vec<Qualifier> {
         match self {
             // An aliased relation is addressable ONLY by the alias; a bare
             // one by its table name.
             FromItem::Relation { base, alias } => {
-                vec![alias.clone().unwrap_or_else(|| base.clone())]
+                vec![alias
+                    .as_ref()
+                    .map_or_else(|| base.clone(), Qualifier::single)]
             }
-            FromItem::Derived { alias, .. } => vec![alias.clone()],
+            FromItem::Derived { alias, .. } => vec![Qualifier::single(alias)],
             FromItem::Join { left, right, .. } => {
                 let mut names = left.exposed();
                 names.extend(right.exposed());
@@ -256,7 +257,7 @@ impl SelectBlock {
     }
 
     /// Append `suffix` to FROM and expose `extra_aliases`.
-    pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<String>) {
+    pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<Qualifier>) {
         debug_assert_eq!(self.max_clause, Clause::From);
         let sql = format!("{}{suffix}", self.from.to_sql());
         let mut exposed = self.from.exposed();
@@ -330,7 +331,7 @@ impl SelectBlock {
             .join(", ");
         Self::from_item(FromItem::Raw {
             sql: format!("({}) AS {}({cols})", unit.to_sql(), quote_ident(WRAP_ALIAS)),
-            exposed: vec![WRAP_ALIAS.to_owned()],
+            exposed: vec![Qualifier::single(WRAP_ALIAS)],
         })
     }
 
@@ -340,14 +341,12 @@ impl SelectBlock {
         clause > self.max_clause || (clause == Clause::Where && self.max_clause == Clause::Where)
     }
 
-    /// Whether the block's FROM scope exposes `qualifier`
-    /// (ASCII case-insensitive) — the merge visibility precondition for any
-    /// analyzer-stamped qualified reference.
-    pub(crate) fn exposes(&self, qualifier: &str) -> bool {
+    /// Whether the block's FROM scope exposes `qualifier`.
+    pub(crate) fn exposes(&self, qualifier: &Qualifier) -> bool {
         self.from
             .exposed()
             .iter()
-            .any(|a| a.eq_ignore_ascii_case(qualifier))
+            .any(|exposed| exposed.matches_suffix(qualifier))
     }
 
     /// Is the SELECT list still free (renders `*`)?
@@ -496,10 +495,13 @@ impl SelectBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpiler_v2::parse_sql_multipart_identifier;
 
     fn scan(base: &str, alias: Option<&str>) -> SelectBlock {
         SelectBlock::from_item(FromItem::Relation {
-            base: base.to_owned(),
+            base: Qualifier::from_parts(
+                parse_sql_multipart_identifier(base).expect("valid test relation"),
+            ),
             alias: alias.map(str::to_owned),
         })
     }
@@ -508,6 +510,13 @@ mod tests {
     fn fresh_block_renders_select_star() {
         assert_eq!(scan("emp", None).to_sql(), "SELECT * FROM emp");
         assert_eq!(scan("emp", Some("e")).to_sql(), "SELECT * FROM emp AS e");
+    }
+
+    #[test]
+    fn relation_parts_and_literal_alias_render_distinctly() {
+        let block = scan("catalog.`a.b`", Some("x.y"));
+        assert_eq!(block.to_sql(), "SELECT * FROM catalog.\"a.b\" AS \"x.y\"");
+        assert!(scan("catalog.`a.b`", None).exposes(&Qualifier::single("a.b")));
     }
 
     #[test]
@@ -560,8 +569,8 @@ mod tests {
     fn wrap_uses_uniform_alias_and_scope() {
         let inner = scan("t", Some("x"));
         let b = SelectBlock::wrap(inner.into());
-        assert!(b.exposes("__td_sub"));
-        assert!(!b.exposes("x"));
+        assert!(b.exposes(&Qualifier::single("__td_sub")));
+        assert!(!b.exposes(&Qualifier::single("x")));
         assert_eq!(
             b.to_sql(),
             "SELECT * FROM (SELECT * FROM t AS x) AS __td_sub"
@@ -571,13 +580,13 @@ mod tests {
     #[test]
     fn scope_matching_is_case_insensitive_and_alias_shadows_base() {
         let aliased = scan("Emp", Some("E"));
-        assert!(aliased.exposes("e"));
+        assert!(aliased.exposes(&Qualifier::single("e")));
         assert!(
-            !aliased.exposes("emp"),
+            !aliased.exposes(&Qualifier::single("emp")),
             "alias replaces table name in SQL scope"
         );
         let bare = scan("Emp", None);
-        assert!(bare.exposes("emp"));
+        assert!(bare.exposes(&Qualifier::single("emp")));
     }
 
     #[test]

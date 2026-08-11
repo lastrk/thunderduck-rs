@@ -45,63 +45,15 @@ impl TypeInferenceEngine {
         Self::column_info(name, schema).1
     }
 
-    /// Look up the type of a qualified column reference in `schema`.
-    pub fn qualified_column_type(
-        name: &str,
-        qualifier: Option<&str>,
-        schema: &ResolvedSchema,
-    ) -> DataType {
-        Self::qualified_column_info(name, qualifier, schema).0
-    }
-
-    /// Look up the nullability of a qualified column reference in `schema`.
-    pub fn qualified_column_nullable(
-        name: &str,
-        qualifier: Option<&str>,
-        schema: &ResolvedSchema,
-    ) -> bool {
-        Self::qualified_column_info(name, qualifier, schema).1
-    }
-
-    /// Shared resolver behind [`Self::column_type`] / [`Self::column_nullable`]:
-    /// `(data_type, nullable)` of `name` in `schema`. Not found →
-    /// `(Unresolved, true)`. Thin wrapper over [`Self::column_info_in`] scoped
-    /// to the whole schema.
     fn column_info(name: &str, schema: &ResolvedSchema) -> (DataType, bool) {
         Self::column_info_in(name, &schema.fields).unwrap_or((DataType::Unresolved, true))
     }
 
-    /// Slice-scoped sibling of [`Self::column_info`]: look up `name`
-    /// case-insensitively within `fields` (rather than a whole [`StructType`]),
-    /// returning `None` when not found instead of the `(Unresolved, true)`
-    /// sentinel. Thin wrapper over [`Self::resolve_in`], discarding the
-    /// resolved attribute — callers that need it (an `ExprId` to stamp) call
-    /// `resolve_in` directly instead of re-walking `fields` a second time.
     pub(super) fn column_info_in(name: &str, fields: &[Attribute]) -> Option<(DataType, bool)> {
         Self::resolve_in(name, fields).map(|(dt, nullable, _)| (dt, nullable))
     }
 
-    /// THE single home of the name-lookup ORDER shared by every
-    /// [`super::analyzer`] resolver tier: exact case-insensitive name match
-    /// first, then (for a dotted `"struct.field"` path) the struct column
-    /// named by the first segment. Returns the matched attribute alongside
-    /// its `(data_type, nullable)` so callers that need identity (an
-    /// `ExprId` to stamp on a `ColumnReference`) get it from the SAME walk
-    /// that produced the type — no paired second lookup, no hand-maintained
-    /// re-basing when `fields` is a sub-slice of a larger schema (the
-    /// returned `&Attribute` borrows from the caller's own backing storage,
-    /// whatever range it was sliced from).
-    ///
-    /// Lets callers restrict a name-only lookup to a contiguous sub-range of
-    /// a merged join schema (the alias→field-range map built by
-    /// [`super::analyzer`]'s `QualifierScopes`). The dot-notation branch
-    /// supports exactly ONE level of struct-field nesting (no recursion) —
-    /// the qualified path ([`Self::qualified_column_info`] /
-    /// [`Self::struct_qualifier_info`]) is the one that recurses. Struct-field
-    /// nullability ORs in the parent column's nullability (a NULL struct makes
-    /// every field read NULL); in the dotted case the returned attribute is
-    /// the struct COLUMN, not the nested field (mirroring the pre-existing
-    /// `field_index` behavior this replaces).
+    /// Resolve a top-level name or one-level dotted struct path.
     pub(super) fn resolve_in<'a>(
         name: &str,
         fields: &'a [Attribute],
@@ -123,91 +75,6 @@ impl TypeInferenceEngine {
             }
         }
         None
-    }
-
-    /// Shared resolver behind [`Self::qualified_column_type`] /
-    /// [`Self::qualified_column_nullable`]. Tries `qualifier` as a struct
-    /// column first (with recursive nested-field resolution), then falls back
-    /// to the unqualified lookup. `pub(super)` so [`super::analyzer`]'s
-    /// `resolve_column` can call it once per fallback site instead of the
-    /// `qualified_column_type` + `qualified_column_nullable` pair (each of
-    /// which re-runs this same resolution end-to-end). Thin wrapper over
-    /// [`Self::qualified_resolve_in`], discarding the resolved attribute.
-    pub(super) fn qualified_column_info(
-        name: &str,
-        qualifier: Option<&str>,
-        schema: &ResolvedSchema,
-    ) -> (DataType, bool) {
-        let (dt, nullable, _) = Self::qualified_resolve_in(name, qualifier, schema);
-        (dt, nullable)
-    }
-
-    /// Identity-carrying sibling of [`Self::qualified_column_info`]: same
-    /// struct-precedence-then-fallback resolution, additionally surfacing the
-    /// resolved top-level [`Attribute`] (for its `ExprId`) when the
-    /// UNQUALIFIED fallback is the one that matched. `None` in the third slot
-    /// means either the name was not found at all, OR the struct-qualifier
-    /// arm matched — the resolved field then lives INSIDE a struct column,
-    /// not as its own top-level attribute, so there is no id to stamp
-    /// (matching `resolve_column` tier-(d)'s existing choice to stamp `None`
-    /// in that case).
-    pub(super) fn qualified_resolve_in<'a>(
-        name: &str,
-        qualifier: Option<&str>,
-        schema: &'a ResolvedSchema,
-    ) -> (DataType, bool, Option<&'a Attribute>) {
-        if let Some(q) = qualifier {
-            if let Some((dt, nullable)) = Self::struct_qualifier_info(name, q, schema) {
-                return (dt, nullable, None);
-            }
-        }
-        match Self::resolve_in(name, &schema.fields) {
-            Some((dt, nullable, attr)) => (dt, nullable, Some(attr)),
-            None => (DataType::Unresolved, true, None),
-        }
-    }
-
-    /// The struct-qualifier arm of [`Self::qualified_column_info`], extracted
-    /// so [`super::analyzer`]'s `resolve_column` can run it standalone: struct
-    /// precedence (a qualifier naming a top-level STRUCT column) must win over
-    /// relation-alias scope resolution. `None` means `qualifier` does not name
-    /// a struct column with a matching field — callers fall through to
-    /// alias-scope or legacy name-only resolution.
-    pub(super) fn struct_qualifier_info(
-        name: &str,
-        qualifier: &str,
-        schema: &ResolvedSchema,
-    ) -> Option<(DataType, bool)> {
-        let f = schema.field_by_name(qualifier)?;
-        if let DataType::Struct(st) = &f.data_type {
-            if let Some(ff) = st.field_by_name(name) {
-                return Some((ff.data_type.clone(), f.nullable || ff.nullable));
-            }
-            if let Some((dt, nullable)) = Self::resolve_nested_field(name, st) {
-                return Some((dt, f.nullable || nullable));
-            }
-        }
-        None
-    }
-
-    /// Recursively resolve a dotted `path` inside a struct, returning
-    /// `(data_type, nullable)`. Nullability ORs in every ancestor field's
-    /// nullability along the path.
-    fn resolve_nested_field(path: &str, st: &StructType) -> Option<(DataType, bool)> {
-        let dot_pos = path.find('.')?;
-        let head = &path[..dot_pos];
-        let tail = &path[dot_pos + 1..];
-        let field = st.field_by_name(head)?;
-        if let DataType::Struct(inner_st) = &field.data_type {
-            if let Some(ff) = inner_st.field_by_name(tail) {
-                Some((ff.data_type.clone(), field.nullable || ff.nullable))
-            } else {
-                let (dt, inner_nullable) = Self::resolve_nested_field(tail, inner_st)?;
-                Some((dt, field.nullable || inner_nullable))
-            }
-        } else {
-            None
-        }
     }
 
     /// Promote two numeric types following Spark's rules.

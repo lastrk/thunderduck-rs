@@ -120,21 +120,9 @@ fn configure_s3_credential_chain(conn: &duckdb::Connection, enabled: Option<Stri
 }
 
 pub(crate) enum SessionCommand {
-    Execute {
+    Query {
         sql: String,
-        resp: oneshot::Sender<SessionResult>,
-    },
-    CreateView {
-        name: String,
-        sql: String,
-        resp: oneshot::Sender<SessionResult>,
-    },
-    /// Create a temp view and cache the Spark-declared schema.
-    CreateViewWithSchema {
-        name: String,
-        sql: String,
-        schema: StructType,
-        resp: oneshot::Sender<SessionResult>,
+        resp: oneshot::Sender<Result<Vec<RecordBatch>>>,
     },
     /// Retrieve a cached Spark schema for a temp view.
     GetViewSchema {
@@ -142,16 +130,14 @@ pub(crate) enum SessionCommand {
         resp: oneshot::Sender<Option<StructType>>,
     },
     /// Execute a query and stream results batch-by-batch via an mpsc channel.
-    ExecuteStreaming {
+    QueryStreaming {
         sql: String,
         batch_tx: mpsc::Sender<StreamBatch>,
     },
-    /// Execute a DDL/DML statement and apply a schema-cache side effect
-    /// atomically on success.
-    ExecuteDdl {
+    ExecuteBatch {
         sql: String,
-        effect: SchemaCacheEffect,
-        resp: oneshot::Sender<SessionResult>,
+        effect: Option<SchemaCacheEffect>,
+        resp: oneshot::Sender<Result<()>>,
     },
     Shutdown,
 }
@@ -173,14 +159,22 @@ pub enum SchemaCacheEffect {
     CacheIfAbsent { name: String, schema: StructType },
     /// Evict the cached schema for the given name.
     Evict { name: String },
-    /// No schema-cache side effect.
-    None,
 }
 
-pub(crate) enum SessionResult {
-    Batches(Vec<RecordBatch>),
-    Ok,
-    Error(ThunderduckError),
+impl SchemaCacheEffect {
+    fn apply(self, schemas: &mut HashMap<String, StructType>) {
+        match self {
+            Self::Cache { name, schema } => {
+                schemas.insert(name.to_lowercase(), schema);
+            }
+            Self::CacheIfAbsent { name, schema } => {
+                schemas.entry(name.to_lowercase()).or_insert(schema);
+            }
+            Self::Evict { name } => {
+                schemas.remove(&name.to_lowercase());
+            }
+        }
+    }
 }
 
 /// DuckDB scalar UDF that drops object keys whose value is JSON `null`,
@@ -693,84 +687,57 @@ CREATE OR REPLACE MACRO next_day(d, day_name) AS
 ";
 
 impl DuckDbSession {
-    /// Execute a SQL statement and collect all result Arrow batches.
-    pub async fn execute(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    async fn request<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<Result<T>>) -> SessionCommand,
+    ) -> Result<T> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(SessionCommand::Execute {
-                sql: sql.to_string(),
-                resp: resp_tx,
-            })
+            .send(command(resp_tx))
             .await
             .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
-
-        match resp_rx
+        resp_rx
             .await
             .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
-        {
-            SessionResult::Batches(batches) => Ok(batches),
-            SessionResult::Ok => Ok(vec![]),
-            // ADR-006: re-clothe a DuckDB engine throw carrying a τ-emitted
-            // Spark error-class token as a Spark-emulated runtime error.
-            SessionResult::Error(e) => Err(e.reclassified_spark_runtime()),
-        }
     }
 
-    /// Register a temporary view in this session.
-    ///
-    /// The view is created as `CREATE OR REPLACE TEMP VIEW <name> AS <sql>`.
-    pub async fn create_temp_view(&self, name: &str, sql: &str) -> Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::CreateView {
-                name: name.to_string(),
-                sql: sql.to_string(),
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
-
-        match resp_rx
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
-        {
-            SessionResult::Ok => Ok(()),
-            SessionResult::Error(e) => Err(e),
-            SessionResult::Batches(_) => {
-                unreachable!("CreateView never returns batches")
-            }
-        }
+    /// Run a query and collect its Arrow batches.
+    pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        self.request(|resp| SessionCommand::Query {
+            sql: sql.to_owned(),
+            resp,
+        })
+        .await
+        .map_err(ThunderduckError::reclassified_spark_runtime)
     }
 
-    /// Create a temp view and cache its Spark-declared schema.
-    ///
-    /// The cached schema preserves nullable flags from the original
-    /// `createDataFrame(data, schema)` call, which DuckDB's `CREATE VIEW` loses.
-    pub async fn create_temp_view_with_schema(
+    /// Execute DDL or DML and apply an optional cache effect on success.
+    pub async fn execute_batch(&self, sql: &str, effect: Option<SchemaCacheEffect>) -> Result<()> {
+        self.request(|resp| SessionCommand::ExecuteBatch {
+            sql: sql.to_owned(),
+            effect,
+            resp,
+        })
+        .await
+        .map_err(ThunderduckError::reclassified_spark_runtime)
+    }
+
+    /// Register a temporary view and optionally retain its Spark schema.
+    pub async fn create_temp_view(
         &self,
         name: &str,
         sql: &str,
-        schema: StructType,
+        schema: Option<StructType>,
     ) -> Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::CreateViewWithSchema {
-                name: name.to_string(),
-                sql: sql.to_string(),
-                schema,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
-
-        match resp_rx
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
-        {
-            SessionResult::Ok => Ok(()),
-            SessionResult::Error(e) => Err(e),
-            _ => unreachable!("CreateViewWithSchema never returns batches"),
-        }
+        let ddl = format!(
+            "CREATE OR REPLACE TEMP VIEW \"{}\" AS {sql}",
+            name.replace('"', "\"\"")
+        );
+        let effect = schema.map(|schema| SchemaCacheEffect::Cache {
+            name: name.to_owned(),
+            schema,
+        });
+        self.execute_batch(&ddl, effect).await
     }
 
     /// Execute a SQL query, streaming results batch-by-batch.
@@ -778,46 +745,20 @@ impl DuckDbSession {
     /// Returns a receiver that yields `StreamBatch` items. The session thread
     /// iterates DuckDB's Arrow result lazily. Backpressure is achieved via the
     /// bounded channel: the session thread blocks when the buffer is full.
-    pub async fn execute_streaming(
+    pub async fn query_streaming(
         &self,
         sql: &str,
         buffer: usize,
     ) -> Result<mpsc::Receiver<StreamBatch>> {
         let (tx, rx) = mpsc::channel(buffer);
         self.cmd_tx
-            .send(SessionCommand::ExecuteStreaming {
-                sql: sql.to_string(),
+            .send(SessionCommand::QueryStreaming {
+                sql: sql.to_owned(),
                 batch_tx: tx,
             })
             .await
             .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
         Ok(rx)
-    }
-
-    /// Execute a DDL/DML statement and apply a schema-cache side effect
-    /// atomically on success.
-    ///
-    /// The `effect` is applied to the session's view-schema cache only when
-    /// the statement executes successfully; on error the cache is untouched.
-    pub async fn execute_ddl(&self, sql: &str, effect: SchemaCacheEffect) -> Result<()> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCommand::ExecuteDdl {
-                sql: sql.to_string(),
-                effect,
-                resp: resp_tx,
-            })
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
-
-        match resp_rx
-            .await
-            .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
-        {
-            SessionResult::Ok => Ok(()),
-            SessionResult::Error(e) => Err(e),
-            _ => unreachable!("ExecuteDdl never returns batches"),
-        }
     }
 
     /// Retrieve the cached Spark schema for a temp view.
@@ -849,81 +790,25 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
 
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            SessionCommand::Execute { sql, resp } => {
-                let result = run_query(&conn, &sql);
-                let msg = match result {
-                    Ok(batches) => SessionResult::Batches(batches),
-                    Err(e) => SessionResult::Error(e),
-                };
-                let _ = resp.send(msg);
+            SessionCommand::Query { sql, resp } => {
+                let _ = resp.send(collect_query(&conn, &sql));
             }
-            SessionCommand::CreateView { name, sql, resp } => {
-                let ddl = format!(
-                    "CREATE OR REPLACE TEMP VIEW \"{}\" AS {}",
-                    name.replace('"', "\"\""),
-                    sql
-                );
-                let result = conn
-                    .execute_batch(&ddl)
-                    .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
-                let msg = match result {
-                    Ok(()) => SessionResult::Ok,
-                    Err(e) => SessionResult::Error(e),
-                };
-                let _ = resp.send(msg);
-            }
-            SessionCommand::CreateViewWithSchema {
-                name,
-                sql,
-                schema,
-                resp,
-            } => {
-                let ddl = format!(
-                    "CREATE OR REPLACE TEMP VIEW \"{}\" AS {}",
-                    name.replace('"', "\"\""),
-                    sql
-                );
-                let result = conn
-                    .execute_batch(&ddl)
-                    .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
-                let msg = match result {
-                    Ok(()) => {
-                        view_schemas.insert(name.to_lowercase(), schema);
-                        SessionResult::Ok
-                    }
-                    Err(e) => SessionResult::Error(e),
-                };
-                let _ = resp.send(msg);
-            }
-            SessionCommand::ExecuteDdl { sql, effect, resp } => {
+            SessionCommand::ExecuteBatch { sql, effect, resp } => {
                 let result = conn
                     .execute_batch(&sql)
                     .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
-                let msg = match result {
-                    Ok(()) => {
-                        match effect {
-                            SchemaCacheEffect::Cache { name, schema } => {
-                                view_schemas.insert(name.to_lowercase(), schema);
-                            }
-                            SchemaCacheEffect::CacheIfAbsent { name, schema } => {
-                                view_schemas.entry(name.to_lowercase()).or_insert(schema);
-                            }
-                            SchemaCacheEffect::Evict { name } => {
-                                view_schemas.remove(&name.to_lowercase());
-                            }
-                            SchemaCacheEffect::None => {}
-                        }
-                        SessionResult::Ok
+                if result.is_ok() {
+                    if let Some(effect) = effect {
+                        effect.apply(&mut view_schemas);
                     }
-                    Err(e) => SessionResult::Error(e),
-                };
-                let _ = resp.send(msg);
+                }
+                let _ = resp.send(result);
             }
             SessionCommand::GetViewSchema { name, resp } => {
                 let schema = view_schemas.get(&name.to_lowercase()).cloned();
                 let _ = resp.send(schema);
             }
-            SessionCommand::ExecuteStreaming { sql, batch_tx } => {
+            SessionCommand::QueryStreaming { sql, batch_tx } => {
                 let result = (|| -> std::result::Result<(), duckdb::Error> {
                     let mut stmt = conn.prepare(&sql)?;
                     let arrow = stmt.query_arrow(duckdb::params![])?;
@@ -966,40 +851,19 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
     // conn drops here — DuckDB connection closed.
 }
 
-/// Run a SQL string against `conn` and return collected Arrow batches.
-///
-/// SELECT / WITH / VALUES → `query_arrow`
-/// DDL / DML             → `execute_batch` (returns empty batch list)
-fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
-    let trimmed = sql.trim_start();
-    let is_query = trimmed.starts_with('(')
-        || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
-        || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("WITH"))
-        || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("VALUES"))
-        || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("FROM"))
-        || (trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("UNPIVOT"));
-
-    if is_query {
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
-        let arrow_stream = stmt
-            .query_arrow(duckdb::params![])
-            .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
-        // Save schema before consuming the stream; needed when there are 0 rows.
-        let schema = arrow_stream.get_schema();
-        let batches: Vec<RecordBatch> = arrow_stream.collect();
-        if batches.is_empty() {
-            // Return a schema-only empty batch so PySpark can build a table from
-            // the schema even when 0 rows are returned.
-            Ok(vec![RecordBatch::new_empty(schema)])
-        } else {
-            Ok(batches)
-        }
+fn collect_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
+    let arrow_stream = stmt
+        .query_arrow(duckdb::params![])
+        .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
+    let schema = arrow_stream.get_schema();
+    let batches: Vec<RecordBatch> = arrow_stream.collect();
+    if batches.is_empty() {
+        Ok(vec![RecordBatch::new_empty(schema)])
     } else {
-        conn.execute_batch(sql)
-            .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
-        Ok(vec![])
+        Ok(batches)
     }
 }
 
@@ -1024,10 +888,42 @@ mod tests {
                  WHERE function_name = '{}') THEN 1 ELSE error('missing session target') END",
                 target.as_str()
             );
-            session.execute(&sql).await.unwrap_or_else(|error| {
+            session.query(&sql).await.unwrap_or_else(|error| {
                 panic!("missing session target `{}`: {error}", target.as_str())
             });
         }
+    }
+
+    #[tokio::test]
+    async fn session_requests_carry_query_or_command_intent() {
+        let session = DuckDbSession::spawn("explicit-request-intent").expect("spawn session");
+        session
+            .execute_batch("CREATE TABLE intent_probe (id INTEGER)", None)
+            .await
+            .expect("command request");
+        let batches = session
+            .query("DESCRIBE intent_probe")
+            .await
+            .expect("query request");
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_batch_does_not_apply_cache_effect() {
+        let session = DuckDbSession::spawn("failed-cache-effect").expect("spawn session");
+        let schema = StructType::new(vec![StructField::nullable("id", DataType::Integer)]);
+        let result = session
+            .execute_batch(
+                "NOT VALID SQL",
+                Some(SchemaCacheEffect::Cache {
+                    name: "ghost".to_owned(),
+                    schema,
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(session.get_view_schema("ghost").await, None);
     }
 
     /// Open a plain in-memory DuckDB connection and register the CRC-32
@@ -1093,7 +989,7 @@ mod tests {
         // Two rows; the `a = 0` row triggers error() mid-stream.
         let sql = "SELECT CASE WHEN a = 0 THEN error('[DIVIDE_BY_ZERO] boom') ELSE a END \
                    FROM (VALUES (1), (0)) t(a)";
-        let err = super::run_query(&conn, sql)
+        let err = super::collect_query(&conn, sql)
             .expect_err("row-dependent error() must surface as Err, not be swallowed");
         assert!(
             err.to_string().contains("DIVIDE_BY_ZERO"),
@@ -1357,37 +1253,15 @@ mod tests {
     use super::SchemaCacheEffect;
     use crate::types::{DataType, StructField, StructType};
 
-    /// Apply a `SchemaCacheEffect` to a HashMap, mirroring the session
-    /// thread's logic.
-    fn apply_effect(
-        cache: &mut std::collections::HashMap<String, StructType>,
-        effect: SchemaCacheEffect,
-    ) {
-        match effect {
-            SchemaCacheEffect::Cache { name, schema } => {
-                cache.insert(name.to_lowercase(), schema);
-            }
-            SchemaCacheEffect::CacheIfAbsent { name, schema } => {
-                cache.entry(name.to_lowercase()).or_insert(schema);
-            }
-            SchemaCacheEffect::Evict { name } => {
-                cache.remove(&name.to_lowercase());
-            }
-            SchemaCacheEffect::None => {}
-        }
-    }
-
     #[test]
     fn cache_effect_inserts_schema() {
         let mut cache = std::collections::HashMap::new();
         let schema = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
-        apply_effect(
-            &mut cache,
-            SchemaCacheEffect::Cache {
-                name: "t".to_owned(),
-                schema: schema.clone(),
-            },
-        );
+        SchemaCacheEffect::Cache {
+            name: "t".to_owned(),
+            schema: schema.clone(),
+        }
+        .apply(&mut cache);
         assert_eq!(cache.get("t"), Some(&schema));
     }
 
@@ -1398,22 +1272,18 @@ mod tests {
         let redeclared = StructType::new(vec![StructField::nullable("b", DataType::String)]);
 
         // Simulate: CREATE TABLE t (a INT)
-        apply_effect(
-            &mut cache,
-            SchemaCacheEffect::Cache {
-                name: "t".to_owned(),
-                schema: original.clone(),
-            },
-        );
+        SchemaCacheEffect::Cache {
+            name: "t".to_owned(),
+            schema: original.clone(),
+        }
+        .apply(&mut cache);
 
         // Simulate: CREATE TABLE IF NOT EXISTS t (b VARCHAR)
-        apply_effect(
-            &mut cache,
-            SchemaCacheEffect::CacheIfAbsent {
-                name: "t".to_owned(),
-                schema: redeclared,
-            },
-        );
+        SchemaCacheEffect::CacheIfAbsent {
+            name: "t".to_owned(),
+            schema: redeclared,
+        }
+        .apply(&mut cache);
 
         // Cache must still hold the original schema, not the redeclaration.
         let cached = cache.get("t").expect("schema must be cached");
@@ -1427,13 +1297,11 @@ mod tests {
         let mut cache = std::collections::HashMap::new();
         let schema = StructType::new(vec![StructField::nullable("x", DataType::Long)]);
 
-        apply_effect(
-            &mut cache,
-            SchemaCacheEffect::CacheIfAbsent {
-                name: "t".to_owned(),
-                schema: schema.clone(),
-            },
-        );
+        SchemaCacheEffect::CacheIfAbsent {
+            name: "t".to_owned(),
+            schema: schema.clone(),
+        }
+        .apply(&mut cache);
 
         assert_eq!(cache.get("t"), Some(&schema));
     }
@@ -1444,12 +1312,10 @@ mod tests {
         let schema = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
         cache.insert("t".to_owned(), schema);
 
-        apply_effect(
-            &mut cache,
-            SchemaCacheEffect::Evict {
-                name: "t".to_owned(),
-            },
-        );
+        SchemaCacheEffect::Evict {
+            name: "t".to_owned(),
+        }
+        .apply(&mut cache);
 
         assert!(!cache.contains_key("t"));
     }

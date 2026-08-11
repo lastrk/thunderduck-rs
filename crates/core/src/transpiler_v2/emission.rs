@@ -1719,7 +1719,7 @@ fn build_local_relation(
 ///
 /// This is the shared core between [`render_file_scan`] (which wraps it in
 /// `SELECT * FROM ...`) and the schema-less Parquet discovery path in
-/// `connect-server`'s `resolve_implicit_pivots` (which wraps it in
+/// `connect-server`'s `resolve_runtime_shapes` (which wraps it in
 /// `SELECT * FROM ... LIMIT 0`).
 pub fn build_file_reader_sql(
     format: FileFormat,

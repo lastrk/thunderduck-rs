@@ -28,3 +28,18 @@ spec:
             platform:
               - linux/amd64
               - linux/arm64
+            # Registry-backed BuildKit layer cache, separate from the release
+            # tags above. `mode: max` exports every intermediate layer (not
+            # just the final image), so the deps-only layer in the Dockerfile
+            # (which compiles DuckDB from source) survives across pushes
+            # instead of recompiling it every time — this is what actually
+            # fixes the ~2h timeout, since each buildkit run here starts from
+            # a fresh daemonless builder with no local cache of its own.
+            cache:
+              import:
+                - type: registry
+                  ref: 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:buildcache
+              export:
+                - type: registry
+                  ref: 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:buildcache
+                  mode: max

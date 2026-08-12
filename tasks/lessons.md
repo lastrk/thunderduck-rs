@@ -13,6 +13,8 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
 ## Workflow shape
 
+- **Keep project communication rules in both agent instruction files.** The user requested ASD-STE100 Simplified Technical English for user communication and project text (2026-08-12). Rule: add shared communication requirements to both root `AGENTS.md` and `CLAUDE.md`; preserve exact technical identifiers and required quotations.
+
 - **A closed route must remain closed at every consumer.** The Phase-4 function-registry
   cleanup initially added `FunctionImplementation::Special`, but inference, nullability,
   and emission still selected handlers with open string matches and a native fallback.

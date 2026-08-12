@@ -1,6 +1,6 @@
 # v2 Restart — Open Architectural Decisions
 
-**Purpose.** Decisions that are load-bearing for parallel-track execution of the v2 restart but were **not covered** by `docs/thunderduck-rearchitect-ADRs.md` at the time of the /goal template's landing. Each entry names the decision, why the ADRs were silent on it, what would happen if it stayed undecided, and the options with their trade-offs. Once a decision closes, the corresponding ADR is amended (or a new one added) and the entry here is stamped **RESOLVED**.
+**Purpose.** Decisions that are load-bearing for parallel-track execution of the v2 restart but were **not covered** by the architecture ADRs at the time of the /goal template's landing. Each entry names the decision, why the ADRs were silent on it, what would happen if it stayed undecided, and the options with their trade-offs. Once a decision closes, the corresponding ADR is amended (or a new one added) and the entry here is stamped **RESOLVED**.
 
 **Status as of 2026-07-02:** all twelve decisions RESOLVED (user directive, 2026-07-02). See the summary table below and the per-decision resolution notes. **ADR-022** was drafted to consolidate the largest cluster of resolutions (no runtime fallback; legacy is superseded; two error categories; INV7 deletion). Other resolutions are absorbed by amendments to existing ADRs (see per-decision entries) or are project-level scheduling decisions not requiring ADR text.
 
@@ -239,7 +239,7 @@ With INV7 deleted (Decision 4), the two front-ends do not need to produce struct
 
 ## What changes as a consequence of these resolutions
 
-**In the ADRs file (`docs/thunderduck-rearchitect-ADRs.md`):**
+**In the architecture ADRs (`docs/adrs/README.md`):**
 - **ADR-022 added** — supersedes ADR-002's post-Slice-C fallback refinement; amends ADR-021; deletes INV7; reframes LB9; retires INV10 at legacy deletion. Covers Decisions 3, 4, 9, 11.
 - **INV7 marked DELETED** in CV.5 with pointer to ADR-022. Covers Decisions 4, 12.
 - **LB9 reframed** in CV.4 — "one implementation validated by ADR-015" replaces "two implementations validated by ADR-015."

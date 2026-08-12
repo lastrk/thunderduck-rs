@@ -8,7 +8,7 @@
 
 Thunderduck is a single-node [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html) server backed by DuckDB. It translates supported Spark DataFrame and Spark SQL plans into DuckDB SQL, then returns Arrow results over the Spark Connect protocol.
 
-It is not a complete Apache Spark replacement: it has no distributed execution or Structured Streaming, and many catalog, administration, extension, ML, Pandas, and persistence APIs remain outside its supported surface. The authoritative compatibility contract is the [rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md). The intended behavior for a Spark-valid but unsupported input is an explicit Thunderduck boundary; the [Spark parity report](SPARK_PARITY_REPORT.md) records the current supported surface and known gaps in that contract.
+It is not a complete Apache Spark replacement: it has no distributed execution or Structured Streaming, and many catalog, administration, extension, ML, Pandas, and persistence APIs remain outside its supported surface. The authoritative compatibility contract is indexed in the [architecture decisions](docs/adrs/README.md). The intended behavior for a Spark-valid but unsupported input is an explicit Thunderduck boundary; the [Spark parity report](SPARK_PARITY_REPORT.md) records the current supported surface and known gaps in that contract.
 
 ## What works today
 
@@ -95,7 +95,7 @@ Spark SQL text ─────────┘                                   
 - `crates/core/src/runtime/` owns each DuckDB connection on its dedicated session thread.
 - `crates/connect-server/` implements the tonic Spark Connect service and Arrow wire bridge.
 
-The concise architecture reference is [docs/context/architecture.md](docs/context/architecture.md). The [rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md) are authoritative when documentation disagrees.
+The concise architecture reference is [docs/context/architecture.md](docs/context/architecture.md). The [individual architecture decisions](docs/adrs/README.md) are authoritative when documentation disagrees.
 
 ### Spark compatibility extension
 
@@ -133,7 +133,7 @@ See [docs/context/testing.md](docs/context/testing.md) for live-oracle recording
 
 ## License
 
-This project is licensed under Apache License 2.0. See [LICENSE](LICENSE).
+This project is licensed under Apache License 2.0.
 
 ## Acknowledgments
 

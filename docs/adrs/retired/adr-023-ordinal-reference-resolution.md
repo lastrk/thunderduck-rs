@@ -1,9 +1,9 @@
 # ADR-023 — Resolve references to qualifier lineage and ordinals
 
 > **Retired 2026-08-10. Do not use this ADR as implementation guidance.**
-> [ADR-024](../../thunderduck-rearchitect-ADRs.md#adr-024--τ-stores-attribute-identity-in-the-resolved-schema-references-bind-to-attributes-not-positions)
+> [ADR-024](../adr-024-resolved-attribute-identity.md)
 > replaced its attribute-binding representation, and
-> [ADR-026](../../thunderduck-rearchitect-ADRs.md#adr-026--τ-mirrors-spark-connects-plan_id-tree-lookup)
+> [ADR-026](../adr-026-connect-plan-id-lookup.md)
 > replaced its plan-ID clauses. The text below is retained only as design history.
 
 **Former status:** Proposed; partially implemented before supersession

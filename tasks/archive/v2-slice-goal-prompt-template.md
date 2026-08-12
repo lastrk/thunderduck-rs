@@ -28,7 +28,7 @@ Required sections:
 
 - **§Targets** — Comma-separated corpus case IDs that must be green on `core_v2` at termination. Example: `type-011, type-019, type-020, join-001, join-002, ..., join-014, chain-001, chain-003, chain-005, chain-006` for Slice E. Must match the pytest `-k` filter format so it can be dropped into the termination-verification command verbatim.
 
-- **§ADRs** — ADR IDs the slice implements. Example for Slice A: `ADR-003 (common AST), ADR-004 (protobuf-boundary dispatch), ADR-021 (substrate independence)`. Cross-references `docs/thunderduck-rearchitect-ADRs.md`.
+- **§ADRs** — ADR IDs the slice implements. Example for Slice A: `ADR-003 (common AST), ADR-004 (protobuf-boundary dispatch), ADR-021 (substrate independence)`. Cross-references `docs/adrs/README.md`.
 
 - **§Inheritance-checklist sections** — Which sections of `tasks/v2-restart-inheritance-checklist.md` the slice's arms/types must present on day 1. Example for Slice A: `§1.1-1.3 (analyzer symmetric-omissions), §2.1-2.3 (V2RelationConverter discipline), §5.5-5.6 (design patterns: plan_has_empty_scan short-circuit, quote_ident fast path)`.
 
@@ -49,7 +49,7 @@ Required sections:
 **Slice scope:** `tasks/v2-slice-<SLICE_ID>-scope.md` — target case IDs, applicable ADRs, inheritance-checklist sections, sub-slice sketch.
 **Methodology:** `tasks/v2-slice-iteration-methodology.md`.
 **Readiness map:** `tasks/v2-adr-readiness-map.md` §Slice <SLICE_ID>.
-**Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000 → ADR-022). **ADR-022** (2026-07-02) is load-bearing: v2 is the only production path, legacy is superseded (reference source only, deletable at any point), no runtime fallback, two error categories (Spark-emulated vs Thunderduck-boundary).
+**Design authority:** `docs/adrs/README.md` (ADR-000 → ADR-022). **ADR-022** (2026-07-02) is load-bearing: v2 is the only production path, legacy is superseded (reference source only, deletable at any point), no runtime fallback, two error categories (Spark-emulated vs Thunderduck-boundary).
 **Inheritance discipline:** `tasks/v2-restart-inheritance-checklist.md` — Pass 1's architect plan MUST cite the applicable sections; reviewer verifies presence.
 **Open-decisions record:** `tasks/v2-restart-open-decisions.md` — twelve decisions RESOLVED as of 2026-07-02; new parallel-track blockers append here as Decision 13+.
 **Iteration log:** `tasks/v2-slice-<SLICE_ID>-iteration-log.md` (create at Pass 1; append each pass's verdict + delta + lessons).

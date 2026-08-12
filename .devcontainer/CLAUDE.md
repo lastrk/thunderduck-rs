@@ -96,8 +96,8 @@ The image ships with **no** MCP servers preinstalled. Instead, the package manag
 After installing a server, register it by adding an `mcpServers.<name>` entry to `~/.claude.json`, then restart `claude` for it to be picked up.
 
 For Rust navigation, this repository provides the worktree-safe
-`.agents/skills/scip-nav` skill. Use it with built-in tools such as `rg`; no
-additional code-exploration service needs to be installed or registered.
+`.agents/skills/scip-nav` skill. Use it with shell tools such as `rg` (install via
+`pkgx install ripgrep` if needed); no additional code-exploration service needs to be installed or registered.
 
 **Verifying a server is registered**:
 ```bash

@@ -95,28 +95,9 @@ The image ships with **no** MCP servers preinstalled. Instead, the package manag
 
 After installing a server, register it by adding an `mcpServers.<name>` entry to `~/.claude.json`, then restart `claude` for it to be picked up.
 
-**Recipe — codegraph** ([repo](https://github.com/colbymchenry/codegraph)) — Tree-sitter + SQLite code knowledge graph:
-```bash
-npm install -g @colbymchenry/codegraph
-# Native better-sqlite3 compiles at install time using build-essential / python3 / make
-# (all preinstalled in the image).
-codegraph --version
-# Then add to ~/.claude.json under mcpServers:
-#   "codegraph": { "type": "stdio", "command": "codegraph", "args": ["serve", "--mcp"] }
-# First-time project setup:
-cd /workspace && codegraph init -i && codegraph index
-# Verify native backend (should print Backend: native, not wasm):
-codegraph status
-```
-
-**Recipe — semble** ([repo](https://github.com/MinishLab/semble)) — fast semantic + BM25 code search:
-```bash
-uv tool install 'semble[mcp]'
-semble --version
-# Then add to ~/.claude.json under mcpServers:
-#   "semble": { "type": "stdio", "command": "semble", "args": [] }
-# Indexing happens on demand on first query.
-```
+For Rust navigation, this repository provides the worktree-safe
+`.agents/skills/scip-nav` skill. Use it with shell tools such as `rg` (install via
+`pkgx install ripgrep` if needed); no additional code-exploration service needs to be installed or registered.
 
 **Verifying a server is registered**:
 ```bash
@@ -566,4 +547,3 @@ The project has documentation in multiple locations:
 3. **.devcontainer/CLAUDE.md** (generated): Copy of this file, embedded in installer, appears in user's projects
 
 When updating documentation, remember that CLAUDE.md gets embedded in the installer and distributed to users.
-

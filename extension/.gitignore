@@ -4,10 +4,9 @@ build/
 # Test temp files
 duckdb_unittest_tempdir/
 
-# agentic-dev pipeline scratch and per-machine indexes
+# Agent pipeline scratch
 .agent-output/
 .gitworktrees/
-.codegraph/
 
 # Spark oracle byproducts (spark-sql local metastore)
 derby.log

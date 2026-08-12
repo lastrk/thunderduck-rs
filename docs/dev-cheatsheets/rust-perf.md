@@ -31,13 +31,11 @@ features, or refactor for readability.
 
 ## Prioritization
 
-Don't know the function name, only the behavior of a hot path? `semble.search`
-(pass `repo` = project root, e.g. `/workspace`) finds the candidate by intent,
-then hand the hit to codegraph. Weight each candidate by
-**call frequency × per-call cost × delta**.
-`codegraph_callers` gives the frequency; profiling (`cargo flamegraph`,
-`perf`, `pprof`, `cargo bench`) gives the per-call cost. Skip changes
-where any of the three is small.
+Don't know the function name, only the behavior of a hot path? Use `rg` to
+find candidates, then `scip-nav refs --count` for typed caller counts. Weight
+each candidate by **call frequency × per-call cost × delta**. Profiling
+(`cargo flamegraph`, `perf`, `pprof`, `cargo bench`) gives the per-call cost.
+Skip changes where any of the three is small.
 
 Cold paths (once per plan, once per RPC, startup, etc.) are usually
 not worth optimizing — mention them as INFO but do not prescribe work.

@@ -1,314 +1,144 @@
 # Thunderduck (Rust)
 
-[![Cargo Build](https://img.shields.io/badge/cargo-1.75+-blue.svg)](https://doc.rust-lang.org/cargo/)
-[![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org/)
+[![Cargo Build](https://img.shields.io/badge/cargo-1.97.1-blue.svg)](https://doc.rust-lang.org/cargo/)
+[![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-> **Alpha Software**: Despite extensive test coverage, Thunderduck is currently alpha quality software and will undergo extensive testing with real-world workloads before production readiness.
+> **Alpha software.** Thunderduck is under active Spark-compatibility development. Use it for the supported batch surface, and treat an `UNIMPLEMENTED` response as an intentional Thunderduck boundary rather than Spark compatibility.
 
-**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Achieves **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
+Thunderduck is a single-node [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html) server backed by DuckDB. It translates supported Spark DataFrame and Spark SQL plans into DuckDB SQL, then returns Arrow results over the Spark Connect protocol.
 
-### Key Features
+It is not a complete Apache Spark replacement: it has no distributed execution or Structured Streaming, and many catalog, administration, extension, ML, Pandas, and persistence APIs remain outside its supported surface. The authoritative compatibility contract is the [rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md). The intended behavior for a Spark-valid but unsupported input is an explicit Thunderduck boundary; the [Spark parity report](SPARK_PARITY_REPORT.md) records the current supported surface and known gaps in that contract.
 
-- **Spark Connect Server** for remote client connectivity (PySpark 4.1.x, Scala Spark)
-- **Faster than Spark local mode** via DuckDB's vectorized engine
-- **Fast startup**: ~50ms cold start vs ~10s for the JVM reference implementation
-- **Low memory**: ~45MB RSS at idle vs ~500MB for the JVM
-- **Multi-architecture support**: x86_64 (Intel/AMD) and ARM64 (AWS Graviton, Apple Silicon)
-- **Arrow-native data interchange** with DuckDB's vectorized engine
-- **Format support**: Parquet, Delta Lake (PLANNED), Iceberg (PLANNED)
-- **835 differential tests** against Spark 4.1.1 — TPC-H (100%), TPC-DS (100%), functions, joins, window, aggregations, lambdas, complex types
-- **Exact Spark type parity** via the bundled `thdck_spark_funcs` DuckDB extension
-- **Query plan introspection** via EXPLAIN statements
+## What works today
 
-### Why Thunderduck?
+- A Spark Connect batch-query surface validated against Apache Spark 4.1.1, including projection, filtering, joins, aggregation, windows, set operations, CTEs, scalar and correlated SQL subqueries, complex types, higher-order functions, and structured generators.
+- Spark SQL queries and a bounded DDL/DML set: views, simple tables, inserts, and truncation. See the supported statement IR in [statement.rs](crates/core/src/transpiler_v2/statement.rs).
+- PySpark Connect 4.1.1 is the primary tested client.
+- Local Arrow relations and Arrow result batches.
+- Parquet, CSV/text, JSON, and single-directory Delta reads. ORC and Iceberg reads are currently unsupported.
+- Two bounded path writes: Delta append to an existing Delta table and Parquet overwrite.
+- A mandatory bundled `thdck_spark_funcs` DuckDB extension for Spark-specific type, decimal, hash, and aggregate semantics.
 
-Most Spark workloads [don't need distributed computing](https://motherduck.com/blog/big-data-is-dead/) — they'd run faster and cheaper on a single node. Thunderduck lets you keep your Spark code while replacing the execution engine with DuckDB's vectorized, SIMD-optimized columnar processing. Zero-copy Arrow interchange eliminates serialization overhead between layers.
+The live function registry contains 352 supported public function spellings, each with explicit scalar, aggregate, generator, special, or frontend-lowered handling. A spelling is not a promise that every Spark overload or option is available; unsupported shapes return a boundary instead of falling through to DuckDB.
 
-The Rust port adds further gains: near-instant startup eliminates JVM warm-up time, and the low memory footprint means you can run more workloads on smaller instances.
+## Deliberate boundaries
 
-### Platform Support
+Thunderduck currently rejects, among other things:
 
-Thunderduck supports **x86_64** (Intel/AMD) and **ARM64** (AWS Graviton, Apple Silicon) architectures. DuckDB automatically applies SIMD optimizations per architecture.
+- Structured Streaming and distributed/shuffle execution.
+- RDD and low-level Spark APIs.
+- Cache/persist/checkpoint and most session/catalog administration.
+- UDF/UDAF/UDTF registration, Pandas/group-map operations, ML, and general table-valued functions.
+- Most write modes, table saves, and WriteOperationV2. Write layout options are currently accepted but not applied.
+- Explain-plan analysis, storage-level analysis, artifacts, operation reattachment, and session cloning.
 
-## Quick Start
+Some Spark SQL syntax is also intentionally bounded where τ cannot yet model its semantics. The server distinguishes these gaps from Spark-invalid input: Spark-invalid input receives a Spark-emulated error where implemented; Spark-valid but unsupported input should receive `UNIMPLEMENTED`. See the parity report for known SQL-lowering cases that still need that guard.
+
+## Quick start
 
 ### Prerequisites
 
-- **Rust** 1.75+ with Cargo (required)
-- **Python** 3.11+ (required for differential tests)
-- **protoc** (Protocol Buffers compiler, required for gRPC code generation)
+- Rust 1.97.1 with Cargo (pinned by [rust-toolchain.toml](rust-toolchain.toml)).
+- Python and PySpark 4.1.1 only when running the differential suite.
 
-### Build and Run
+`protoc` is vendored by the build; it is not a host prerequisite.
+
+### Build and run
 
 ```bash
-git clone https://github.com/lastrk/thunderduck-rs.git
+git clone https://github.com/nubank/thunderduck-rs.git
 cd thunderduck-rs
 
-# Build the release binary (--features bundled compiles DuckDB from source)
+# Fresh clones / CI compile DuckDB from source.
 cargo build --release --features bundled
 
-# Start the Spark Connect server (default port 15002)
+# Start the Spark Connect server on 0.0.0.0:15002.
 ./target/release/thunderduck-connect-server
 ```
 
-> **DuckDB linkage:** DuckDB is non-bundled by default, so a fresh clone builds with `--features bundled`
-> (compiles DuckDB from source). Inside the devcontainer you can instead run
-> `scripts/dev/dev-cache-setup.sh` once to link a shared prebuilt libduckdb — then `--features bundled`
-> is no longer needed. See [`scripts/dev/README.md`](scripts/dev/README.md).
+For repeat development inside the devcontainer, `scripts/dev/dev-cache-setup.sh` prepares a shared prebuilt DuckDB library; then ordinary `cargo build` and `cargo test` work without `--features bundled`. See [scripts/dev/README.md](scripts/dev/README.md).
 
 Connect with PySpark:
 
 ```python
 from pyspark.sql import SparkSession
 
-spark = SparkSession.builder \
-    .remote("sc://localhost:15002") \
+spark = (
+    SparkSession.builder
+    .remote("sc://localhost:15002")
     .getOrCreate()
+)
 
 df = spark.read.parquet("my_data.parquet")
-df.groupBy("category").agg({"amount": "sum"}).show()
+rows = df.groupBy("category").sum("amount").collect()
+print(rows)
 ```
+
+The server does not implement the Connect `ShowString` relation, so use ordinary actions such as `collect()` rather than `DataFrame.show()`.
 
 ## Architecture
 
-Thunderduck uses a three-layer architecture:
+Both front ends share one production translation path, τ:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│         Spark API Facade (DataFrame/Dataset)            │
-│              Lazy Plan Construction                     │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│                Translation Engine                       │
-│   Logical Plan → DuckDB SQL Translation                 │
-│   Expression Mapping, Type Conversion                   │
-└─────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│         DuckDB Execution Engine                         │
-│   Vectorized Processing, SIMD Optimization              │
-│   Arrow-Native Data Interchange                         │
-└─────────────────────────────────────────────────────────┘
+Spark Connect protobuf ─┐
+                        ├─> CommonAst ─> analyzer ─> TypedAst ─> DuckDB SQL
+Spark SQL text ─────────┘                                      │
+                                                               ▼
+                                                        DuckDB + Arrow
 ```
 
-### Crate Structure
+- `crates/core/src/transpiler_v2/` owns the common AST, Spark-aware analysis, function registry, and SQL emission.
+- `crates/core/src/parser_v2/` parses Spark SQL into that same AST.
+- `crates/connect-server/src/converter/v2_relation_converter.rs` converts Spark Connect protobuf into that AST.
+- `crates/core/src/runtime/` owns each DuckDB connection on its dedicated session thread.
+- `crates/connect-server/` implements the tonic Spark Connect service and Arrow wire bridge.
 
-```
-thunderduck-rs/
-├── Cargo.toml                     # Workspace manifest
-├── crates/
-│   ├── core/                      # Pure translation engine (no gRPC)
-│   │   ├── logical/               # LogicalPlan enum (29 variants, exhaustive match)
-│   │   ├── expression/            # Expression enum (21+ variants)
-│   │   ├── types/                 # DataType enum, StructType, TypeInferenceEngine
-│   │   ├── generator/             # SqlGenerator (match-based visitor)
-│   │   ├── functions/             # FunctionRegistry (500+ Spark→DuckDB mappings)
-│   │   ├── parser/                # SparkSQL parser (sqlparser-rs + SparkDialect)
-│   │   └── runtime/               # DuckDB session, Arrow streaming, extension loading
-│   └── connect-server/            # gRPC binary (tonic)
-│       ├── service/               # SparkConnectService (tonic gRPC handlers)
-│       ├── session/               # SessionManager (DashMap + per-session OS threads)
-│       └── converter/             # Protobuf → LogicalPlan (RelationConverter, ExpressionConverter)
-├── extensions/vendored/            # thdck_spark_funcs binaries, all 4 platforms (checked into git;
-│                                   #   embedded via include_bytes!; see MANIFEST.toml)
-└── tests/
-    ├── integration/               # Python differential tests
-    │   ├── differential/          # Differential test suites (41 test files)
-    │   └── sql/                   # TPC-H and TPC-DS SQL queries
-    └── scripts/                   # Test runner scripts
-```
+The concise architecture reference is [docs/context/architecture.md](docs/context/architecture.md). The [rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md) are authoritative when documentation disagrees.
 
-### Core Components
+### Spark compatibility extension
 
-- **Logical Plan** (`crates/core/logical/`): `LogicalPlan` enum with 29 variants — exhaustive `match` enforced at compile time
-- **Expression System** (`crates/core/expression/`): `Expression` enum with 21+ variants; `to_sql()` for generation, `data_type()` for inference
-- **SQL Generator** (`crates/core/generator/`): `SqlGenerator` — match-based visitor producing DuckDB SQL from the logical plan tree
-- **Type Mapping** (`crates/core/types/`): `TypeInferenceEngine` resolves expression types following Spark semantics
-- **Function Registry** (`crates/core/functions/`): 500+ Spark→DuckDB function mappings
-- **SparkSQL Parser** (`crates/core/parser/`): sqlparser-rs with a custom `SparkDialect` for raw SQL queries
-- **Runtime** (`crates/core/runtime/`): `DuckDbSession` owns a `duckdb::Connection` on a dedicated OS thread; Arrow streaming; extension loading
-- **gRPC Server** (`crates/connect-server/`): tonic-based Spark Connect service with per-session thread model
-
-**Note**: Thunderduck relies on **DuckDB's world-class query optimizer** rather than implementing custom optimization rules. DuckDB automatically performs filter pushdown, column pruning, join reordering, and many other optimizations.
-
-### Threading Model
-
-`duckdb::Connection` is `!Send + !Sync`. Each session runs on a dedicated `std::thread`. The gRPC async handler communicates via `tokio::sync::mpsc` channels:
-
-```
-tokio task → mpsc::Sender<SessionCommand> → session thread (owns Connection)
-session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
-```
-
-## Building from Source
-
-### Prerequisites
-
-- **Rust** 1.75+ (`rustup` recommended)
-- **protoc** — Protocol Buffers compiler
-- **curl** — required by `build.rs` to download the mandatory `thdck_spark_funcs` extension binary on first build
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install protoc (macOS)
-brew install protobuf
-
-# Install protoc (Ubuntu/Debian)
-apt-get install -y protobuf-compiler
-```
-
-### Build
-
-> DuckDB is non-bundled by default. The commands below need an external libduckdb: either run
-> `scripts/dev/dev-cache-setup.sh` once (devcontainer — links a shared prebuilt lib), **or** append
-> `--features bundled` to compile DuckDB from source (fresh clones / CI). `--features bundled` applies
-> equally to `build`, `test`, `check`, and `clippy`.
-
-```bash
-# Full build (debug) — add `--features bundled` on a fresh clone / CI
-cargo build
-
-# Release build (required for integration/differential tests).
-# Downloads and embeds the thdck_spark_funcs extension automatically.
-cargo build --release
-
-# Build a single crate
-cargo build -p thunderduck-core
-cargo build -p thunderduck-connect-server
-
-# Check only (faster than build — no code generation)
-cargo check
-```
-
-All 4 platform binaries of the adopted `thdck_spark_funcs` release (currently
-the `ext6` set, `v1.5.4`, matching the `duckdb` crate at `1.10504.0`) are
-vendored — checked into git plain under `extensions/vendored/` (see
-`extensions/vendored/MANIFEST.toml`). `build.rs` picks the binary matching the
-current platform at build time — no network access, no download. Adopting a
-new release (only on `duckdb` crate bumps) is done via
-`scripts/dev/adopt-extension-release.sh`. The extension is embedded directly
-in the binary via `include_bytes!()` and loaded at every session's startup.
-
-The extension's C++ source now lives in-tree at [`extension/`](extension/)
-(imported from `nubank/thunderduck-duckdb-extension`, now archived — see
-`extension/README.md`'s Provenance section and
-`docs/context/extension-archival-checklist.md`). Local dev builds use
-`scripts/dev/build-extension.sh`; producing new vendored binaries is a
-`workflow_dispatch`-only CI job, `.github/workflows/extension-release.yml`.
-
-### Start the Server
-
-```bash
-# Default
-./target/release/thunderduck-connect-server
-
-# Custom port
-./target/release/thunderduck-connect-server --port 15002
-
-# Kill the server (worktree-scoped — never touches other worktrees' servers)
-./tests/scripts/kill-test-servers.sh
-```
-
-## Spark Compatibility Extension
-
-Spark parity is the only emission target. The `thdck_spark_funcs` DuckDB extension is mandatory and bundled into every build (see [rearchitect ADR-020](docs/thunderduck-rearchitect-ADRs.md)). It implements Spark-precise numerical semantics:
-- `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
-- `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
-- `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
-- `spark_sum(col)` — Spark-compatible SUM return types
-- `spark_avg(col)` — Spark-compatible AVG return types
-- `spark_skewness(col)` — population skewness (Spark's formula, no bias correction)
+`thdck_spark_funcs` is embedded in every server build and loaded for every session. It closes semantic gaps that DuckDB SQL alone cannot express, including Spark-compatible hashing, decimal division, and selected aggregate return types. The extension source is in [extension/](extension/); the matching platform binaries are tracked under [extensions/vendored/](extensions/vendored/).
 
 ## Testing
 
-Assumes the project is already built (see [Building from Source](#building-from-source)). **Always use a release build for differential tests** — test servers launch `./target/release/thunderduck-connect-server`.
-
-### Unit Tests
-
-> Same DuckDB linkage rule as Build: works as-is with the devcontainer prebuilt lib; on a fresh clone / CI
-> add `--features bundled` (e.g. `cargo test --features bundled`).
+The differential oracle compares τ against Apache Spark 4.1.1. The DataFrame and Spark SQL corpora include TPC-H and TPC-DS cases alongside focused compatibility witnesses. The corpora are the regression gates, not a claim of complete Spark API coverage.
 
 ```bash
-# All unit tests
+# Rust quality gates
+cargo fmt --check
+cargo clippy -- -D warnings
 cargo test
 
-# Single module
-cargo test -p thunderduck-core -- types::
+# Build the server used by the differential runner.
+cargo build --release
 
-# Single test
-cargo test -p thunderduck-core -- generator::tests::test_project_to_sql
+# τ's DataFrame and Spark SQL conformance corpora.
+./tests/scripts/run-differential-tests.sh core
+./tests/scripts/run-differential-tests.sh sql_v2
 
-# With stdout output
-cargo test -- --nocapture
-```
-
-### Differential Tests
-
-```bash
-# Full suite (all 41 test files: TPC-H, TPC-DS, joins, window, aggregations, etc.)
+# All differential tests.
 ./tests/scripts/run-differential-tests.sh all
-
-# Quick check: TPC-H only
-./tests/scripts/run-differential-tests.sh tpch
 ```
 
-The run script handles virtualenv setup, server lifecycle, and cleanup automatically.
-
-### Running Tests Directly with pytest
-
-```bash
-# Activate the virtualenv first
-source tests/integration/.venv/bin/activate
-
-# Full suite
-cd tests/integration && python3 -m pytest differential/ -v --tb=short
-
-# Single test file
-cd tests/integration && python3 -m pytest differential/test_joins_differential.py -v --tb=long
-
-# Single parameterized test (e.g., TPC-H Q7)
-cd tests/integration && python3 -m pytest \
-  "differential/test_differential_v2.py::TestTPCH_AllQueries_Differential[7]" -v --tb=long
-```
-
-### Key Test Data Paths
-
-| Resource | Path |
-|----------|------|
-| TPC-H parquet data | `tests/integration/tpch_sf001/*.parquet` |
-| TPC-H SQL queries | `tests/integration/sql/tpch_queries/q{1-22}.sql` |
-| TPC-DS SQL queries | `tests/integration/sql/tpcds_queries/q{1-99}.sql` |
-| Test conftest | `tests/integration/conftest.py` |
-| DataFrame diff util | `tests/integration/utils/dataframe_diff.py` |
-
-## Documentation
-
-- **[Rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md)**: Authoritative architecture for the transpiler redesign (ADR-000 → ADR-019)
-- **[Architecture](docs/architecture.md)**: Architectural decisions for the existing implementation (ADRs 1–21)
-- **[Dev Journal](docs/dev-journal-toc.md)**: Chronological development history
+See [docs/context/testing.md](docs/context/testing.md) for live-oracle recording, worktree isolation, Spark setup, and the current corpus inventory.
 
 ## Contributing
 
-1. **Fork the repository** and create a feature branch
-2. **Write tests** for new functionality
-3. **Ensure unit tests pass**: `cargo test`
-4. **Build release and run differential tests**: `cargo build --release && ./tests/scripts/run-differential-tests.sh all`
-5. **Submit a pull request** with a clear description
+1. Read [AGENTS.md](AGENTS.md) and the relevant documents under [docs/context/](docs/context/).
+2. Keep unsupported Spark-valid shapes as typed Thunderduck boundaries; do not silently weaken them to DuckDB behavior.
+3. Add a focused unit or differential witness for behavioral changes.
+4. Run format, lint, unit, and applicable differential gates before opening a pull request.
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- **DuckDB Team**: High-performance embedded database
-- **Apache Arrow**: Zero-copy data interchange
-- **Apache Spark**: API compatibility and testing reference
-- **sqlparser-rs**: SQL parsing foundation for the SparkSQL parser
-- **tonic**: gRPC framework for the Spark Connect server
+- [DuckDB](https://duckdb.org/)
+- [Apache Arrow](https://arrow.apache.org/)
+- [Apache Spark](https://spark.apache.org/)
+- [sqlparser-rs](https://github.com/apache/datafusion-sqlparser-rs)
+- [tonic](https://github.com/hyperium/tonic)

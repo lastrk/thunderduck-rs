@@ -1,24 +1,15 @@
 # This context is shared by two Dockerfiles:
 #   - .devcontainer/Dockerfile (devcontainer.json sets context to "..",
 #     i.e. the project root) — does not COPY or ADD anything.
-#   - the root Dockerfile (release image) — `COPY . .` for
-#     `cargo build --features bundled -p thunderduck-connect-server`.
+#   - the root Dockerfile (release image) — packages a prebuilt binary from
+#     dist/ (see Dockerfile's header comment); it does not run cargo.
 #
 # Without this file the context would include multi-GB directories
 # (target/, .claude/worktrees/, test parquet data), which Podman streams
 # into /var/tmp on the VM and runs out of space.
 #
-# Default-deny, then allowlist exactly what the release Dockerfile's cargo
-# build needs. If you add a COPY/ADD elsewhere, whitelist the new path here.
+# Default-deny, then allowlist exactly what the release Dockerfile needs.
 
 *
-!Cargo.toml
-!Cargo.lock
-# Must be re-included: this file is default-deny, so without this line the
-# toolchain pin would never reach the build context and the release image
-# would quietly compile with whatever rustc its base tag happens to ship.
-!rust-toolchain.toml
-!crates/
-!crates/**
-!extensions/vendored/
-!extensions/vendored/**
+!dist/
+!dist/**

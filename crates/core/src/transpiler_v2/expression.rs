@@ -238,31 +238,22 @@ pub struct ColumnReference {
     /// reference resolved to. Local references use the producing plan's
     /// schema; correlated references use the enclosing plan's schema. The
     /// root of a struct-field extraction carries the id of its struct column.
-    /// Resolved references carry an id; `None` is retained for representational
-    /// symmetry with unresolved inputs.
-    ///
     /// This is derived binding data, not part of the reference's logical
     /// identity, and is excluded from `PartialEq`.
-    pub expr_id: Option<ExprId>,
+    pub expr_id: ExprId,
 }
 
 impl From<Attribute> for ColumnReference {
-    /// THE door from a resolved [`Attribute`] to the reference naming it:
-    /// COPY the attribute's identity, never mint a fresh one (the same
-    /// named-constructor discipline `schema.rs` imposes on `Attribute`, so no
-    /// arm can quietly write `expr_id: None` and produce a reference
-    /// `emission::bare_dup_slot` declines to bind). `qualifier` is `None`:
-    /// emission renders the bare column so that id-keyed rewrite applies.
-    /// NOT for struct-field resolution — there type/nullability come from the
-    /// nested field, only the id from the column. Borrow sites use
-    /// [`ColumnReference::from_attr`].
+    /// Preserve the attribute's identity and clear its rendering qualifier.
+    /// Struct-field references use an explicit literal because their type and
+    /// nullability come from the nested field rather than the root attribute.
     fn from(attr: Attribute) -> Self {
         Self {
             name: attr.name,
             qualifier: None,
             data_type: attr.data_type,
             nullable: attr.nullable,
-            expr_id: Some(attr.expr_id),
+            expr_id: attr.expr_id,
         }
     }
 }
@@ -275,7 +266,7 @@ impl ColumnReference {
             qualifier: None,
             data_type: attr.data_type.clone(),
             nullable: attr.nullable,
-            expr_id: Some(attr.expr_id),
+            expr_id: attr.expr_id,
         }
     }
 }
@@ -2446,7 +2437,7 @@ mod tests {
             qualifier: None,
             data_type: address_struct_type(),
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         })
     }
 
@@ -2822,7 +2813,7 @@ mod tests {
             qualifier: None,
             data_type,
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         })
     }
 

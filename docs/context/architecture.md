@@ -129,7 +129,7 @@ Aggregate SQL generation uses a single canonical path through `render_aggregate`
 ```
 Expression (enum)
   Literal               # constant values
-  ColumnReference       # resolved column ref with type info and qualifier
+  ColumnReference       # resolved column ref with type, qualifier, and mandatory ExprId
   UnresolvedColumn      # unresolved (pre-resolution)
   Binary(BinaryExpression)   # left OP right
   Unary(UnaryExpression)     # OP operand

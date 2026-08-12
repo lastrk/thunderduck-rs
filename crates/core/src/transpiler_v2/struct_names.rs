@@ -64,6 +64,7 @@ mod tests {
         AliasExpression, BinaryExpression, BinaryOp, ColumnReference, Literal, LiteralValue,
         UnresolvedColumn,
     };
+    use super::super::schema::ExprId;
     use super::*;
     use crate::types::DataType;
 
@@ -73,7 +74,7 @@ mod tests {
             qualifier: None,
             data_type: DataType::String,
             nullable: true,
-            expr_id: None,
+            expr_id: ExprId::fresh(),
         })
     }
 

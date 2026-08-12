@@ -518,3 +518,11 @@ not serialize it behind the critical path or mix its churn into that diff.
   existing operator's keys or predicates. Freeze `Deduplicate` keys and
   `NaDrop` subsets by `ExprId` before recovery, then bind those identities
   through emission wrappers.
+
+## 2026-08-11 — Recheck cold worktree corpus registration failures
+
+- When a first corpus run in a fresh worktree reports broad missing-table
+  failures, verify fixture registration and rerun in the same isolated
+  environment before classifying them as code regressions. Compare only the
+  final result against the known-green baseline, while still reporting the
+  transient setup failure.

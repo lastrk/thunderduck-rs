@@ -15,7 +15,15 @@ fn link_external_duckdb_runtime() {
     if std::env::var_os("CARGO_FEATURE_BUNDLED").is_some() {
         return; // bundled build handles the C++ runtime
     }
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // Apple toolchains (Xcode 15+) no longer ship `libstdc++.dylib`, only
+    // `libc++.dylib`; Linux toolchains ship `libstdc++` and lack `libc++` by
+    // default. Pick the one the platform actually has.
+    let cxx_runtime = if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
+        "c++"
+    } else {
+        "stdc++"
+    };
+    println!("cargo:rustc-link-lib=dylib={cxx_runtime}");
     println!("cargo:rustc-link-lib=dylib=m");
     if std::env::var_os("DUCKDB_LIB_DIR").is_none() {
         println!(

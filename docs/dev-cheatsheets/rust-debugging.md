@@ -12,11 +12,9 @@ observe evidence, then propose a change.
 
 Collect raw facts before interpreting.
 
-**Locating the code**: if you know the behavior under test but not the
-symbol implementing it, start with `semble.search` (pass `repo` = project
-root, e.g. `/workspace`), then hand the hit to `codegraph_explore` for
-structure and callers. Known symbol/relationship → codegraph directly;
-literal string → shell `grep` last.
+**Locating the code**: use `rg` to locate behavior or literals. For a known
+Rust symbol or relationship, use `scip-nav` for its definition and typed
+references.
 
 **Compiler errors**: capture exact codes (`E0308`, `E0277`, `E0495`,
 `E0382`), every span, every `note:` and `help:` (they contain rustc's

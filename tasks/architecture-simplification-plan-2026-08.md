@@ -474,8 +474,9 @@ longer pays.
 
 ### Prototype
 
-On a private branch or throwaway patch, model only Project, Filter, Join, and a
-subquery with one of:
+On a private branch or throwaway patch, model Project, Filter, Join, and a
+subquery, then stress the design with Aggregate, SetOp, Pivot/Crosstab,
+recovery-bearing operators, Generate, and RecursiveCte. Use one of:
 
 - `Plan<P>` / `Op<P>` with sealed phase markers; or
 - `Op<Child, Expr>` with separate unresolved and resolved expression types.
@@ -498,6 +499,27 @@ Adopt only if the prototype:
 Otherwise document the negative result and keep `CommonOp`/`TypedOp`. Their
 duplication is preferable to a generic architecture that is smaller only on
 paper.
+
+### Completion checkpoint (2026-08-11)
+
+- Compile-tested sealed `Plan<P>` and hybrid shared-payload prototypes cover
+  the favorable slice and all adversarial cases above.
+- Both prevent mixed-phase subqueries and require resolved identity. The full
+  generic model also closes source-only nodes with `Infallible`.
+- The equal-capability hybrid is 700 lines versus 831 for `Plan<P>`; the
+  generic model saves declaration lines but adds more conversion/traversal
+  code. Exact SCIP also shows a production migration would cross 3,922
+  `Expression`, 5,522 `CommonOp`, and 1,270 `TypedOp` references.
+- Neither whole-tree design passes the lower-LOC/local-complexity adoption
+  gate. Retain `CommonOp`/`TypedOp` and the current expression hierarchy.
+- Two narrower candidates remain: make resolved `ColumnReference.expr_id`
+  non-optional, and represent completed runtime discovery with a private
+  `PreparedCommonAst` boundary newtype. Detailed evidence lives in
+  `tasks/phase6-phase-typed-ir-experiment.md`.
+- Format, strict workspace Clippy, and all workspace tests pass, including all
+  five experiment witnesses. The DataFrame corpus remains 422 green with the
+  same seven deferred cases, the SQL corpus remains 426 green with two skips,
+  and the 829-case prior-green oracle reports zero regressions.
 
 ## Phase 7 — complete the inline-comment audit
 

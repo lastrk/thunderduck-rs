@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.strict {
         tracing::warn!(
             "--strict is deprecated and has no effect; strict is the only mode \
-             (see ADR-020 in docs/thunderduck-rearchitect-ADRs.md)"
+             (see ADR-020 in docs/adrs/adr-020-strict-only-target.md)"
         );
     }
 

@@ -1,7 +1,7 @@
 # SQL Generator (SUPERSEDED)
 
 > **SUPERSEDED — DO NOT USE AS GUIDANCE — HISTORICAL REFERENCE ONLY.**
-> This ADR describes the retired legacy v1 transpiler. The corresponding Rust modules were deleted on 2026-07-05. Kept in-tree as a historical reference to the pre-τ architecture. ADR index: [`../README.md`](../README.md) · τ spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
+> This ADR describes the retired legacy v1 transpiler. The corresponding Rust modules were deleted on 2026-07-05. Kept in-tree as historical reference only. Active ADR index: [`../README.md`](../README.md).
 
 **Decision: `SqlGenerator` struct with `match`-based dispatch**
 

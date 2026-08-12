@@ -1,6 +1,6 @@
 # SparkSQL Parser Strategy
 
-> **Status: current — SparkSQL parser front-end; complements (not superseded by) the rearchitecture.** Rearchitect ADR-004 mandates parsing SparkSQL into the common AST; this ADR records the parser *technology* that implements that front-end (sqlparser-rs + a custom `SparkDialect`, Tier 1; `chumsky`, Tier 2). ADR index: [`../README.md`](../README.md) · v2 spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
+> **Status: current — SparkSQL parser front-end.** [ADR-004](../adr-004-common-ast-frontends.md) mandates parsing SparkSQL into the common AST; this record captures the parser technology. Active ADR index: [`../README.md`](../README.md).
 
 > **Context:** the interim `preprocess_spark_sql` text-rewrite pass this strategy replaced has since been removed from the codebase. Raw SQL now flows through a parser front-end (and, in v2, lowers into the common AST per rearchitect ADR-004) rather than through string substitution.
 

@@ -1,0 +1,25 @@
+# ADR-026 — τ mirrors Spark Connect's `plan_id` tree lookup
+
+**Status:** Proposed
+**Depends on:** ADR-001 (observable plan boundaries), ADR-002 (bounded ownership exception), ADR-003 (per-node metadata), ADR-004 (front-end convergence), ADR-006 (bounded analysis), ADR-015 (Spark differential oracle), ADR-016 (Spark 4.1.1 pin), ADR-021 (τ owns its substrate), ADR-022 (Spark-emulated errors), ADR-024 (`ExprId` identity)
+**Supersedes:** [retired ADR-023](retired/adr-023-ordinal-reference-resolution.md)'s plan-ID clauses and ADR-024's retired 2026-08-09 plan-ID draft
+**Depended on by:** DataFrame reference resolution
+
+**Context.** Spark Connect defines `RelationCommon.plan_id` as an optional, per-client globally unique plan-node ID. Its planner tags every converted `LogicalPlan` node with that ID and attaches the corresponding ID to DataFrame references. Catalyst searches the plan tree; it does not propagate ID sets through outputs or store them on joins. This ADR covers DataFrame column/star lookup; `SubqueryExpression.plan_id` uses Spark's separate `WithRelations` substitution protocol.
+
+**Decision.** Mirror Spark 4.1.1's resolver:
+
+1. `CommonAst` and `TypedAst` preserve each Connect relation's exact `Option<i64>`; SparkSQL nodes use `None`. Expression conversion mirrors `SparkConnectPlanner` rather than blindly copying every proto field: attributes receive the tag, DataFrame stars carry the ID, and true regex expressions retain Spark's tag-free behavior. τ never invents an ID.
+2. The owning analyzer rule supplies the same search roots it uses for ordinary resolution—normally the operator's inputs—and the resolver searches each tree top-down. On an ID match, resolve against that node's output and stop descending that branch. Column lookup treats `Union` as a leaf, as Catalyst does; DataFrame-star lookup still descends through it.
+3. A candidate survives only while its referenced `ExprId`s remain in every ancestor's output. Column candidates use Spark's depth merge: a surviving direct-root candidate outranks deeper candidates; other competing survivors raise `AMBIGUOUS_COLUMN_REFERENCE`. Stars require every target expression to survive and treat multiple surviving targets as ambiguous.
+4. For a column, no matching node raises `CANNOT_RESOLVE_DATAFRAME_COLUMN`; a match with no surviving candidate returns the original unresolved expression to Spark's ordinary and missing-column rules. Recovery follows Catalyst operator identity: Dataset `Deduplicate` participates while SQL `Distinct` does not, and recovered attributes never enlarge pre-existing deduplication keys or `NaDrop` predicates. A star with no surviving target raises `CANNOT_RESOLVE_DATAFRAME_COLUMN`. An unknown ID never takes the name-only path.
+5. Joins carry no plan-ID sets. Their condition naturally searches both inputs, including semi/anti joins; output filtering through the actual join node determines which child attributes remain referenceable above it. USING/NATURAL joins and set operations need no plan-ID donor rules.
+
+Every tagged logical-plan boundary must remain observable. A converter may retain a cosmetic node or insert a transparent plan-boundary node; it may not overwrite a child's ID or flatten several IDs onto one node, because tree position participates in resolution.
+
+**Consequences.** Plan IDs remain distinct from ADR-024's `ExprId`: the former locate a client plan node; the latter prove attribute survival through ancestors. Every mint-versus-copy site visible to that filtering must therefore match Spark; ADR-024's 2026-08-10 amendment is a prerequisite. A direct recursive `PlanIdResolver` states Spark's algorithm without per-operator lineage rules. The former proto collector, join vectors, and `RelScope` plan-ID bookkeeping were removed on 2026-08-11.
+
+**Spark 4.1.1 evidence.** [`RelationCommon.plan_id`](https://github.com/apache/spark/blob/v4.1.1/sql/connect/common/src/main/protobuf/spark/connect/relations.proto#L168-L178) defines the key; [`SparkConnectPlanner`](https://github.com/apache/spark/blob/v4.1.1/sql/connect/server/src/main/scala/org/apache/spark/sql/connect/planner/SparkConnectPlanner.scala#L239-L242) tags each converted node and converts [attributes](https://github.com/apache/spark/blob/v4.1.1/sql/connect/server/src/main/scala/org/apache/spark/sql/connect/planner/SparkConnectPlanner.scala#L1928-L1937), [stars, and regexes](https://github.com/apache/spark/blob/v4.1.1/sql/connect/server/src/main/scala/org/apache/spark/sql/connect/planner/SparkConnectPlanner.scala#L2238-L2288); [`LogicalPlan.PLAN_ID_TAG`](https://github.com/apache/spark/blob/v4.1.1/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/LogicalPlan.scala#L209-L219) specifies top-down lookup; and [`ColumnResolutionHelper`](https://github.com/apache/spark/blob/v4.1.1/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/analysis/ColumnResolutionHelper.scala#L495-L668) defines matching, ancestor filtering, depth/ambiguity, stars, `Union`, and errors.
+
+---
+

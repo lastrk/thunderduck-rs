@@ -1,10 +1,10 @@
 # Dependencies & Configuration
 
-> **Scope: τ (the only production path per ADR-022).** External dependencies (the `thdck_spark_funcs` extension, protobuf, Arrow, Tokio) plus value-level types (`DataType`/`StructType`/`StructField`) are τ's substrate. τ owns its `Expression` enum and its `TypeInferenceEngine` (INV10). This file is authoritative on shared externals; for τ's substrate-independence commitments see `docs/thunderduck-rearchitect-ADRs.md` §ADR-021 and INV10.
+> **Scope: τ (the only production path per ADR-022).** External dependencies (the `thdck_spark_funcs` extension, protobuf, Arrow, Tokio) plus value-level types (`DataType`/`StructType`/`StructField`) are τ's substrate. τ owns its `Expression` enum and its `TypeInferenceEngine` (INV10). This file is authoritative on shared externals; for τ's substrate-independence commitments see [ADR-021](../adrs/adr-021-tau-substrate.md) and [Cross-Validation](../adrs/cross-validation.md).
 
 ## Spark Compatibility Extension
 
-Spark parity is the only emission target. The `thdck_spark_funcs` extension is mandatory and bundled into every build (see [rearchitect ADR-020](../thunderduck-rearchitect-ADRs.md)).
+Spark parity is the only emission target. The `thdck_spark_funcs` extension is mandatory and bundled into every build (see [ADR-020](../adrs/adr-020-strict-only-target.md)).
 
 ```bash
 cargo build --release

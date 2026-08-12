@@ -2,7 +2,7 @@
 
 **Scope.** The v2 transliterator τ: `crates/core/src/transpiler_v2/` (~10.9k LOC), `crates/core/src/parser_v2/` (~1.2k), `crates/connect-server/src/converter/v2_relation_converter.rs` (~2.2k), dispatch in `service.rs`.
 **Baseline.** Branch `feat/v2-transpiler`, HEAD `b263549` + uncommitted working tree; corpus ~205/324.
-**Rubric.** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000…022 + §CV invariants INV1–INV10 / load-bearing LB1–LB9), `tasks/lessons.md`, `CLAUDE.md`.
+**Rubric.** `docs/adrs/README.md` (ADR-000…022 + §CV invariants INV1–INV10 / load-bearing LB1–LB9), `tasks/lessons.md`, `CLAUDE.md`.
 **Method.** Four parallel read-only deep-dives (boundary, emission, analyzer/types, ingress) + line-level spot-verification of every High/Med finding.
 
 > **Caveat — moving target.** The repo was being edited *during* this review: the spine doc gained ADR-022 and dropped INV7 at 14:02, and `emission.rs`/`expression.rs`/`mod.rs`/`struct_names.rs` are uncommitted. Line numbers are a snapshot of the working tree at review time.

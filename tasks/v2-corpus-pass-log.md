@@ -1280,7 +1280,7 @@ the summary below records the corpus deltas by pass number.
 - Files: 1 (+ test). Tests added: 1 (parser_v2: `'line1\nline2'`/`'tab\there'` lower to String literals holding real LF/TAB).
 - Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — independently re-verified decode table matches Spark for `\n`/`\t`; only single-quoted literals affected (`"` is a delimited-identifier start in SparkDialect); no live token re-serialization path; backslash-free strings byte-identical). Perf 0 HIGH + 0 MEDIUM (parse-time only, no big-O change, off hot path).
 - Findings addressed this pass: reviewer Low (doc-comment imprecision) — tightened the dialect.rs comment to describe sqlparser's actual decode table (`\0 \a \b \f \n \r \t \Z` → control chars; `_ => *next` passthrough for `\\`/`\'`/`\"`) and the deferred `\a`/`\f`/`\%`/`\_`/`\u`/octal divergences.
-- Findings queued as follow-up: reviewer Low — stale premise in architecture doc (cited `multi_alias.rs`, which does not exist in this worktree; the architect's codegraph indexed the main tree) — informational, makes the regression surface smaller; known parity debt `\%`/`\_` LIKE deferred to a future witness case.
+- Findings queued as follow-up: reviewer Low — stale premise in architecture doc (cited `multi_alias.rs`, which does not exist in this worktree; the review used the wrong checkout) — informational, makes the regression surface smaller; known parity debt `\%`/`\_` LIKE deferred to a future witness case.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt --check clean on touched files, `cargo check -p thunderduck-core` clean, `cargo test -p thunderduck-core --lib` 636/0, `sql_v2` 232/30/262, lit-009 GREEN, no regression).
 - Commit SHA: (this commit).

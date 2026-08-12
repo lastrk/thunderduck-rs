@@ -48,6 +48,10 @@ For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip 
 - **Idiomatic Rust**: enums over trait objects for closed sets, `match` over dynamic dispatch, `thiserror` for typed errors, no `unwrap()` in library code. Full rules in [`docs/context/coding-standards.md`](docs/context/coding-standards.md).
 - **Respect architectural underpinnings**:  see [`docs/context/architecture.md`](docs/context/architecture.md).
 
+## Communication
+
+Use ASD-STE100 Simplified Technical English when you communicate with the user. Use it when you write pull request descriptions, code comments, and other project text. Preserve required technical terms, code identifiers, and quoted external text.
+
 ## Documentation Map
 
 CLAUDE.md holds only policy and process. Everything factual lives in the docs below — pull the relevant one in when the task touches its area.

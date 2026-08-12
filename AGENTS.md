@@ -2,6 +2,10 @@
 
 Project-specific **policy and process** for thunderduck-rs (the Rust port of Thunderduck). Factual reference — architecture, commands, gotchas, standards — lives under `docs/context/` and the ADRs; see the [Documentation Map](#documentation-map) at the bottom and pull the relevant doc in on demand.
 
+## Communication
+
+Use ASD-STE100 Simplified Technical English when you communicate with the user. Use it when you write pull request descriptions, code comments, and other project text. Preserve required technical terms, code identifiers, and quoted external text.
+
 ## Project Vision
 
 **Keep your Spark API, get single-node DuckDB performance.** Thunderduck is a drop-in Spark Connect server backed by DuckDB for workloads that don't need distributed compute. This is the Rust port: same Spark API compatibility, fast startup (~50ms vs ~10s JVM), and low memory overhead (~30MB vs ~500MB JVM baseline).

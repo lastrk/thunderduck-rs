@@ -7,12 +7,9 @@ first-try. Assume Opus 4.7 / Sonnet 4.5+ reader — no language basics.
 
 Search ladder — pick by what you already know:
 
-1. **Only the intent/behavior, no symbol yet** → `semble.search` (pass
-   `repo` = project root, e.g. `/workspace`), then hand the hit to codegraph.
-2. **A symbol or relationship** → `codegraph_explore` (source + callers +
-   blast radius in one call).
-3. **A literal string** → shell `grep -rn` last (no Grep tool on native
-   builds — Claude Code v2.1.117+).
+1. **Intent, behavior, or a literal** → `rg`.
+2. **A Rust symbol or relationship** → `scip-nav def`, `refs`, or `sym`.
+3. **Macro expansion** → `scip-nav expand` on a green tree.
 
 ## Ownership & borrowing
 

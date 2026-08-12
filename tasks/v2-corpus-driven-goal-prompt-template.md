@@ -37,7 +37,7 @@ break from the slice-driven methodology.
 
 ## Design authority
 
-- `docs/thunderduck-rearchitect-ADRs.md` — ADR-000 to ADR-022. Every design
+- `docs/adrs/README.md` — authoritative ADR index. Every design
   decision cites the applicable ADR. ADR-022 is load-bearing: τ is the only
   path; two error categories (Spark-emulated vs Thunderduck-boundary).
 - `tasks/v2-restart-open-decisions.md` — 13 decisions RESOLVED. New
@@ -178,7 +178,7 @@ diagnostic hypothesis is wrong; re-run step 2 with fresh instrumentation.
 
 **Methodology (retired 2026-07-11, folded into `tasks/goal-corpus-to-100.md`):** `tasks/archive/v2-corpus-driven-iteration-methodology.md` — per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf), 5-fix-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning discipline, pass-log format.
 
-**Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000..ADR-022). Every fix cites applicable ADR.
+**Design authority:** `docs/adrs/README.md`. Every fix cites the applicable ADR.
 **Open decisions:** `tasks/v2-restart-open-decisions.md` — 13 RESOLVED. New gaps → Decision 14+ (HALT-AND-FLAG-3).
 **Inheritance checklist:** `tasks/v2-restart-inheritance-checklist.md` — every applicable item present by termination.
 **Pass log:** `tasks/v2-corpus-pass-log.md` (append one entry per pass).

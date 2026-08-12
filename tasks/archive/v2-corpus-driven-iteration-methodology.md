@@ -83,7 +83,7 @@ smallest correct fix.")
 ```
 
 Requirements for the architect:
-- Cite applicable ADR(s) from `docs/thunderduck-rearchitect-ADRs.md`
+- Cite applicable ADR(s) from `docs/adrs/README.md`
   by identifier.
 - Cite applicable inheritance-checklist sections from
   `tasks/v2-restart-inheritance-checklist.md`.
@@ -225,7 +225,7 @@ Update this file at the end of every pass (before commit).
 
 ## References
 
-- Design authority: `docs/thunderduck-rearchitect-ADRs.md`
+- Design authority: `docs/adrs/README.md`
   (ADR-000..ADR-022).
 - Open decisions: `tasks/v2-restart-open-decisions.md`.
 - Inheritance checklist: `tasks/v2-restart-inheritance-checklist.md`.

@@ -1,6 +1,6 @@
 # Architecture Reference
 
-> **Scope: τ (the only production path per ADR-022).** This document is the condensed reference for the current transpiler. The authoritative design is [`docs/thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
+> **Scope: τ (the only production path per ADR-022).** This is the condensed current implementation reference. The authoritative individual decisions and task router live in [`docs/adrs/README.md`](../adrs/README.md). Retired v1 ADRs live under [`docs/adrs/legacy-transpiler/`](../adrs/legacy-transpiler/) and are marked SUPERSEDED.
 
 ## SQL Generation Architecture Principles
 
@@ -11,7 +11,7 @@ These are non-negotiable constraints governing all SQL generation and type handl
 3. **SparkSQL data flow**: Spark SQL string → sqlparser-rs parse tree → `CommonAst` → analyzer → `TypedAst` → emission → DuckDB SQL.
 4. **DataFrame data flow**: Spark Connect protobuf → `V2RelationConverter` → `CommonAst` → analyzer → `TypedAst` → emission → DuckDB SQL.
 5. **Spark parity is the only emission target.** τ matches Apache Spark exactly via (a) CASTs at top-level SELECT projection or (b) DuckDB extension functions; the `thdck_spark_funcs` extension is mandatory (ADR-020).
-6. **Zero result copying**: 100% type matching is achieved at SQL generation time using extension functions + AS aliases. No Arrow vector copying or rewriting.
+6. **Prefer semantic shaping before execution.** Ordinary Spark type matching is achieved in generated SQL with casts, aliases, and extension functions. Arrow interval transcoding is the explicit wire-format exception defined by ADR-025; there is no generic result-rewrite layer.
 7. **Emission is dedicated.** Use `render_expr` / `dispatch_op`. `Display` / `Debug` implementations are human-readable debug output only — never used to build SQL sent to DuckDB.
 
 ## Crate Structure
@@ -69,7 +69,7 @@ crates/connect-server/              # gRPC binary (tonic)
 | **Parser** | `SparkSqlParserV2` | sqlparser-rs based Spark SQL parser (raw SQL path) → `CommonAst` |
 | **IR** | `CommonAst` / `CommonOp` (enum) | Shared operator tree plus optional Connect node ID; SparkSQL IDs are `None` |
 | **Expression** | τ `Expression` (enum) | τ's Spark-parity expression types with `data_type()` / `nullable()` |
-| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, plan_id, resolved_schema }` — each `Attribute` carries name/type/nullability, stable `ExprId`, origin lineage, and its current Catalyst qualifier; hidden USING outputs live in relation scope (ADR-024); `StructType` is produced only at the `mod.rs` wire boundary |
+| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, plan_id, resolved_schema }` — each `Attribute` carries name/type/nullability, stable `ExprId`, origin lineage, and its current Catalyst qualifier; hidden USING outputs live in relation scope ([ADR-024](../adrs/adr-024-resolved-attribute-identity.md)); `StructType` is produced only at the `mod.rs` wire boundary |
 | **Emission** | `dispatch_op()` / `render_expr()` | Traverses `TypedAst`, produces DuckDB SQL |
 | **Runtime** | `DuckDbSession` | Owns `duckdb::Connection` on its dedicated OS thread |
 | **Types** | `TypeInferenceEngine` | Resolves expression types following Spark semantics |
@@ -105,7 +105,7 @@ Never attempt to move a `Connection` across thread boundaries or hold it across 
 
 Spark's declared interval field span is semantic type structure. τ preserves it
 on `DataType::DayTimeInterval { start, end }` and
-`DataType::YearMonthInterval { start, end }` (ADR-025); it is never inferred
+`DataType::YearMonthInterval { start, end }` ([ADR-025](../adrs/adr-025-ansi-interval-field-spans.md)); it is never inferred
 from the stored months/days/microseconds value. Physical Arrow encoding remains
 an independent connect-server concern.
 
@@ -156,7 +156,7 @@ Both paths flow through τ's analyzer for full type awareness before emission.
 
 **Implication**: type-inference and emission fixes affect both raw SQL and DataFrame queries.
 
-## Spark Connect plan IDs (ADR-026)
+## Spark Connect plan IDs ([ADR-026](../adrs/adr-026-connect-plan-id-lookup.md))
 
 A Connect `plan_id` locates a logical-plan node; it is not attribute lineage.
 `CommonAst` and `TypedAst` retain each node's optional ID; tagged cosmetic
@@ -170,6 +170,25 @@ regexes expand normally; either form nested inside another expression validates
 its plan ID or regex first, then returns an explicit Thunderduck boundary rather
 than degrading to SQL `*`. Plan-tagged columns inside opaque lambda bodies
 likewise validate plan lookup before returning an explicit boundary.
+
+## Function registry
+
+The live function registry is the single callable-name authority. Every public
+spelling selects exactly one closed implementation route:
+
+```text
+FunctionImplementation
+  Scalar(ordinary interpreted rules)
+  Aggregate(ordinary interpreted rules)
+  Generator(structured generator)
+  Special(closed handwritten handler)
+  Lowered(frontend-owned syntax/IR)
+```
+
+Catalog exposure, type/nullability rules, and emission consume that same
+registry. There is no open DuckDB-native fallback; unknown functions reach an
+honest boundary. This is the implemented amendment to
+[ADR-009](../adrs/adr-009-emission-table.md).
 
 ## Spark Parity Requirements
 

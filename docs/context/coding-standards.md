@@ -1,6 +1,6 @@
 # Coding Standards
 
-> **Scope: τ (the only production path per ADR-022).** These are language-level rules (Rust hygiene, error-type conventions, borrow patterns, commit workflow). Substrate-independence questions are covered by INV10 in `docs/thunderduck-rearchitect-ADRs.md`.
+> **Scope: τ (the only production path per ADR-022).** These are language-level rules (Rust hygiene, error-type conventions, borrow patterns, commit workflow). Substrate-independence questions are covered by INV10 in [`docs/adrs/cross-validation.md`](../adrs/cross-validation.md).
 
 ## Rust Standards
 

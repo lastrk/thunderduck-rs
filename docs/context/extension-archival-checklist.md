@@ -69,7 +69,7 @@ All six must be green before archiving. Each corresponds to a stage of the phase
    ```bash
    grep -rn "nubank/thunderduck-duckdb-extension\|lastrk/thunderduck-duckdb-extension" docs/ README.md extension/ .github/ scripts/ 2>/dev/null
    ```
-   Expect hits only in: `extension/README.md` (Provenance section), `extension/BUILD_PINS.toml` (`[provenance]` block), `docs/thunderduck-rearchitect-ADRs.md` (dated historical notes that explicitly say "kept as-is"), this checklist, `docs/dev_journal/` entries (chronological history — never edited retroactively), `scripts/dev/adopt-extension-release.sh` (`REPO_SLUG` + doc comment for the legacy download mode — retained deliberately, since archived GitHub repos still serve release downloads — and the in-tree `[source]` provenance string), and `.github/workflows/extension-release.yml` (provenance text in the generated PR body).
+   Expect hits only in: `extension/README.md` (Provenance section), `extension/BUILD_PINS.toml` (`[provenance]` block), the individual active records under `docs/adrs/` (dated historical notes that explicitly say "kept as-is"), this checklist, `docs/dev_journal/` entries (chronological history — never edited retroactively), `scripts/dev/adopt-extension-release.sh` (`REPO_SLUG` + doc comment for the legacy download mode — retained deliberately, since archived GitHub repos still serve release downloads — and the in-tree `[source]` provenance string), and `.github/workflows/extension-release.yml` (provenance text in the generated PR body).
 
 ## Manual archival commands (human-run, after all 6 gates are green)
 

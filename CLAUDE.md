@@ -8,9 +8,9 @@ Project-specific **policy and process** for thunderduck-rs (the Rust port of Thu
 
 ### Authoritative architecture
 
-[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation) is the **authoritative** architecture source for the transpiler (`τ`) and the source of truth on any contradiction. The condensed, day-to-day reference is [`docs/context/architecture.md`](docs/context/architecture.md).
+The individual records indexed by [**docs/adrs/README.md**](docs/adrs/README.md) are the **authoritative** architecture source for the transpiler (`τ`) and the source of truth on any contradiction. The index routes tasks to the smallest relevant ADR set; the condensed, day-to-day reference is [`docs/context/architecture.md`](docs/context/architecture.md).
 
-### τ is the only path (per ADR-022)
+### τ is the only path (per [ADR-022](docs/adrs/adr-022-only-path-error-categories.md))
 
 τ (the transpiler at `crates/core/src/transpiler_v2/`, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/`) is the only production path. Every Spark Connect request flows to τ; τ's output is the response. If τ has not implemented a given operator, it produces a Thunderduck-boundary error (`Unsupported*`) directly to the caller. There is no fallback, no dispatch flag, no alternate implementation.
 
@@ -53,7 +53,7 @@ For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip 
 CLAUDE.md holds only policy and process. Everything factual lives in the docs below — pull the relevant one in when the task touches its area.
 
 **Authoritative architecture**
-- [`docs/thunderduck-rearchitect-ADRs.md`](docs/thunderduck-rearchitect-ADRs.md) — ADR-000 → ADR-022 + Cross-Validation. Source of truth for τ's design; consult on any architecture question or contradiction.
+- [`docs/adrs/README.md`](docs/adrs/README.md) — index and task router for the individual active τ ADRs, Cross-Validation, runtime records, retired records, and legacy history. Load the specific decisions relevant to the change; use [`cross-validation.md`](docs/adrs/cross-validation.md) for architecture-wide review.
 - [`docs/adrs/legacy-transpiler/`](docs/adrs/legacy-transpiler/) — SUPERSEDED v1 ADRs, historical reference only.
 
 **Condensed reference — [`docs/context/`](docs/context/)** (pull in when the task touches the area):

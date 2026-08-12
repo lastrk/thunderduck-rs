@@ -23,7 +23,7 @@ reduction in concepts, code, or invalid states.
 
 ## Authority and non-negotiable constraints
 
-- [`docs/thunderduck-rearchitect-ADRs.md`](../docs/thunderduck-rearchitect-ADRs.md)
+- [`docs/adrs/README.md`](../docs/adrs/README.md)
   is authoritative. Any representation change that conflicts with it requires
   an ADR amendment before production code changes.
 - τ remains the only production path under ADR-022. No fallback, dispatch flag,

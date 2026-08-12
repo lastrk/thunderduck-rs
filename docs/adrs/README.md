@@ -3,9 +3,27 @@
 This directory is the entry point to Thunderduck's architecture decisions. It is organized so a
 **designer or reviewer agent can be pointed at exactly the right slice** without reading everything.
 
+**Subject:** Spark Connect → DuckDB SQL transliterator (`τ`), its front-ends, its analyzer, and its test architecture.
+**Status of set:** Proposed — for ratification before / alongside reimplementation.
+**Reference Spark version:** 4.1.1.
+
+The active ADRs are ordered as a logical narrative: ADR-000 establishes the product premise that
+selects the whole approach; ADR-001–002 state what τ is and what it delegates; ADR-003–004 define
+the intermediate representation and how both front-ends populate it; ADR-005–006 define the
+analyzer that resolves and types it; ADR-007–010 define how it is transformed and emitted;
+ADR-011–013 cover commands, the catalog, and external/lakehouse reads; ADR-014–016 are the testing
+architecture the rest makes possible; ADR-017–019 add the per-format write paths and end-to-end I/O
+contract; ADR-020 pins the emission target; ADR-021 pins the substrate boundary; ADR-022 pins the
+runtime position; ADR-024 defines resolved attribute identity; ADR-025 defines ANSI interval field
+spans; and ADR-026 defines Spark Connect plan-ID resolution.
+
+Review an ADR on its own using its refinement hooks. For a change spanning decisions, also load
+[`cross-validation.md`](cross-validation.md) to check dependencies, tensions, assumptions, and
+invariants.
+
 τ (Spark → DuckDB SQL) is the only production transpiler per ADR-022. Records live in four places:
 
-- **[`../thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md)** — the **authoritative active τ spine**.
+- **Individual `adr-*.md` files listed below** — the **authoritative active τ spine**.
 - **[`runtime/`](runtime/)** — current decisions for the serving/execution substrate.
 - **[`retired/`](retired/)** — superseded τ records, retained only as design history.
 - **[`legacy-transpiler/`](legacy-transpiler/)** — SUPERSEDED. Describes the retired v1 transpiler (Rust modules deleted 2026-07-05). Historical reference only.
@@ -26,12 +44,18 @@ This directory is the entry point to Thunderduck's architecture decisions. It is
 
 | If the agent is… | Inject |
 |---|---|
-| **Designing / implementing τ** (parse → analyze → emit) | The whole [rearchitect spine](../thunderduck-rearchitect-ADRs.md) + the [τ spine at a glance](#τ-spine-at-a-glance) below |
-| **Reviewing τ work** | The rearchitect **§Cross-Validation** (tensions T1–T6, [LB1–LB9](#load-bearing-assumptions-lb1lb9), [INV1–INV10](#cross-cutting-invariants-inv1inv10)) + the specific ADRs the change cites |
-| **Adding / changing a Spark function or expression emission** | Rearchitect **ADR-009** (emission table) + **ADR-010** (extension functions) + **ADR-005** (types/nullability) |
-| **Working on the SparkSQL parser front-end** | Rearchitect **ADR-004** (both front-ends lower to the common AST) |
+| **Designing / implementing τ** (parse → analyze → emit) | The specific active ADRs routed below + [`cross-validation.md`](cross-validation.md) for changes that cross decision boundaries |
+| **Reviewing τ work** | [`cross-validation.md`](cross-validation.md) (tensions T1–T6, LB1–LB9, INV1–INV10) + the specific ADRs the change cites |
+| **Adding / changing a Spark function or expression emission** | [ADR-009](adr-009-emission-table.md) + [ADR-010](adr-010-extension-functions.md) + [ADR-005](adr-005-type-nullability-inference.md) |
+| **Working on the SparkSQL parser front-end** | [ADR-004](adr-004-common-ast-frontends.md) |
+| **Changing the analyzer, type inference, or nullability** | [ADR-005](adr-005-type-nullability-inference.md) + [ADR-006](adr-006-analyzer-passes.md) + [ADR-015](adr-015-differential-oracle.md) |
+| **Changing resolved columns, qualifiers, joins, or missing-column recovery** | [ADR-024](adr-024-resolved-attribute-identity.md) + [ADR-006](adr-006-analyzer-passes.md) |
+| **Changing Connect `plan_id`, DataFrame columns, stars, or regexes** | [ADR-026](adr-026-connect-plan-id-lookup.md) + [ADR-024](adr-024-resolved-attribute-identity.md) |
+| **Changing interval types, lowering, inference, or Arrow representation** | [ADR-025](adr-025-ansi-interval-field-spans.md) + [ADR-005](adr-005-type-nullability-inference.md) + [ADR-016](adr-016-version-and-ansi-pins.md) |
+| **Changing commands or catalog/session-visible state** | [ADR-011](adr-011-command-path.md) + [ADR-012](adr-012-catalog-overlay.md) |
+| **Changing differential tests or compatibility claims** | [ADR-014](adr-014-testing-decision-spaces.md) + [ADR-015](adr-015-differential-oracle.md) + [ADR-016](adr-016-version-and-ansi-pins.md) |
 | **Working on serving / runtime / threading / streaming / sessions** | [`runtime/`](runtime/) (see [table](#runtime--serving-substrate-runtime)) |
-| **Lakehouse read / write (Delta, Iceberg, Unity Catalog)** | Rearchitect **ADR-012** (catalog overlay), **ADR-013** (external reads), **ADR-017** (Delta writes), **ADR-018** (Iceberg writes), **ADR-019** (I/O contract) |
+| **Lakehouse read / write (Delta, Iceberg, Unity Catalog)** | [ADR-012](adr-012-catalog-overlay.md), [ADR-013](adr-013-external-lakehouse-reads.md), [ADR-017](adr-017-delta-append-writes.md), [ADR-018](adr-018-iceberg-writes.md), [ADR-019](adr-019-lakehouse-io-contract.md) |
 
 > Numbering note: `ADR-0NN` identifies the rearchitect ADR family, active or
 > retired. Legacy/runtime records use topic filenames instead.
@@ -40,50 +64,51 @@ This directory is the entry point to Thunderduck's architecture decisions. It is
 
 ## τ spine at a glance
 
-Authoritative decisions; one line each. Full text (with `Depends on` / `Depended on by` and refinement hooks) in [`../thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md).
+Authoritative decisions; one line each. Follow the ADR link for its full text, dependencies, and refinement hooks.
 
 | ADR | Decision |
 |---|---|
-| **000** | Positioning: single-node, vertically-scaled, instant-start, **no-JVM** DuckDB-backed Spark Connect server. Selects "reimplement a minimal Rust slice" over embedding Catalyst. |
-| **001** | `τ` is a **transliterator, not an optimizer** — no cost-driven rewrites; only expressibility-forced transforms, result-irrelevant cosmetic reductions, and enumerated carve-outs. |
-| **002** | **Emit-level delegation**: ordinary structural binding goes to DuckDB; τ owns type/nullability plus ADR-026's bounded Connect plan-ID exception. |
-| **003** | IR is a proto-inspired **common AST**, extended incrementally (add a node only when SQL needs it and it isn't composable), not a full Catalyst `LogicalPlan`. |
-| **004** | **Both front-ends lower to the common AST**; relation-vs-command decided by parse-tree root. Raw `spark.sql(...)` is parsed (not string-rewritten). Dispatch at the protobuf boundary. |
-| **005** | thunderduck **owns Spark type & nullability inference** over the common AST (the divergent slice): a coercion lattice + nullability derivation. |
-| **006** | The analyzer is a **bounded sequence of coordinated passes**, mostly bottom-up, with named non-upward traversals including ADR-026 plan-ID lookup. |
-| **007** | `τ` layers **A (annotate) / B (tree-rewrite) / C (escape hatch)**; B is retained but minimal (expressibility-forced + SQL desugarings + carve-outs). |
-| **008** | **Correlated subqueries emitted directly** as DuckDB correlated subqueries — no rewrite to lateral. |
-| **009** | The **emission table is declarative data**, keyed on `(op, operand types, mode, nullability)` — simultaneously the input grammar and the coverage denominator. **Compiled dispatch**. |
-| **010** | **Extension functions** (in the C++ `thunderduck-duckdb-extension` project, now in-tree at [`extension/`](../../extension/)) are a *minimal gap-filler* for value/return-type divergences DuckDB can't match natively. |
-| **011** | The Spark Connect **`Command` arm** is in scope as a separate `emit_command` path; its oracle is **catalog/table state**, not result rows. |
-| **012** | A **narrow catalog overlay** carries Spark types of base relations (+ access provenance/format); commands write it, resolution reads it. |
-| **013** | **External / lakehouse reads** (Hive-Parquet, Delta, Iceberg, Unity Catalog) delegate to DuckDB storage extensions; **read-only** this iteration. |
-| **014** | **Two decision spaces** (translation, resolution) with independent coverage; three failure-attribution buckets (resolver / translator / DuckDB-excluded). |
-| **015** | **Differential oracle** vs reference Spark (serialize once, send identical bytes to both); variation-suppression is test-side; inference validated in isolation via **AnalyzePlan**. |
-| **016** | **Pinned reference version**: Spark 4.1.1; DuckDB ≥ v1.5.3 where Iceberg writes are used. Coverage claims are version-scoped. |
-| **017** | **Delta writes** = append into a pre-existing *attached* table only; DELETE/MERGE/overwrite/create are typed rejections pending DuckDB support. |
-| **018** | **Iceberg writes** target Databricks UC-managed Iceberg via the attached REST catalog: CTAS / INSERT / DELETE / MERGE (single-table, merge-on-read). |
-| **019** | **Lakehouse I/O contract**: read inputs in their native format, write results as Iceberg, both via UC — each format on its DuckDB-strong side; no cross-format single-table access. |
-| **020** | **Strict-only**: the `thdck_spark_funcs` extension is mandatory; "relaxed mode" is eliminated. One emission target. |
-| **021** | **τ substrate independence**: dispatch at the protobuf boundary; τ-native `Expression` and `TypeInferenceEngine`. Only value-level types shared. |
-| **022** | **τ is the only path**: no fallback, no dispatch flag, no alternate implementation; errors follow ADR-022's active category contract. |
-| **024** | **Resolved attribute identity**: `ResolvedSchema` stores stable `ExprId` and qualifier lineage; references bind to attributes rather than positions alone. |
-| **026** | **Spark Connect plan-ID lookup**: preserve per-node IDs and mirror Catalyst's top-down search plus ancestor-`ExprId` filtering; no join ID sets. |
-| **§CV** | Cross-Validation: layered structure, dependency matrix, tensions T1–T6, load-bearing assumptions, invariants, ratification order. |
-| **OQ-1** | Raw-SQL handling — **resolved** by ADR-004 (parse to common AST). |
-| **OQ-2** | External write paths — **partially addressed** (Delta append ADR-017, UC Iceberg ADR-018); remainder deferred per-format. |
+| [**ADR-000**](adr-000-positioning.md) | Positioning: single-node, vertically-scaled, instant-start, **no-JVM** DuckDB-backed Spark Connect server. Selects "reimplement a minimal Rust slice" over embedding Catalyst. |
+| [**ADR-001**](adr-001-transliterator-not-optimizer.md) | `τ` is a **transliterator, not an optimizer** — no cost-driven rewrites; only expressibility-forced transforms, result-irrelevant cosmetic reductions, and enumerated carve-outs. |
+| [**ADR-002**](adr-002-emit-level-delegation.md) | **Emit-level delegation**: ordinary structural binding goes to DuckDB; τ owns type/nullability plus ADR-026's bounded Connect plan-ID exception. |
+| [**ADR-003**](adr-003-common-ast.md) | IR is a proto-inspired **common AST**, extended incrementally (add a node only when SQL needs it and it isn't composable), not a full Catalyst `LogicalPlan`. |
+| [**ADR-004**](adr-004-common-ast-frontends.md) | **Both front-ends lower to the common AST**; relation-vs-command decided by parse-tree root. Raw `spark.sql(...)` is parsed (not string-rewritten). Dispatch at the protobuf boundary. |
+| [**ADR-005**](adr-005-type-nullability-inference.md) | thunderduck **owns Spark type & nullability inference** over the common AST (the divergent slice): a coercion lattice + nullability derivation. |
+| [**ADR-006**](adr-006-analyzer-passes.md) | The analyzer is a **bounded sequence of coordinated passes**, mostly bottom-up, with named non-upward traversals including ADR-026 plan-ID lookup. |
+| [**ADR-007**](adr-007-translation-layers.md) | `τ` layers **A (annotate) / B (tree-rewrite) / C (escape hatch)**; B is retained but minimal (expressibility-forced + SQL desugarings + carve-outs). |
+| [**ADR-008**](adr-008-correlated-subqueries.md) | **Correlated subqueries emitted directly** as DuckDB correlated subqueries — no rewrite to lateral. |
+| [**ADR-009**](adr-009-emission-table.md) | **Closed, inspectable dispatch**: structural AST emission is handwritten and exhaustive; callable semantics use one interpreted `FunctionSpec` registry with five closed implementation routes. |
+| [**ADR-010**](adr-010-extension-functions.md) | **Extension functions** (in the C++ `thunderduck-duckdb-extension` project, now in-tree at [`extension/`](../../extension/)) are a *minimal gap-filler* for value/return-type divergences DuckDB can't match natively. |
+| [**ADR-011**](adr-011-command-path.md) | The Spark Connect **`Command` arm** is in scope as a separate `emit_command` path; its oracle is **catalog/table state**, not result rows. |
+| [**ADR-012**](adr-012-catalog-overlay.md) | A **narrow catalog overlay** carries Spark types of base relations (+ access provenance/format); commands write it, resolution reads it. |
+| [**ADR-013**](adr-013-external-lakehouse-reads.md) | **External / lakehouse reads** (Hive-Parquet, Delta, Iceberg, Unity Catalog) delegate to DuckDB storage extensions; **read-only** this iteration. |
+| [**ADR-014**](adr-014-testing-decision-spaces.md) | **Two decision spaces** (translation, resolution) with independent coverage; three failure-attribution buckets (resolver / translator / DuckDB-excluded). |
+| [**ADR-015**](adr-015-differential-oracle.md) | **Differential oracle** vs reference Spark (serialize once, send identical bytes to both); variation-suppression is test-side; inference validated in isolation via **AnalyzePlan**. |
+| [**ADR-016**](adr-016-version-and-ansi-pins.md) | **Pinned reference version**: Spark 4.1.1; DuckDB ≥ v1.5.3 where Iceberg writes are used. Coverage claims are version-scoped. |
+| [**ADR-017**](adr-017-delta-append-writes.md) | **Delta writes** = append into a pre-existing *attached* table only; DELETE/MERGE/overwrite/create are typed rejections pending DuckDB support. |
+| [**ADR-018**](adr-018-iceberg-writes.md) | **Iceberg writes** target Databricks UC-managed Iceberg via the attached REST catalog: CTAS / INSERT / DELETE / MERGE (single-table, merge-on-read). |
+| [**ADR-019**](adr-019-lakehouse-io-contract.md) | **Lakehouse I/O contract**: read inputs in their native format, write results as Iceberg, both via UC — each format on its DuckDB-strong side; no cross-format single-table access. |
+| [**ADR-020**](adr-020-strict-only-target.md) | **Strict-only**: the `thdck_spark_funcs` extension is mandatory; "relaxed mode" is eliminated. One emission target. |
+| [**ADR-021**](adr-021-tau-substrate.md) | **τ substrate independence**: dispatch at the protobuf boundary; τ-native `Expression` and `TypeInferenceEngine`. Only value-level types shared. |
+| [**ADR-022**](adr-022-only-path-error-categories.md) | **τ is the only path**: no fallback, no dispatch flag, no alternate implementation; errors follow ADR-022's active category contract. |
+| [**ADR-024**](adr-024-resolved-attribute-identity.md) | **Resolved attribute identity**: `ResolvedSchema` stores stable `ExprId` and qualifier lineage; references bind to attributes rather than positions alone. |
+| [**ADR-025**](adr-025-ansi-interval-field-spans.md) | **ANSI interval field spans** are durable `DataType` structure and round-trip through analysis, Connect schemas, and interval lowering. |
+| [**ADR-026**](adr-026-connect-plan-id-lookup.md) | **Spark Connect plan-ID lookup**: preserve per-node IDs and mirror Catalyst's top-down search plus ancestor-`ExprId` filtering; no join ID sets. |
+| [**§CV**](cross-validation.md) | Cross-Validation: layered structure, dependency matrix, tensions T1–T6, load-bearing assumptions, invariants, ratification order. |
+| [**OQ-1**](resolved-and-open-questions.md#oq-1--raw-sql-sparksql-handling--resolved-by-adr-004) | Raw-SQL handling — **resolved** by ADR-004 (parse to common AST). |
+| [**OQ-2**](resolved-and-open-questions.md#oq-2--external--lakehouse-table-write-paths--partially-addressed-remainder-deferred-per-format) | External write paths — **partially addressed** (Delta append ADR-017, UC Iceberg ADR-018); remainder deferred per-format. |
 
 ---
 
 ## Cross-cutting invariants (INV1–INV10)
 
-The reviewer's checklist — any refinement must preserve all of these (full text in §CV.5).
+The reviewer's checklist — any refinement must preserve all of these (full text in [`cross-validation.md`](cross-validation.md#cv5--cross-cutting-invariants)).
 
 | # | Invariant |
 |---|---|
 | **INV1** | Both engines receive **byte-identical input** (serialize-once-send-twice). |
 | **INV2** | Every `τ` decision is **node-local** (post-A) or a labeled **C escape hatch** — never a hidden closure in the table. |
-| **INV3** | The **emission table is the single source of truth** for generation and coverage (emission-side contamination barrier; no imports from the deleted v1 modules). |
+| **INV3** | The live function registry is the single callable-name authority; structural AST emission remains exhaustive handwritten dispatch. Neither path imports the deleted v1 modules. |
 | **INV4** | **Inference is validated in isolation** (AnalyzePlan green) before translation failures are read as translation bugs. |
 | **INV5** | thunderduck **knows the schema everywhere**; type tracking and plan-ID lookup consume the resolved attributes even where emission delegates structure. |
 | **INV6** | Every `Extension(...)` target in the table **exists and is loaded** in the C++ extension. |
@@ -94,7 +119,7 @@ The reviewer's checklist — any refinement must preserve all of these (full tex
 
 ## Load-bearing assumptions (LB1–LB9)
 
-Assumptions whose failure cascades; each is empirically checkable (full text in §CV.4).
+Assumptions whose failure cascades; each is empirically checkable (full text in [`cross-validation.md`](cross-validation.md#cv4--load-bearing-assumptions)).
 
 | # | Assumption |
 |---|---|
@@ -152,7 +177,6 @@ Removed from the active set on 2026-07-02; recoverable from git history at the p
 
 ## Related docs
 
-- [`../thunderduck-rearchitect-ADRs.md`](../thunderduck-rearchitect-ADRs.md) — the authoritative τ spine.
 - [`retired/`](retired/) — superseded τ decisions, loaded only for historical rationale.
 - [`../context/`](../context/) — condensed agent reference (architecture, build commands, coding standards, dependencies, testing).
 - [`../dev-journal-toc.md`](../dev-journal-toc.md) — chronological development history.

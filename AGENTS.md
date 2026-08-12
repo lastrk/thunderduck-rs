@@ -4,7 +4,7 @@ Project-specific **policy and process** for thunderduck-rs (the Rust port of Thu
 
 ## Communication
 
-Use ASD-STE100 Simplified Technical English when communicating with the user and when writing pull requests, code comments, and other project text. Preserve required technical terms, code identifiers, and quoted external text.
+Use ASD-STE100 Simplified Technical English when you communicate with the user. Use it when you write pull request descriptions, code comments, and other project text. Preserve required technical terms, code identifiers, and quoted external text.
 
 ## Project Vision
 

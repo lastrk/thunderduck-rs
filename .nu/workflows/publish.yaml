@@ -10,9 +10,6 @@ spec:
     - push
   branches:
     - "$(workflow.repo.default-branch)"
-    # TEMP validation trigger for ci/publish-cross-compile-cache — remove
-    # before merging to main.
-    - "ci/publish-cross-compile-cache"
   tasks:
     build-and-publish:
       serviceAccount: ecr-write
@@ -77,9 +74,8 @@ spec:
           options:
             ecrLogin: true
             destination:
-              # TEMP validation tag — restore to $(workflow.head-commit) /
-              # :latest before merging to main.
-              - 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:validate-cross-compile
+              - 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:$(workflow.head-commit)
+              - 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:latest
             platform:
               - linux/amd64
               - linux/arm64

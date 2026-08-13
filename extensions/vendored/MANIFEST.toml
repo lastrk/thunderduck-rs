@@ -17,31 +17,31 @@
 
 [source]
 origin = "in-tree: extension/ (imported from nubank/thunderduck-duckdb-extension, archived)"
-build_sha = "74e94134d7e1527f8b1e8ab811d0a568df0e4ee4"
-duckdb_version = "v1.5.4"
-built_by = "github-actions[bot] via https://github.com/nubank/thunderduck-rs/actions/runs/29369283007"
-adopted_at = "2026-07-14T22:14:24Z"
+build_sha = "be167da5c693b7cd4ae1dc70d16ea3bab2cb423f"
+duckdb_version = "v1.5.5"
+built_by = "github-actions[bot] via https://github.com/nubank/thunderduck-rs/actions/runs/31659858516"
+adopted_at = "2026-08-13T02:57:56Z"
 
 [[artifact]]
 platform = "linux_amd64"
-file = "thdck_spark_funcs-v1.5.4-linux_amd64.duckdb_extension"
-sha256 = "e100295e51baa8821e2e61e0cb8407fbf30fe158de5c6ce919f2ff0b66837647"
-size = 10903110
+file = "thdck_spark_funcs-v1.5.5-linux_amd64.duckdb_extension"
+sha256 = "6532ee5c7dbac3cb693fd0ec78e687bfe7e1345463242065aed86b8eeefce09b"
+size = 10911798
 
 [[artifact]]
 platform = "linux_arm64"
-file = "thdck_spark_funcs-v1.5.4-linux_arm64.duckdb_extension"
-sha256 = "4ccac6d8757234e31c5d9a8be0b125048f230c1f611899d556fd1a42b714ae68"
-size = 9842950
+file = "thdck_spark_funcs-v1.5.5-linux_arm64.duckdb_extension"
+sha256 = "fcafba00f214c3b0ddedaff55b80c69fa85b29065b009a6d230c9423337e7fbf"
+size = 9846974
 
 [[artifact]]
 platform = "osx_amd64"
-file = "thdck_spark_funcs-v1.5.4-osx_amd64.duckdb_extension"
-sha256 = "7899c0781e48a53bcd33d1f2bd5f852e338c2b07da46eb404002f9b7167cce13"
-size = 5416774
+file = "thdck_spark_funcs-v1.5.5-osx_amd64.duckdb_extension"
+sha256 = "0fd2b7c7c719373e32414f41865d3a8e5523baf7aad2536443eddf2b663dd71f"
+size = 5425382
 
 [[artifact]]
 platform = "osx_arm64"
-file = "thdck_spark_funcs-v1.5.4-osx_arm64.duckdb_extension"
-sha256 = "fd11394a795b2321f616268c1c5a92f677e322e3d84738961330f60170c0a435"
-size = 5272806
+file = "thdck_spark_funcs-v1.5.5-osx_arm64.duckdb_extension"
+sha256 = "3f1f4b0ec85da5ecaa026c2e4a9f00b86604226b11aaf34064d593fdb28c3808"
+size = 5279574

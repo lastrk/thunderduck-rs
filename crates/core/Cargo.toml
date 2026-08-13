@@ -4,10 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Compile DuckDB from source (the upstream `bundled` behavior). Off by default:
-# local dev links a shared prebuilt libduckdb via DUCKDB_LIB_DIR (see scripts/dev/).
-# CI / fresh clones: `cargo build --features bundled`.
-bundled = ["duckdb/bundled"]
+# Compatibility flag for existing commands. Clean builds download the exact
+# DuckDB release; local development links a shared verified library.
+bundled = []
 
 [dependencies]
 thiserror.workspace = true

@@ -7,7 +7,7 @@
 > **⚠ Read this first: the true fix requires a patch to duckdb-rs.**
 > Eliminating the one genuinely unnecessary materialization — switching the
 > session thread from `Statement::query_arrow` to `Statement::stream_arrow` —
-> cannot be done safely against duckdb-rs `1.10504.0` as published. The
+> cannot be done safely against duckdb-rs `1.10505.0` as published. The
 > crate's streaming iterator (`ArrowStream` / `streaming_step`) maps a
 > **mid-stream runtime error to `None`**, which is indistinguishable from a
 > clean end-of-stream. τ's ANSI error emulation (ADR-006) relies on
@@ -38,7 +38,7 @@ let arrow = stmt.query_arrow(duckdb::params![])?;   // ← materializes
 for batch in arrow { ... blocking_send(StreamBatch::Batch(batch)) ... }
 ```
 
-In duckdb-rs `1.10504.0`, `query_arrow` → `RawStatement::execute()` →
+In duckdb-rs `1.10505.0`, `query_arrow` → `RawStatement::execute()` →
 `duckdb_execute_prepared_arrow`, DuckDB's **materialized-result** C API: the
 query runs to completion and the full result set is buffered inside DuckDB
 before the first chunk is handed to the iterator. The `for` loop only drains

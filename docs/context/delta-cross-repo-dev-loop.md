@@ -24,7 +24,7 @@ live at the repo root (see `.gitignore`; materialized by
 thunderduck-rs (this repo)
 ├── .delta-kernel-rs/   fork lastrk/delta-kernel-rs   (branch thunderduck-delta-dev off tag v0.21.0)
 ├── .duckdb-delta/      fork lastrk/duckdb-delta       (branch thunderduck-delta-dev off v1.5-variegata)
-│   └── duckdb/         submodule pinned to tag v1.5.4  ← ABI anchor
+│   └── duckdb/         submodule pinned to tag v1.5.5  ← ABI anchor
 └── .delta-toolchain/   conda-forge gcc-13 (micromamba) — see "Toolchain" below
 ```
 
@@ -32,14 +32,14 @@ thunderduck-rs (this repo)
 
 | Repo | Ref | Reason |
 |------|-----|--------|
-| thunderduck `duckdb` crate | `1.10504.0` | == DuckDB **v1.5.4** (`extensions/vendored/MANIFEST.toml` `[source].duckdb_version`) |
+| thunderduck `duckdb` crate | `1.10505.0` | == DuckDB **v1.5.5** (`extensions/vendored/MANIFEST.toml` `[source].duckdb_version`) |
 | `.duckdb-delta` branch | `v1.5-variegata` | DuckDB-1.5.x-aligned line ("variegata" = 1.5.x codename) |
-| `.duckdb-delta/duckdb` submodule | tag `v1.5.4` | **must equal** thunderduck's linked libduckdb, or the extension won't `LOAD` |
+| `.duckdb-delta/duckdb` submodule | tag `v1.5.5` | **must equal** thunderduck's linked libduckdb, or the extension won't `LOAD` |
 | `.delta-kernel-rs` branch | off tag `v0.21.0` | the FFI version the extension's C++ currently compiles against — green baseline |
 
 **ABI rule:** a DuckDB C++ extension only loads into a DuckDB of the *same
-version + platform*. thunderduck links libduckdb v1.5.4, so the extension is built
-against v1.5.4 (submodule tag). `session.rs` sets `allow_unsigned_extensions=true`,
+version + platform*. thunderduck links libduckdb v1.5.5, so the extension is built
+against v1.5.5 (submodule tag). `session.rs` sets `allow_unsigned_extensions=true`,
 so the locally-built (unsigned) extension loads.
 
 ## How the custom kernel replaces the stable dependency
@@ -66,7 +66,7 @@ unavailable here (no root). So `delta-toolchain-setup.sh` installs a relocatable
 -static-libgcc`**, so it embeds the newer libstdc++ and carries *no* dynamic
 libstdc++/libgcc_s dependency — it loads cleanly into thunderduck's gcc-11
 process (verified: `objdump -T` shows no external `GLIBCXX_*` needs). DuckDB's
-own C++ ABI is keyed to the v1.5.4 version, not the compiler, so mixing gcc 11
+own C++ ABI is keyed to the v1.5.5 version, not the compiler, so mixing gcc 11
 (host) and gcc 13 (extension) across the load boundary is safe.
 
 ## How thunderduck loads it
@@ -85,7 +85,7 @@ rebuild — unless you changed the loader itself.
 # bootstrap the userspace gcc-13 toolchain (~a few hundred MB, first run only).
 scripts/dev/delta-dev-setup.sh
 
-# Build the extension against the local kernel (first run compiles DuckDB v1.5.4
+# Build the extension against the local kernel (first run compiles DuckDB v1.5.5
 # from source — slow; later runs are incremental). Resource-capped for the 8 GiB
 # container: linker jobs=2, compile/cargo jobs=4 (override via
 # DELTA_BUILD_LINK_JOBS / DELTA_BUILD_COMPILE_JOBS).

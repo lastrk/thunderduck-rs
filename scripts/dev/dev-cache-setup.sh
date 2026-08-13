@@ -80,11 +80,9 @@ if [[ -e "$BIN/ld-mold/ld" ]]; then LINKER_DIR="$BIN/ld-mold"; LINKER_NAME="mold
 elif [[ -e "$BIN/ld-lld/ld" ]]; then LINKER_DIR="$BIN/ld-lld"; LINKER_NAME="lld"
 fi
 
-# This is what lets every worktree skip the ~2 GB DuckDB C++ compile: builds
-# link the prebuilt static lib via DUCKDB_LIB_DIR (the default, non-bundled path).
-"$SCRIPT_DIR/duckdb-build-cache.sh" ensure || log "WARN: could not prepare prebuilt libduckdb (builds will need --features bundled)"
-duckdb_dir="$("$SCRIPT_DIR/duckdb-build-cache.sh" dir 2>/dev/null || true)"
-duckdb_lib="$duckdb_dir/lib/libduckdb_static.a"
+# DuckDB 1.5.5 uses the official version-matched dynamic library download.
+# The upstream static archive is incompatible with extension loading.
+duckdb_lib=""
 
 # IMPORTANT: we deliberately do NOT put the linker in rustflags. A rustflags
 # entry is part of cargo's fingerprint, so it would invalidate EVERY crate's
@@ -124,7 +122,7 @@ fi
   echo "$marker_end"
 } >> "$cfg"
 
-log "wrote managed block to $cfg (sccache=$([[ -x $BIN/sccache ]] && echo on || echo off), duckdb=$([[ -f $duckdb_lib ]] && echo prebuilt || echo MISSING))"
+log "wrote managed block to $cfg (sccache=$([[ -x $BIN/sccache ]] && echo on || echo off), duckdb=official-download)"
 
 # Source this in shells that build/test. (cargo check / rust-analyzer don't link,
 # so they don't need it; they still get sccache from the cargo config above.)
@@ -150,4 +148,4 @@ done
 log "linker=${LINKER_NAME:-default} via PATH (source $envsh in this shell to activate now)"
 
 log "done. In this shell run:  source $envsh  then build normally (cargo build)."
-log "Builds link the shared prebuilt libduckdb — no DuckDB recompile, no --features bundled needed locally."
+log "Builds download the version-matched official libduckdb — no DuckDB source compile is needed locally."

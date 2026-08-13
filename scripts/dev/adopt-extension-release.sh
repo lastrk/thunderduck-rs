@@ -27,7 +27,7 @@
 # Usage:
 #   scripts/dev/adopt-extension-release.sh --from-local <dir>
 #   scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version>
-#     e.g. scripts/dev/adopt-extension-release.sh ext6 v1.5.4
+#     e.g. scripts/dev/adopt-extension-release.sh <release-tag> v1.5.5
 #
 #   scripts/dev/adopt-extension-release.sh --verify
 #     CI-style check: re-hash the files already vendored under

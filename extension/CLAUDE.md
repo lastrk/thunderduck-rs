@@ -33,7 +33,7 @@ The extension registers, under `namespace duckdb`, the following functions:
 algorithms. Changes to the shared path affect both functions.
 
 - **Language / standard:** C++11 (enforced — see conventions below).
-- **DuckDB:** pinned submodule at **v1.5.4** (`duckdb/`) — see `BUILD_PINS.toml` (this directory) for the authoritative pin.
+- **DuckDB:** pinned submodule at **v1.5.5** (`duckdb/`) — see `BUILD_PINS.toml` (this directory) for the authoritative pin.
 - **CI scaffolding:** `extension-ci-tools/` submodule (Makefile templates).
 - **Downstream consumer:** thunderduck-rs itself — the built binary is adopted
   into `../extensions/vendored/` and embedded into the server via
@@ -130,7 +130,7 @@ a reviewer must flag any change that does.
 
 ## C++11 + DuckDB Conventions
 
-**C++11 only.** DuckDB v1.5.4 pins `CMAKE_CXX_STANDARD "11"`. Do not use
+**C++11 only.** DuckDB v1.5.5 pins `CMAKE_CXX_STANDARD "11"`. Do not use
 C++14/17/20 features: no `std::optional`, no structured bindings
 (`auto [a, b]`), no `if constexpr`, no generic-lambda `auto` params, no
 `std::make_unique`, no fold expressions, no `std::string_view`. "Modern C++"

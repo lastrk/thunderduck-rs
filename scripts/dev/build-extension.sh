@@ -33,6 +33,7 @@ ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 EXT_DIR="$ROOT/extension"
 BUILD_PINS="$EXT_DIR/BUILD_PINS.toml"
 CARGO_TOML="$ROOT/Cargo.toml"
+CARGO_LOCK="$ROOT/Cargo.lock"
 
 log() { printf '[build-extension] %s\n' "$*" >&2; }
 err() { printf '[build-extension] ERROR: %s\n' "$*" >&2; }
@@ -90,13 +91,18 @@ if [[ "$submodule_tag" != "$pinned_version" ]]; then
   exit 1
 fi
 
-# (b) the `duckdb` crate version in the workspace Cargo.toml decodes to the
-# same DuckDB version. duckdb-rs encodes it in the crate's minor field:
-# 1.10504.0 -> minor "10504" -> split into major (leading digits) + 2-digit
-# DuckDB minor + 2-digit DuckDB patch -> v1.5.4. See docs/context/gotchas.md #6.
-crate_version="$(awk -F'"' '/^duckdb[[:space:]]*=/{print $2; exit}' "$CARGO_TOML")"
+# (b) the resolved `duckdb` crate version decodes to the same DuckDB version.
+# Read Cargo.lock so this also works when Cargo.toml pins duckdb-rs by Git rev.
+# duckdb-rs encodes it in the crate's minor field:
+# 1.10505.0 -> minor "10505" -> split into major (leading digits) + 2-digit
+# DuckDB minor + 2-digit DuckDB patch -> v1.5.5. See docs/context/gotchas.md #6.
+crate_version="$(awk -F'"' '
+  /^name = "duckdb"$/ { found=1; next }
+  found && /^version = / { print $2; exit }
+  /^\[\[package\]\]$/ { found=0 }
+' "$CARGO_LOCK")"
 [[ -n "$crate_version" ]] || {
-  err "could not parse the duckdb crate version from $CARGO_TOML"
+  err "could not parse the duckdb crate version from $CARGO_LOCK"
   exit 1
 }
 minor_field="$(printf '%s' "$crate_version" | awk -F. '{print $2}')"

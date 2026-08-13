@@ -10,7 +10,7 @@
 #                       (the FFI version duckdb-delta currently compiles against)
 #   .duckdb-delta/      fork lastrk/duckdb-delta, branch off v1.5-variegata
 #                       (DuckDB 1.5.x line); its `duckdb` submodule pinned to the
-#                       v1.5.4 tag == thunderduck's linked libduckdb (ABI anchor).
+#                       v1.5.5 tag == thunderduck's linked libduckdb (ABI anchor).
 #
 # The duckdb-delta CMakeLists is patched to accept -DDELTA_KERNEL_LOCAL_DIR so
 # the build uses our local kernel checkout instead of cloning the pinned tag.
@@ -26,7 +26,7 @@ DELTA_FORK="lastrk/duckdb-delta"
 DELTA_UPSTREAM="duckdb/duckdb-delta"
 DELTA_BASE_BRANCH="v1.5-variegata"
 
-DUCKDB_ABI_TAG="v1.5.4"        # must match thunderduck's duckdb crate (1.10504.0)
+DUCKDB_ABI_TAG="v1.5.5"        # must match thunderduck's duckdb crate (1.10505.0)
 WORK_BRANCH="thunderduck-delta-dev"
 
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"

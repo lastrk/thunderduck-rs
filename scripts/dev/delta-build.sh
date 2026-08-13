@@ -3,7 +3,7 @@
 # delta-build.sh — the hot loop of the cross-repo Delta dev loop.
 #
 # Builds the duckdb-delta extension against our LOCAL delta-kernel-rs checkout
-# (.delta-kernel-rs) instead of the pinned GIT_TAG, linked against DuckDB v1.5.4
+# (.delta-kernel-rs) instead of the pinned GIT_TAG, linked against DuckDB v1.5.5
 # (thunderduck's ABI anchor). On success it prints the built loadable extension
 # path and the `export THUNDERDUCK_DELTA_EXT_PATH=...` line to feed the server's
 # dev-load hook.
@@ -32,7 +32,7 @@ if [[ ! -d "$DELTA_DIR/.git" || ! -d "$KERNEL_DIR/.git" ]]; then
 fi
 
 log "building duckdb-delta ($BUILD_TYPE) against local kernel: $KERNEL_DIR"
-log "duckdb submodule @ $(git -C "$DELTA_DIR/duckdb" describe --tags 2>/dev/null || echo '?') — must be v1.5.4"
+log "duckdb submodule @ $(git -C "$DELTA_DIR/duckdb" describe --tags 2>/dev/null || echo '?') — must be v1.5.5"
 
 # Userspace gcc toolchain. The devcontainer's gcc 11 can't compile the extension
 # (self-referential unordered_map — newer libstdc++ required), and apt is

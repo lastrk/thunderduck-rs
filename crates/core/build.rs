@@ -4,12 +4,9 @@ fn main() {
     embed_vendored_extension();
 }
 
-/// When DuckDB is NOT compiled from source (the `bundled` feature is off), we
-/// link a prebuilt `libduckdb` provided via `DUCKDB_LIB_DIR`. That static
-/// archive is built from C++ and pulls in the C++ runtime plus libm, which the
-/// non-bundled path of `libduckdb-sys` does not emit. Add them here so they
-/// land after `duckdb` on the final link line and resolve its symbols. The
-/// `bundled` path already links the C++ runtime itself, so skip it then.
+/// When DuckDB is not compiled from source, the host can link either an
+/// external `libduckdb` or the version-matched official download. Both need
+/// the C++ runtime and libm after DuckDB on the final link line.
 fn link_external_duckdb_runtime() {
     println!("cargo:rerun-if-env-changed=DUCKDB_LIB_DIR");
     if std::env::var_os("CARGO_FEATURE_BUNDLED").is_some() {
@@ -25,11 +22,14 @@ fn link_external_duckdb_runtime() {
     };
     println!("cargo:rustc-link-lib=dylib={cxx_runtime}");
     println!("cargo:rustc-link-lib=dylib=m");
-    if std::env::var_os("DUCKDB_LIB_DIR").is_none() {
+    let downloads_duckdb = matches!(
+        std::env::var("DUCKDB_DOWNLOAD_LIB").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    );
+    if std::env::var_os("DUCKDB_LIB_DIR").is_none() && !downloads_duckdb {
         println!(
-            "cargo:warning=DuckDB `bundled` feature is off and DUCKDB_LIB_DIR is unset; \
-             linking will look for a system libduckdb. For local dev run \
-             scripts/dev/dev-cache-setup.sh, or build with `--features bundled`."
+            "cargo:warning=DuckDB has no configured library source; set \
+             DUCKDB_DOWNLOAD_LIB=1 or DUCKDB_LIB_DIR."
         );
     }
 }

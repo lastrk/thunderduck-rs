@@ -189,7 +189,7 @@ mod tests {
 
     /// End-to-end gate for the cross-repo Delta dev loop: proves a locally-built
     /// `duckdb-delta` extension loads into thunderduck's *own* linked libduckdb
-    /// (same v1.5.4 ABI) and that `delta_scan` runs. Exercises the real
+    /// (same v1.5.5 ABI) and that `delta_scan` runs. Exercises the real
     /// [`load`] path, so `THUNDERDUCK_DELTA_EXT_PATH` drives the dev hook.
     ///
     /// Ignored by default (needs the built extension + a Delta table). Run it

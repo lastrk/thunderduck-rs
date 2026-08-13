@@ -5,8 +5,7 @@
 ## Build
 
 ```bash
-# Full build (debug). Local dev uses the prebuilt libduckdb from
-# scripts/dev/dev-cache-setup.sh; fresh clones / CI need --features bundled.
+# Full build (debug). It downloads the pinned DuckDB release when needed.
 cargo build
 
 # Release build (for integration tests). Embeds the vendored thdck_spark_funcs

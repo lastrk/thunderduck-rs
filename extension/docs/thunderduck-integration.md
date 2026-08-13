@@ -18,11 +18,11 @@ counterpart of the legacy JVM/JDBC bundling scheme it replaces.
 
 ## Version Alignment
 
-Currently pinned to DuckDB `v1.5.4` (`extension/BUILD_PINS.toml` is the
+Currently pinned to DuckDB `v1.5.5` (`extension/BUILD_PINS.toml` is the
 authoritative pin; see also `docs/context/dependencies.md` → Version Pinning
 and `docs/context/gotchas.md` #6 in thunderduck-rs). The `duckdb` crate
-version `1.10504.0` encodes this: crate minor `10504` decodes to DuckDB
-`v1.5.4` (`1` + `05` + `04`).
+version `1.10505.0` encodes this: crate minor `10505` decodes to DuckDB
+`v1.5.5` (`1` + `05` + `05`).
 
 If the DuckDB version is updated, three things move together:
 - the `extension/duckdb` submodule (`git checkout v<new>`),

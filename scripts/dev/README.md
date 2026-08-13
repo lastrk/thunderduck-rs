@@ -17,50 +17,33 @@ on the persistent mount).
    crates compile once and are reused everywhere. Each worktree keeps its **own
    `target/`**, so concurrent builds never block on a shared cargo lock.
    Workspace crates keep incremental compilation (sccache passes them through).
-3. **Shared prebuilt DuckDB (the big one)** — the `duckdb` dependency now
-   defaults to **non-bundled**: instead of recompiling the ~2 GB C++ amalgamation
-   (and `ar`-archiving a ~1.9 GB lib) in every `target/`, builds **link a single
-   prebuilt `libduckdb_static.a`** built once and shared from
-   `.build-cache/duckdb/<version>/`. A fresh worktree links it in seconds.
-   Because the lib lives outside `target/`, **`cargo clean` can never remove it.**
+3. **Official DuckDB download** — the `duckdb` dependency downloads the exact
+   pinned DuckDB release for clean builds. This avoids a local C++ build and
+   keeps the host ABI aligned with the bundled extension.
 
 ## Usage
 
 ```bash
-# Once per container start (downloads tools, builds/caches libduckdb if needed,
+# Once per container start (downloads tools and configures the build cache,
 # writes $CARGO_HOME/config.toml + env.sh):
 scripts/dev/dev-cache-setup.sh
 
 # Activate the linker in the current shell (added to ~/.bashrc for new shells):
 source <main-repo>/.build-cache/env.sh
 
-# Then build/test normally — non-bundled, links the shared prebuilt libduckdb:
+# Then build/test normally:
 cargo build
 cargo test
 ```
 
 That's it — no per-build flags. `cargo`, `cargo test`, and rust-analyzer all
-pick up `DUCKDB_LIB_DIR` / `DUCKDB_STATIC` from `$CARGO_HOME/config.toml`.
-
-## Bundled (compile DuckDB from source)
-
-The old behavior is still available behind a feature — used by CI and fresh
-clones that don't have the prebuilt cache:
-
-```bash
-cargo build --features bundled            # compiles DuckDB from source
-```
-
-`scripts/dev/duckdb-build-cache.sh ensure` produces the prebuilt once (it
-harvests an existing build if one is around, otherwise does a one-time bundled
-build) so that subsequent non-bundled builds — in every worktree — link it.
+download the pinned DuckDB library when needed.
 
 ## Other helpers
 
 - `scripts/dev/dev-clean.sh` — `cargo clean` scoped to first-party crates only
   (deps stay built). Less essential now that the heavy DuckDB lib lives in
   `.build-cache/`, but handy.
-- `scripts/dev/duckdb-build-cache.sh dir` — print the prebuilt cache dir.
 - Inspect cache hits: `<repo>/.build-cache/bin/sccache --show-stats`.
 
 ## Cross-repo Delta dev loop
@@ -85,12 +68,11 @@ Full design, pinning matrix, and gotchas:
 
 - Delete the `# >>> thunderduck dev-cache (managed) >>>` block in
   `$CARGO_HOME/config.toml` and remove the `source …/env.sh` line from
-  `~/.bashrc`. With `DUCKDB_LIB_DIR` unset, builds need `--features bundled`.
+  `~/.bashrc`.
 - Nuke everything: `rm -rf <main-repo>/.build-cache`.
 
 ## Why local-only / not CI
 
-CI uses its own `$CARGO_HOME`, has no `.build-cache/`, and builds with
-`--features bundled`, so it never sees the linker or prebuilt-lib wiring. The
-repo's tracked `.cargo/config.toml` (`jobs = 2`) is untouched and merges with
-the per-container block (different keys).
+CI uses its own `$CARGO_HOME`, has no `.build-cache/`, and downloads the
+version-matched official DuckDB library. The repo's tracked `.cargo/config.toml`
+sets the required download mode.

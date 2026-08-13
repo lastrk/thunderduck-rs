@@ -528,11 +528,3 @@ not serialize it behind the critical path or mix its churn into that diff.
   environment before classifying them as code regressions. Compare only the
   final result against the known-green baseline, while still reporting the
   transient setup failure.
-
-## 2026-08-13 — Preserve the deployment linkage contract
-
-- Treat the shipped artifact shape as an upgrade invariant. A dependency bump
-  must not change the self-contained server into a binary that needs a DuckDB
-  dynamic library at run time. Check the publish workflow and the final binary
-  dependencies before approval. Use checksummed official static archives when
-  Thunderduck does not need a custom DuckDB build.

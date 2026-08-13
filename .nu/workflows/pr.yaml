@@ -36,14 +36,21 @@ spec:
           run: |
             export CARGO_HOME="$HOME/.cargo-cache"
             export PATH="$CARGO_HOME/bin:$PATH"
+            apt-get update
+            apt-get install -y --no-install-recommends unzip
             rustup component add rustfmt clippy
+            scripts/dev/duckdb-build-cache.sh ensure
+            duckdb_dir="$(scripts/dev/duckdb-build-cache.sh dir)"
+            export DUCKDB_LIB_DIR="$duckdb_dir/lib"
+            export DUCKDB_INCLUDE_DIR="$duckdb_dir/include"
+            export DUCKDB_STATIC=1
             cargo fmt --all -- --check
             # `--locked` keeps CI on the committed Cargo.lock. Without it a
             # checkout re-resolves the graph and can pull a dependency whose
             # MSRV exceeds this image's rustc — how this workflow broke on
             # 2026-08-07 (ar_archive_writer 0.5.3 requires rustc 1.88).
-            cargo clippy --locked --workspace --all-targets --features bundled -- -D warnings
-            cargo test --locked --workspace --features bundled
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+            cargo test --locked --workspace
 
         - name: save-cache
           image: 193814090748.dkr.ecr.us-east-1.amazonaws.com/cicd/cache
@@ -51,4 +58,5 @@ spec:
             save-cache \
               --cache-key-template='thunderduck-rs-cargo-{% checksum Cargo.lock %}' \
               --folder=~/.cargo-cache \
+              --folder=.build-cache \
               --folder=target

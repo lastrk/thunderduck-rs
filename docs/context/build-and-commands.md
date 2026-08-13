@@ -5,7 +5,11 @@
 ## Build
 
 ```bash
-# Full build (debug). It downloads the pinned DuckDB release when needed.
+# Prepare DuckDB's checksummed official static library and Cargo environment.
+scripts/dev/dev-cache-setup.sh
+source "$(git rev-parse --show-toplevel)/.build-cache/env.sh"
+
+# Full build (debug).
 cargo build
 
 # Release build (for integration tests). Embeds the vendored thdck_spark_funcs

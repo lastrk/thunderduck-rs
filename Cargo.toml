@@ -8,15 +8,9 @@ edition = "2021"
 
 [workspace.dependencies]
 thiserror  = "2"
-# DuckDB linkage is selected by libduckdb-sys:
-#   * clean builds download the official library for this crate's exact version
-#     (configured in .cargo/config.toml);
-#   * callers can set DUCKDB_LIB_DIR / DUCKDB_STATIC to use their own library.
-#
-# The crates.io 1.10505.0 archive embeds DuckDB v1.5.4 in duckdb.tar.gz. Use
-# the upstream tag instead: its submodule pin is DuckDB v1.5.5. Do not enable
-# its bundled features: Cargo's shallow submodule checkout loses the tag.
-duckdb     = { git = "https://github.com/duckdb/duckdb-rs", rev = "88f673c5cdf09e287c010a910db53b97e523a9fa", default-features = false, features = ["vscalar"] }
+# Use the Rust API bindings with Thunderduck's separately prepared DuckDB
+# v1.5.5 static release archive.
+duckdb     = { version = "=1.10505.0", default-features = false, features = ["vscalar"] }
 arrow      = "58"
 arrow-ipc  = "58"
 dashmap    = "6"

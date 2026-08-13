@@ -33,28 +33,26 @@ spec:
               --cache-key-template='thunderduck-rs-cargo-publish-{% checksum Cargo.lock %}' \
               --cache-key-default='thunderduck-rs-cargo-publish'
 
-        # Cross-compiles both targets natively on this (amd64) node — no QEMU.
-        # aarch64-unknown-linux-gnu uses the gcc-aarch64-linux-gnu cross linker;
-        # DuckDB's C++ (the `bundled` feature) cross-compiles the same way cargo
-        # cross-compiles the Rust crates. This used to happen inside the release
-        # Dockerfile's `cargo build`, once per platform, on a fresh BuildKit
-        # builder with no cache — that's what made build-and-publish time out at
-        # the platform's 2h ceiling. Doing it here instead means it benefits from
-        # the same cicd/cache restore/save-cache pattern already proven in
-        # pr.yaml's `check` task.
+        # Cross-compile both targets natively on this amd64 node. DuckDB comes
+        # from its checksummed official static release archives, so this step
+        # does not compile DuckDB C++ code.
         - name: build-release-binaries
           image: rust:1.97.1-bookworm
           run: |
             export CARGO_HOME="$HOME/.cargo-cache"
             export PATH="$CARGO_HOME/bin:$PATH"
             apt-get update
-            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu unzip
             rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-            cargo build --locked --release --features bundled --target x86_64-unknown-linux-gnu -p thunderduck-connect-server
-            cargo build --locked --release --features bundled --target aarch64-unknown-linux-gnu -p thunderduck-connect-server
+            for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+              scripts/dev/duckdb-build-cache.sh ensure "$target"
+              duckdb_dir="$(scripts/dev/duckdb-build-cache.sh dir "$target")"
+              DUCKDB_LIB_DIR="$duckdb_dir/lib" \
+              DUCKDB_INCLUDE_DIR="$duckdb_dir/include" \
+              DUCKDB_STATIC=1 \
+                cargo build --locked --release --target "$target" -p thunderduck-connect-server
+            done
             mkdir -p dist
             cp target/x86_64-unknown-linux-gnu/release/thunderduck-connect-server dist/thunderduck-connect-server-linux-amd64
             cp target/aarch64-unknown-linux-gnu/release/thunderduck-connect-server dist/thunderduck-connect-server-linux-arm64
@@ -65,6 +63,7 @@ spec:
             save-cache \
               --cache-key-template='thunderduck-rs-cargo-publish-{% checksum Cargo.lock %}' \
               --folder=~/.cargo-cache \
+              --folder=.build-cache \
               --folder=target
 
         # Packages the two prebuilt binaries (Dockerfile does no compiling —

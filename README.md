@@ -50,14 +50,20 @@ Some Spark SQL syntax is also intentionally bounded where τ cannot yet model it
 git clone https://github.com/nubank/thunderduck-rs.git
 cd thunderduck-rs
 
-# Fresh clones / CI compile DuckDB from source.
-cargo build --release --features bundled
+# Download and verify DuckDB's official static release archive.
+scripts/dev/duckdb-build-cache.sh ensure
+duckdb_dir="$(scripts/dev/duckdb-build-cache.sh dir)"
+export DUCKDB_LIB_DIR="$duckdb_dir/lib"
+export DUCKDB_INCLUDE_DIR="$duckdb_dir/include"
+export DUCKDB_STATIC=1
+
+cargo build --release
 
 # Start the Spark Connect server on 0.0.0.0:15002.
 ./target/release/thunderduck-connect-server
 ```
 
-For repeat development inside the devcontainer, `scripts/dev/dev-cache-setup.sh` prepares a shared prebuilt DuckDB library; then ordinary `cargo build` and `cargo test` work without `--features bundled`. See [scripts/dev/README.md](scripts/dev/README.md).
+For repeat development inside the devcontainer, `scripts/dev/dev-cache-setup.sh` prepares this environment automatically. See [scripts/dev/README.md](scripts/dev/README.md).
 
 Connect with PySpark:
 

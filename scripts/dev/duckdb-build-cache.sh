@@ -1,116 +1,115 @@
 #!/usr/bin/env bash
-# duckdb-build-cache.sh — inspect legacy local static archives.
-#
-# DuckDB 1.5.5 clean builds download the exact official library. This helper
-# retains its inspection interface for older worktrees, but does not make a
-# static archive for the current version because it is incompatible with the
-# extension-loading configuration.
-#
-# Layout:  .build-cache/duckdb/<libduckdb-sys-version>/
-#            lib/libduckdb_static.a     (link name expected by DUCKDB_STATIC=1)
-#            include/                    (duckdb.h etc., for DUCKDB_INCLUDE_DIR)
-#
-# Usage:
-#   duckdb-build-cache.sh ensure        # cache it if missing (harvest or build)
-#   duckdb-build-cache.sh dir           # print the cache dir for the current version
-#   duckdb-build-cache.sh harvest FROM  # harvest from a given libduckdb-sys out dir
+# Download and cache DuckDB's official static release archive for one target.
 set -euo pipefail
 
+DUCKDB_VERSION="1.5.5"
+
 common_git="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-[[ -z "$common_git" ]] && { echo "duckdb-build-cache: not in a git repo" >&2; exit 1; }
+[[ -n "$common_git" ]] || { echo "duckdb-cache: not in a git repository" >&2; exit 1; }
 MAIN_ROOT="$(dirname "$common_git")"
 CACHE_ROOT="${BUILD_CACHE_ROOT:-$MAIN_ROOT/.build-cache}"
+target="${2:-${TARGET:-$(rustc -vV | awk '/^host: /{print $2}')}}"
 
-lockfile="$MAIN_ROOT/Cargo.lock"; [[ -f "$PWD/Cargo.lock" ]] && lockfile="$PWD/Cargo.lock"
-ver="$(awk '/^name = "libduckdb-sys"/{f=1} f&&/^version = /{gsub(/[",]/,"",$3);print $3;exit}' "$lockfile" 2>/dev/null || true)"
-[[ -z "$ver" ]] && { echo "duckdb-build-cache: cannot read libduckdb-sys version (build/resolve first)" >&2; exit 1; }
-DIR="$CACHE_ROOT/duckdb/$ver"
+case "$target" in
+  x86_64-unknown-linux-gnu)
+    asset="static-libs-linux-amd64.zip"
+    expected_sha="deb47c5300f3c99725e84cdb14d214c3b12bbd748b613b1698b938c894cb68eb"
+    ;;
+  aarch64-unknown-linux-gnu)
+    asset="static-libs-linux-arm64.zip"
+    expected_sha="ea6a34cb49ec2db5ed23d9e8311237c53c32abf9cdbf5dd608c4176c3dd8bfeb"
+    ;;
+  x86_64-apple-darwin)
+    asset="static-libs-osx-amd64.zip"
+    expected_sha="a27d36fa1247a3ffa1692e7aa0bf4ea4d1e0ee51da7c4df7a5db5217357b1b4d"
+    ;;
+  aarch64-apple-darwin)
+    asset="static-libs-osx-arm64.zip"
+    expected_sha="d79ec66b8a4054b866faada82e9e31f859a713c555b3f1c4b71c4a43d3273e9c"
+    ;;
+  *)
+    echo "duckdb-cache: unsupported target: $target" >&2
+    exit 1
+    ;;
+esac
+
+DIR="$CACHE_ROOT/duckdb/v$DUCKDB_VERSION/$target"
 LIB="$DIR/lib/libduckdb_static.a"
-INC="$DIR/include"
-
-crate_minor="$(printf '%s' "$ver" | awk -F. '{print $2}')"
-[[ "$crate_minor" =~ ^[0-9]{5,}$ ]] || {
-  echo "duckdb-build-cache: unexpected libduckdb-sys version '$ver'" >&2
-  exit 1
-}
-duckdb_patch="${crate_minor: -2}"
-duckdb_minor="${crate_minor: -4:2}"
-duckdb_major="${crate_minor:0:$((${#crate_minor} - 4))}"
-expected_duckdb_version="v${duckdb_major}.${duckdb_minor#0}.${duckdb_patch#0}"
+HEADER="$DIR/include/duckdb.h"
+MARKER="$DIR/.archive-sha256"
+DOWNLOAD_DIR="$CACHE_ROOT/downloads"
+ARCHIVE="$DOWNLOAD_DIR/duckdb-v$DUCKDB_VERSION-$asset"
+URL="https://github.com/duckdb/duckdb/releases/download/v$DUCKDB_VERSION/$asset"
 
 log() { printf '[duckdb-cache] %s\n' "$*" >&2; }
 
-archive_matches_expected_version() {
-  local version_object
-  version_object="$(ar t "$1" | grep -E '(pragma_version\.o$|func_table_version\.cpp\.o$)' | head -1 || true)"
-  [[ -n "$version_object" ]] \
-    && ar p "$1" "$version_object" | strings | grep -Fx "$expected_duckdb_version" >/dev/null
-}
-
-harvest() {
-  local out="$1"   # a libduckdb-sys-<hash>/out directory
-  local a hdr
-  a="$out/libduckdb.a"
-  [[ -f "$a" ]] || { log "no libduckdb.a in $out"; return 1; }
-  archive_matches_expected_version "$a" || {
-    log "libduckdb.a is not $expected_duckdb_version: $a"
-    return 1
-  }
-  hdr="$(find "$out" -name duckdb.h -path '*src/include*' 2>/dev/null | head -1)"
-  [[ -n "$hdr" ]] || { log "no duckdb.h under $out"; return 1; }
-  mkdir -p "$DIR/lib" "$INC"
-  # atomic-ish: copy to tmp then rename the lib (the presence test gate).
-  cp -p "$hdr"/../*.h "$INC"/ 2>/dev/null || true
-  cp -rp "$(dirname "$hdr")" "$INC/include" 2>/dev/null || true   # full src/include tree
-  cp -p "$a" "$LIB.tmp"
-  mv -f "$LIB.tmp" "$LIB"
-  local kib; kib="$(du -k "$LIB" | cut -f1)"
-  log "cached libduckdb_static.a ($(du -h "$LIB" | cut -f1)) + headers for $expected_duckdb_version (crate v$ver)"
-  # A release (-O3) archive is ~100 MB; a debug (-O0+debuginfo) one is ~2 GB.
-  if [[ "$kib" -gt 524288 ]]; then
-    log "WARN: archive >512 MB — this looks like a DEBUG build. Re-run after a release build for a small/fast lib."
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
   fi
 }
 
-find_existing_out() {
-  # Only harvest from a RELEASE build: the cc crate compiles the amalgamation
-  # with the consuming profile's opt-level, so a debug build yields a ~2 GB
-  # -O0 archive while release is a ~100 MB -O3 one. The lib is an external C-ABI
-  # archive, so the optimized build links fine into debug Rust builds too.
-  local archive
-  while IFS= read -r archive; do
-    if archive_matches_expected_version "$archive"; then
-      dirname "$archive"
-      return
-    fi
-  done < <(ls -t "$MAIN_ROOT"/target/release/build/libduckdb-sys-*/out/libduckdb.a \
-                "$MAIN_ROOT"/.claude/worktrees/*/target/release/build/libduckdb-sys-*/out/libduckdb.a \
-                2>/dev/null || true)
+download() {
+  mkdir -p "$DOWNLOAD_DIR"
+  if [[ -f "$ARCHIVE" ]] && [[ "$(sha256 "$ARCHIVE")" == "$expected_sha" ]]; then
+    return
+  fi
+
+  local tmp="$ARCHIVE.tmp.$$"
+  log "downloading DuckDB v$DUCKDB_VERSION $asset"
+  curl -fsSL --retry 3 --max-time 300 "$URL" -o "$tmp"
+  if [[ "$(sha256 "$tmp")" != "$expected_sha" ]]; then
+    rm -f "$tmp"
+    log "checksum verification failed for $asset"
+    return 1
+  fi
+  mv -f "$tmp" "$ARCHIVE"
 }
 
-build_once() {
-  log "no compatible static archive is available for $expected_duckdb_version"
-  log "clean builds download the official libduckdb release instead"
+prepare() {
+  if [[ -f "$LIB" && -f "$HEADER" && -f "$MARKER" ]] \
+      && [[ "$(<"$MARKER")" == "$expected_sha" ]]; then
+    log "already cached: DuckDB v$DUCKDB_VERSION for $target"
+    return
+  fi
+
+  command -v unzip >/dev/null || { log "unzip is required"; return 1; }
+  download
+
+  mkdir -p "$DIR"
+  local work
+  work="$(mktemp -d "$DIR/.prepare.XXXXXX")"
+  trap 'rm -rf "$work"' RETURN
+  unzip -q "$ARCHIVE" -d "$work/extracted"
+
+  if [[ "$target" == *-apple-darwin ]]; then
+    command -v libtool >/dev/null || { log "Apple libtool is required"; return 1; }
+    libtool -static -o "$work/libduckdb_static.a" "$work"/extracted/*.a
+  else
+    command -v ar >/dev/null || { log "ar is required"; return 1; }
+    (
+      cd "$work/extracted"
+      {
+        echo "CREATE ../libduckdb_static.a"
+        for archive in ./*.a; do echo "ADDLIB $archive"; done
+        echo "SAVE"
+        echo "END"
+      } | ar -M
+    )
+  fi
+
+  mkdir -p "$DIR/lib" "$DIR/include"
+  mv -f "$work/libduckdb_static.a" "$LIB"
+  cp "$work/extracted/duckdb.h" "$HEADER"
+  printf '%s\n' "$expected_sha" > "$MARKER.tmp"
+  mv -f "$MARKER.tmp" "$MARKER"
+  log "cached official DuckDB v$DUCKDB_VERSION static library for $target"
 }
 
 case "${1:-ensure}" in
-  dir) echo "$DIR" ;;
-  harvest) [[ -n "${2:-}" ]] || { echo "usage: harvest <out-dir>" >&2; exit 2; }; harvest "$2" ;;
-  ensure)
-    if [[ -f "$LIB" ]] && archive_matches_expected_version "$LIB"; then
-      log "already cached for $expected_duckdb_version (crate v$ver): $LIB"
-      exit 0
-    fi
-    if [[ -f "$LIB" ]]; then
-      log "cached archive has the wrong DuckDB version; rebuilding $expected_duckdb_version"
-    fi
-    existing="$(find_existing_out || true)"
-    if [[ -n "$existing" ]]; then
-      log "harvesting existing build: $existing"
-      harvest "$existing"
-    else
-      build_once
-    fi
-    ;;
-  *) echo "usage: duckdb-build-cache.sh {ensure|dir|harvest <out-dir>}" >&2; exit 2 ;;
+  ensure) prepare ;;
+  dir) printf '%s\n' "$DIR" ;;
+  *) echo "usage: duckdb-build-cache.sh {ensure|dir} [target]" >&2; exit 2 ;;
 esac

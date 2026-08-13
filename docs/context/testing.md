@@ -161,9 +161,9 @@ Use a separate terminal for each worktree. Keep its `target/` directory local
 to that worktree—**do not set a shared `CARGO_TARGET_DIR`**. Cargo mutates that
 directory and concurrent builds would contend, invalidate each other's
 incremental state, and encode worktree-specific paths. The dev cache setup
-shares the safe, expensive part instead: `sccache`; DuckDB is downloaded as a
-version-matched official library. The mandatory `thdck_spark_funcs` extension
-is already vendored in every worktree.
+shares the safe, expensive parts instead: `sccache` and the checksummed
+official DuckDB static archive under the main checkout's `.build-cache/`. The
+mandatory `thdck_spark_funcs` extension is already vendored in every worktree.
 
 ```bash
 cd .worktrees/feature-one

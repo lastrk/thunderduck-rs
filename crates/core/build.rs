@@ -4,13 +4,19 @@ fn main() {
     embed_vendored_extension();
 }
 
-/// When DuckDB is not compiled from source, the host can link either an
-/// external `libduckdb` or the version-matched official download. Both need
-/// the C++ runtime and libm after DuckDB on the final link line.
+/// Link the C++ runtime after the external DuckDB static archive.
 fn link_external_duckdb_runtime() {
     println!("cargo:rerun-if-env-changed=DUCKDB_LIB_DIR");
-    if std::env::var_os("CARGO_FEATURE_BUNDLED").is_some() {
-        return; // bundled build handles the C++ runtime
+    println!("cargo:rerun-if-env-changed=DUCKDB_STATIC");
+
+    if std::env::var_os("DUCKDB_LIB_DIR").is_none()
+        || std::env::var("DUCKDB_STATIC").as_deref() != Ok("1")
+    {
+        panic!(
+            "Thunderduck requires a static DuckDB library. Run \
+             scripts/dev/duckdb-build-cache.sh ensure and set DUCKDB_LIB_DIR, \
+             DUCKDB_INCLUDE_DIR, and DUCKDB_STATIC=1."
+        );
     }
     // Apple toolchains (Xcode 15+) no longer ship `libstdc++.dylib`, only
     // `libc++.dylib`; Linux toolchains ship `libstdc++` and lack `libc++` by
@@ -22,16 +28,9 @@ fn link_external_duckdb_runtime() {
     };
     println!("cargo:rustc-link-lib=dylib={cxx_runtime}");
     println!("cargo:rustc-link-lib=dylib=m");
-    let downloads_duckdb = matches!(
-        std::env::var("DUCKDB_DOWNLOAD_LIB").as_deref(),
-        Ok("1" | "true" | "TRUE")
-    );
-    if std::env::var_os("DUCKDB_LIB_DIR").is_none() && !downloads_duckdb {
-        println!(
-            "cargo:warning=DuckDB has no configured library source; set \
-             DUCKDB_DOWNLOAD_LIB=1 or DUCKDB_LIB_DIR."
-        );
-    }
+    // rustc-link-lib can occur before Rust archives and be removed by
+    // --as-needed. Put the C++ runtime at the end of test and binary links too.
+    println!("cargo:rustc-link-arg=-l{cxx_runtime}");
 }
 
 /// Embed the vendored `thdck_spark_funcs` extension binary into the build.

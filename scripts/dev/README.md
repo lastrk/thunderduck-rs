@@ -1,9 +1,9 @@
 # Local build acceleration (`scripts/dev/`)
 
-Faster change-compile-eval loops **inside the devcontainer only**. Nothing here
-touches CI: the config lives in `$CARGO_HOME/config.toml` + `env.sh` (per
-container), and artifacts live under `<main-repo>/.build-cache/` (gitignored,
-on the persistent mount).
+The setup script makes change-compile-eval loops faster inside the devcontainer.
+Its configuration lives in `$CARGO_HOME/config.toml` and `env.sh`, and its
+artifacts live under the gitignored `<main-repo>/.build-cache/` directory. CI
+uses only the DuckDB archive helper from this directory.
 
 ## What it does
 
@@ -17,9 +17,10 @@ on the persistent mount).
    crates compile once and are reused everywhere. Each worktree keeps its **own
    `target/`**, so concurrent builds never block on a shared cargo lock.
    Workspace crates keep incremental compilation (sccache passes them through).
-3. **Official DuckDB download** — the `duckdb` dependency downloads the exact
-   pinned DuckDB release for clean builds. This avoids a local C++ build and
-   keeps the host ABI aligned with the bundled extension.
+3. **Official static DuckDB library** — the setup downloads the exact static
+   release archive, verifies its pinned SHA-256 checksum, and caches one merged
+   archive per target. This avoids a local C++ build and keeps the server free
+   of a runtime `libduckdb` dependency.
 
 ## Usage
 
@@ -36,14 +37,16 @@ cargo build
 cargo test
 ```
 
-That's it — no per-build flags. `cargo`, `cargo test`, and rust-analyzer all
-download the pinned DuckDB library when needed.
+That's it — no per-build flags. `cargo`, `cargo test`, and rust-analyzer use the
+cached static DuckDB library through the managed Cargo environment.
 
 ## Other helpers
 
 - `scripts/dev/dev-clean.sh` — `cargo clean` scoped to first-party crates only
   (deps stay built). Less essential now that the heavy DuckDB lib lives in
   `.build-cache/`, but handy.
+- `scripts/dev/duckdb-build-cache.sh ensure [target]` — download, verify, and
+  prepare the official static library for a supported target.
 - Inspect cache hits: `<repo>/.build-cache/bin/sccache --show-stats`.
 
 ## Cross-repo Delta dev loop
@@ -73,6 +76,5 @@ Full design, pinning matrix, and gotchas:
 
 ## Why local-only / not CI
 
-CI uses its own `$CARGO_HOME`, has no `.build-cache/`, and downloads the
-version-matched official DuckDB library. The repo's tracked `.cargo/config.toml`
-sets the required download mode.
+CI calls the same DuckDB cache helper before Cargo and stores `.build-cache/`
+with its other build caches. Cargo itself does not access the DuckDB release.

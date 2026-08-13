@@ -258,18 +258,19 @@ BINARY_PATH="${THUNDERDUCK_BINARY:-$WORKSPACE_DIR/target/release/thunderduck-con
 if [ -z "${THUNDERDUCK_BINARY:-}" ]; then
     echo -e "${YELLOW}  Building Thunderduck server (no-op when up to date)...${NC}"
     cd "$WORKSPACE_DIR"
-    # DuckDB is non-bundled by default. If no external libduckdb is configured
-    # (DUCKDB_LIB_DIR — set by local dev via scripts/dev/), compile it from
-    # source so fresh clones / CI link successfully.
-    BUILD_FEATURES=""
+    # Prepare the official static DuckDB library when this shell does not have
+    # the local development environment.
     if [ -z "${DUCKDB_LIB_DIR:-}" ]; then
-        echo -e "${YELLOW}  DUCKDB_LIB_DIR unset — compiling DuckDB from source (--features bundled)${NC}"
-        BUILD_FEATURES="--features bundled"
+        "$WORKSPACE_DIR/scripts/dev/duckdb-build-cache.sh" ensure
+        duckdb_dir="$("$WORKSPACE_DIR/scripts/dev/duckdb-build-cache.sh" dir)"
+        export DUCKDB_LIB_DIR="$duckdb_dir/lib"
+        export DUCKDB_INCLUDE_DIR="$duckdb_dir/include"
+        export DUCKDB_STATIC=1
     fi
     # Subshell pipefail so the guard tests CARGO's exit status, not tail's
     # (plain `cmd | tail` under set -e without pipefail always sees tail's 0,
     # silently gating against a stale binary when the build breaks).
-    if ! (set -o pipefail; cargo build --release $BUILD_FEATURES 2>&1 | tail -20); then
+    if ! (set -o pipefail; cargo build --release 2>&1 | tail -20); then
         echo -e "${RED}ERROR: Failed to build Thunderduck server${NC}"
         exit 1
     fi
